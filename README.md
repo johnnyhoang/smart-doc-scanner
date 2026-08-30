@@ -2,6 +2,9 @@
 
 Ứng dụng xử lý ảnh chụp tài liệu thông minh thay thế hoàn hảo cho **CamScanner, Adobe Scan, vFlat Scan và Microsoft Lens**.
 
+> 📖 **Dành cho Lập trình viên & AI Assistant:**  
+> Xem toàn bộ bộ tài liệu đặc tả kiến trúc, thuật toán và API tại: [**docs/specs/CORE_SPECS.md**](file:///d:/Hoa%20Hoang/Apps/refine_docs/docs/specs/CORE_SPECS.md).
+
 ---
 
 ## 🌟 Các Tính Năng Nổi Bật

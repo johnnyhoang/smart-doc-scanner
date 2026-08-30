@@ -32,6 +32,9 @@ class DocScanApp {
         this.images = new Map();
         this.activeImageId = null;
         this.currentView = 'crop';
+        this.currentViewMode = 'edited';
+        this.showCropHandles = true;
+        this.isHoldingCompare = false;
 
         // Undo / Redo History Stacks per image
         this.historyMap = new Map();
@@ -239,6 +242,7 @@ class DocScanApp {
         this.txtInlineNewFolder = document.getElementById('txtInlineNewFolder');
         this.btnConfirmInlineFolder = document.getElementById('btnConfirmInlineFolder');
         this.btnCancelInlineFolder = document.getElementById('btnCancelInlineFolder');
+        this.btnCloseMoveModal = document.getElementById('btnCloseMoveModal');
         this.btnCancelMoveModal = document.getElementById('btnCancelMoveModal');
         this.btnSubmitMoveModal = document.getElementById('btnSubmitMoveModal');
         this.inlineCreateParentFolderId = null;
@@ -2486,15 +2490,18 @@ class DocScanApp {
         if (!page || !this.currentImageObj) return;
 
         const viewport = this.canvasViewport;
-        const availWidth = viewport.clientWidth - 40;
-        const availHeight = viewport.clientHeight - 40;
+        const rect = viewport ? viewport.getBoundingClientRect() : null;
+        const vW = (rect && rect.width > 50) ? rect.width : (viewport && viewport.clientWidth > 50 ? viewport.clientWidth : window.innerWidth - 650);
+        const vH = (rect && rect.height > 50) ? rect.height : (viewport && viewport.clientHeight > 50 ? viewport.clientHeight : window.innerHeight - 200);
+        const availWidth = Math.max(200, vW - 40);
+        const availHeight = Math.max(200, vH - 40);
 
         const isViewingOriginal = this.isHoldingCompare || this.currentViewMode === 'original';
         const displayImg = (!isViewingOriginal && page.processedImageObj) ? page.processedImageObj : this.currentImageObj;
 
         const padRatio = isViewingOriginal ? this.canvasPaddingRatio : 0.04;
 
-        const paddedAspect = displayImg.width / displayImg.height;
+        const paddedAspect = (displayImg.width && displayImg.height) ? (displayImg.width / displayImg.height) : 1.414;
         const screenAspect = availWidth / availHeight;
 
         let imgRenderW, imgRenderH;
@@ -3252,6 +3259,155 @@ class DocScanApp {
 
     hideLoading() {
         this.loadingOverlay.style.display = 'none';
+    }
+
+    // ==========================================
+    // 🎛️ INSPECTOR UI & METADATA SYNC
+    // ==========================================
+
+    renderNameSuggestions(page) {
+        if (!this.suggestMenu) return;
+        this.suggestMenu.innerHTML = '';
+        const suggestions = (page && page.name_suggestions && page.name_suggestions.length > 0) ? 
+            page.name_suggestions : [(page ? page.suggested_name : null) || "Tai-Lieu-Scan"];
+
+        suggestions.forEach(name => {
+            const item = document.createElement('div');
+            item.className = 'suggest-item';
+            item.innerHTML = `<i class="fa-solid fa-file-signature text-accent"></i> <span>${name}</span>`;
+            item.addEventListener('click', () => {
+                this.txtDocName.value = name;
+                if (page) {
+                    page.suggested_name = name;
+                    if (this.cardFileName) this.cardFileName.textContent = name;
+                    this.updatePageThumbTitle(page.id, name);
+                    this.debounceSaveMetadata(this.activeFolderId);
+                    this.scheduleAutoSave(60000);
+                }
+                this.suggestMenu.classList.remove('open');
+            });
+            this.suggestMenu.appendChild(item);
+        });
+    }
+
+    syncInspectorUI(settings) {
+        if (!settings) return;
+        if (this.modeCards) {
+            this.modeCards.forEach(card => {
+                card.classList.toggle('active', card.dataset.mode === (settings.mode || 'natural'));
+            });
+        }
+        if (this.chkDewarp) {
+            this.chkDewarp.checked = !!settings.dewarp_enabled;
+        }
+        if (this.dewarpStrengthGroup) {
+            this.dewarpStrengthGroup.style.display = settings.dewarp_enabled ? 'flex' : 'none';
+        }
+        if (this.rngDewarp) {
+            this.rngDewarp.value = settings.dewarp_strength ?? 0.8;
+            if (this.valDewarp) this.valDewarp.textContent = this.rngDewarp.value;
+        }
+        if (this.rngShadow) {
+            const shVal = Math.round((settings.shadow_reduction ?? 0.6) * 100);
+            this.rngShadow.value = shVal;
+            if (this.valShadow) this.valShadow.textContent = `${shVal}%`;
+        }
+        if (this.rngSharpness) {
+            const spVal = Math.round((settings.sharpness ?? 0.6) * 100);
+            this.rngSharpness.value = spVal;
+            if (this.valSharpness) this.valSharpness.textContent = `${spVal}%`;
+        }
+        if (this.rngMargin) {
+            const mgVal = ((settings.margin_percent ?? 0.02) * 100).toFixed(1);
+            this.rngMargin.value = mgVal;
+            if (this.valMargin) this.valMargin.textContent = `${mgVal}%`;
+        }
+        if (this.rngContrast) {
+            const ctVal = Math.round((settings.contrast ?? 0.2) * 100);
+            this.rngContrast.value = ctVal;
+            if (this.valContrast) this.valContrast.textContent = `${ctVal}%`;
+        }
+        if (this.rngQuality) {
+            const qVal = settings.quality ?? 85;
+            this.rngQuality.value = qVal;
+            if (this.valQuality) this.valQuality.textContent = `${qVal}%`;
+        }
+        if (this.chkNormalizeDpi) {
+            this.chkNormalizeDpi.checked = settings.normalize_res !== false;
+        }
+    }
+
+    updateMetadataUI(page) {
+        if (!page) return;
+        const origDim = `${page.width || '--'} × ${page.height || '--'} px`;
+        const origSize = page.file_size_human || '--';
+        const outDim = page.out_dim || origDim;
+        const outSize = page.out_size_human || origSize;
+        const saving = page.saving_ratio ? `Tiết kiệm ${page.saving_ratio}` : 'Chuẩn in A4';
+
+        if (this.metaOrigDim) this.metaOrigDim.textContent = origDim;
+        if (this.metaOrigSize) this.metaOrigSize.textContent = origSize;
+        if (this.metaOutDim) this.metaOutDim.textContent = outDim;
+        if (this.metaOutSize) this.metaOutSize.textContent = outSize;
+        if (this.savingPill) this.savingPill.textContent = saving;
+
+        if (this.cardFileName) this.cardFileName.textContent = page.suggested_name || page.filename || '--';
+        if (this.cardOrigDim) this.cardOrigDim.textContent = origDim;
+        if (this.cardOrigSize) this.cardOrigSize.textContent = origSize;
+        if (this.cardMegapixels) this.cardMegapixels.textContent = page.megapixels || '--';
+        if (this.cardOutSize) this.cardOutSize.textContent = outSize;
+        if (this.cardSavingRatio) this.cardSavingRatio.textContent = page.saving_ratio || '--';
+    }
+
+    async triggerAiDocumentNaming() {
+        const page = this.getActivePage();
+        if (!page) return;
+
+        this.showLoading("AI đang đọc nội dung văn bản để gợi ý tên...");
+        try {
+            const folderImgIds = this.getActiveFolderImageIds();
+            const pageIndex = (folderImgIds.indexOf(page.id) >= 0 ? folderImgIds.indexOf(page.id) : 0) + 1;
+
+            const res = await fetch('/api/ai-suggest-name', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    image_id: page.id,
+                    page_index: pageIndex
+                })
+            });
+
+            if (!res.ok) throw new Error("Gợi ý AI thất bại");
+            const data = await res.json();
+            if (data.primary_name) {
+                page.suggested_name = data.primary_name;
+                this.txtDocName.value = data.primary_name;
+                if (this.cardFileName) this.cardFileName.textContent = data.primary_name;
+                this.updatePageThumbTitle(page.id, data.primary_name);
+            }
+            if (data.suggestions) {
+                page.name_suggestions = data.suggestions;
+                this.renderNameSuggestions(page);
+            }
+            page.aiAnalyzed = true;
+            if (this.aiSuggestBanner) this.aiSuggestBanner.style.display = 'none';
+            this.showToast(`✨ AI đã đặt tên: ${data.primary_name}`);
+            this.debounceSaveMetadata(this.activeFolderId);
+            this.scheduleAutoSave(60000);
+        } catch (err) {
+            this.showToast(err.message || "Lỗi đọc AI", false);
+        } finally {
+            this.hideLoading();
+        }
+    }
+
+    switchView(view) {
+        this.currentView = view;
+        this.setViewMode(view === 'crop' ? 'original' : (this.currentViewMode || 'edited'));
+    }
+
+    onSlideMove(e) {
+        // comparison slider handler
     }
 }
 
