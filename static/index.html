@@ -576,6 +576,55 @@
                 </div>
             </div>
         </div>
+
+        <!-- Modal 3: Xử lý ảnh chưa có bản gốc (Standalone / Orphan Image) -->
+        <div class="modal-backdrop" id="orphanImageModal" style="display: none;">
+            <div class="modal-card modal-orphan-card">
+                <div class="modal-header">
+                    <div class="modal-header-icon text-warning">
+                        <i class="fa-solid fa-triangle-exclamation"></i>
+                    </div>
+                    <div class="modal-header-text">
+                        <h3 id="orphanModalTitle">Phát hiện ảnh chưa có bản gốc</h3>
+                        <p class="modal-desc" id="orphanModalDesc">Ảnh này chưa có bản chụp gốc trong thư mục <code>_goc/</code>. Bạn muốn sửa ảnh này không, hay xóa đi?</p>
+                    </div>
+                    <button class="modal-close-btn" id="btnCloseOrphanModal"><i class="fa-solid fa-xmark"></i></button>
+                </div>
+                <div class="modal-body orphan-body">
+                    <div class="orphan-preview-box">
+                        <img id="orphanPreviewImg" class="orphan-thumb" src="" alt="Ảnh chưa có bản gốc">
+                    </div>
+                    <div class="orphan-info-box">
+                        <div class="orphan-info-row">
+                            <span class="text-muted">Tệp tin:</span>
+                            <strong id="orphanFileName">--</strong>
+                        </div>
+                        <div class="orphan-info-row">
+                            <span class="text-muted">Đường dẫn thư mục:</span>
+                            <span id="orphanFolderPath" class="text-accent">--</span>
+                        </div>
+                        <div class="orphan-info-row">
+                            <span class="text-muted">Dung lượng:</span>
+                            <span id="orphanFileSize">--</span>
+                        </div>
+                    </div>
+                </div>
+                <div class="modal-footer orphan-actions">
+                    <button class="btn btn-secondary" id="btnOrphanCancel" title="Bỏ qua không thao tác">
+                        <i class="fa-solid fa-xmark"></i> Bỏ qua (Cancel)
+                    </button>
+                    <button class="btn btn-danger" id="btnOrphanDelete" title="Xóa file ảnh này khỏi máy tính">
+                        <i class="fa-solid fa-trash-can"></i> Xóa (Delete)
+                    </button>
+                    <button class="btn btn-warning" id="btnOrphanMoveToUnapproved" title="Chuyển ảnh vào Kho ảnh chưa duyệt (không cần tạo cặp ảnh gốc)">
+                        <i class="fa-solid fa-inbox"></i> Chuyển vào Kho chưa duyệt
+                    </button>
+                    <button class="btn btn-primary" id="btnOrphanAdopt" title="Tạo bản sao vào thư mục _goc và sẵn sàng chỉnh sửa">
+                        <i class="fa-solid fa-wand-magic-sparkles"></i> Sửa ảnh & Tạo bản gốc (Yes)
+                    </button>
+                </div>
+            </div>
+        </div>
     </div>
 
     <script src="js/app.js"></script>

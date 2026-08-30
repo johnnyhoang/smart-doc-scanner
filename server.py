@@ -1,6 +1,8 @@
 import os
 import io
 import json
+import time
+import shutil
 import datetime
 import uuid
 import base64
@@ -125,6 +127,25 @@ class ApplyAsOriginalRequest(BaseModel):
     root_path: Optional[str] = None
     relative_path: Optional[str] = ""
     doc_name: Optional[str] = None
+
+class AdoptOriginalRequest(BaseModel):
+    root_path: str
+    relative_path: Optional[str] = ""
+    filename: str
+    image_id: str
+
+class DeleteDiskFileRequest(BaseModel):
+    root_path: str
+    relative_path: Optional[str] = ""
+    filename: str
+    image_id: Optional[str] = None
+
+class MoveToUnapprovedRequest(BaseModel):
+    root_path: str
+    relative_path: Optional[str] = ""
+    filename: str
+    image_id: str
+    unapproved_folder_name: Optional[str] = "Kho_Chua_Duyet"
 
 def image_to_base64(img_bytes: bytes, mime: str = "image/jpeg") -> str:
     return f"data:{mime};base64,{base64.b64encode(img_bytes).decode('utf-8')}"
@@ -568,6 +589,137 @@ async def save_metadata(req: SaveMetadataRequest):
     update_folder_metadata(target_dir, [p.dict() for p in req.pages])
     return {"success": True}
 
+@app.post("/api/adopt-as-original")
+async def api_adopt_as_original(req: AdoptOriginalRequest):
+    if not req.root_path or not os.path.exists(req.root_path):
+        raise HTTPException(status_code=400, detail="Thư mục gốc không tồn tại.")
+    
+    clean_rel = (req.relative_path or "").replace("/", "\\").strip("\\")
+    target_dir = os.path.normpath(os.path.join(req.root_path, clean_rel)) if clean_rel else req.root_path
+    
+    img_path = os.path.join(target_dir, req.filename)
+    if not os.path.exists(img_path):
+        raise HTTPException(status_code=404, detail="Không tìm thấy file ảnh.")
+    
+    stem = os.path.splitext(req.filename)[0]
+    goc_dir = os.path.join(target_dir, "_goc")
+    os.makedirs(goc_dir, exist_ok=True)
+    goc_path = os.path.join(goc_dir, f"{stem}_goc.jpg")
+    
+    # Read image and save into _goc
+    img = cv2.imread(img_path)
+    if img is None:
+        raise HTTPException(status_code=400, detail="Không thể đọc file ảnh.")
+    
+    cv2.imwrite(goc_path, img)
+    
+    # Update in-memory IMAGE_STORE
+    if req.image_id in IMAGE_STORE:
+        IMAGE_STORE[req.image_id]["original"] = img
+        
+    return {
+        "success": True,
+        "filename": req.filename,
+        "goc_path": goc_path,
+        "has_raw_original": True
+    }
+
+@app.post("/api/delete-disk-file")
+async def api_delete_disk_file(req: DeleteDiskFileRequest):
+    if not req.root_path or not os.path.exists(req.root_path):
+        raise HTTPException(status_code=400, detail="Thư mục gốc không tồn tại.")
+    
+    clean_rel = (req.relative_path or "").replace("/", "\\").strip("\\")
+    target_dir = os.path.normpath(os.path.join(req.root_path, clean_rel)) if clean_rel else req.root_path
+    
+    stem = os.path.splitext(req.filename)[0]
+    img_path = os.path.join(target_dir, req.filename)
+    goc_path = os.path.join(target_dir, "_goc", f"{stem}_goc.jpg")
+    
+    deleted_any = False
+    if os.path.exists(img_path):
+        try:
+            os.remove(img_path)
+            deleted_any = True
+        except Exception as e:
+            print(f"Error removing {img_path}: {e}")
+            
+    if os.path.exists(goc_path):
+        try:
+            os.remove(goc_path)
+            deleted_any = True
+        except Exception as e:
+            print(f"Error removing {goc_path}: {e}")
+            
+    if req.image_id and req.image_id in IMAGE_STORE:
+        IMAGE_STORE.pop(req.image_id, None)
+        
+    # Clean up from metadata
+    meta_path = os.path.join(target_dir, ".docscan_meta.json")
+    if os.path.exists(meta_path):
+        try:
+            with open(meta_path, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+            pages = meta.get("pages", {})
+            pages.pop(req.filename, None)
+            pages.pop(stem, None)
+            meta["pages"] = pages
+            with open(meta_path, "w", encoding="utf-8") as f:
+                json.dump(meta, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+            
+    return {"success": True, "deleted": deleted_any}
+
+@app.post("/api/move-to-unapproved")
+async def api_move_to_unapproved(req: MoveToUnapprovedRequest):
+    if not req.root_path or not os.path.exists(req.root_path):
+        raise HTTPException(status_code=400, detail="Thư mục gốc không tồn tại.")
+    
+    clean_rel = (req.relative_path or "").replace("/", "\\").strip("\\")
+    source_dir = os.path.normpath(os.path.join(req.root_path, clean_rel)) if clean_rel else req.root_path
+    source_file = os.path.join(source_dir, req.filename)
+    
+    if not os.path.exists(source_file):
+        raise HTTPException(status_code=404, detail="Không tìm thấy file ảnh nguồn.")
+        
+    folder_dir_name = req.unapproved_folder_name or "Kho_Chua_Duyet"
+    target_dir = os.path.normpath(os.path.join(req.root_path, folder_dir_name))
+    os.makedirs(target_dir, exist_ok=True)
+    
+    target_file = os.path.join(target_dir, req.filename)
+    if os.path.abspath(source_file) != os.path.abspath(target_file):
+        if os.path.exists(target_file):
+            stem, ext = os.path.splitext(req.filename)
+            target_file = os.path.join(target_dir, f"{stem}_{int(time.time())}{ext}")
+        import shutil
+        shutil.move(source_file, target_file)
+        
+    new_filename = os.path.basename(target_file)
+    target_fid = 'folder_' + folder_dir_name.replace('\\', '_').replace('/', '_')
+    
+    # Also clean up from old folder's metadata if present
+    meta_path = os.path.join(source_dir, ".docscan_meta.json")
+    if os.path.exists(meta_path):
+        try:
+            with open(meta_path, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+            pages = meta.get("pages", {})
+            pages.pop(req.filename, None)
+            meta["pages"] = pages
+            with open(meta_path, "w", encoding="utf-8") as f:
+                json.dump(meta, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+            
+    return {
+        "success": True,
+        "folder_id": target_fid,
+        "folder_name": "Kho ảnh chưa duyệt",
+        "relative_path": folder_dir_name,
+        "filename": new_filename
+    }
+
 @app.post("/api/scan-directory")
 async def scan_directory(req: ScanDirectoryRequest):
     if not req.path:
@@ -600,7 +752,9 @@ async def scan_directory(req: ScanDirectoryRequest):
             parent_rel = ''
         parent_id = None if rel == '' else ('folder_root' if parent_rel == '' else 'folder_' + parent_rel.replace('\\', '_').replace('/', '_'))
         
-        folder_name = os.path.basename(current_root) if rel != '' else root_name
+        raw_folder_name = os.path.basename(current_root) if rel != '' else root_name
+        is_unapproved = (rel == 'Kho_Chua_Duyet' or raw_folder_name == 'Kho_Chua_Duyet')
+        folder_name = "Kho ảnh chưa duyệt" if is_unapproved else raw_folder_name
         img_filenames = [f for f in sorted(files) if f.lower().endswith(('.jpg', '.jpeg', '.png', '.webp', '.bmp'))]
         
         # Check if folder has persistent metadata
@@ -687,7 +841,8 @@ async def scan_directory(req: ScanDirectoryRequest):
                             "folderId": fid,
                             "rotation": page_meta.get("rotation", 0),
                             "settings": page_meta.get("settings"),
-                            "history": page_meta.get("history")
+                            "history": page_meta.get("history"),
+                            "has_raw_original": os.path.exists(orig_subfolder_path)
                         })
                 except Exception as ex:
                     print(f"Error loading {full_img_path}: {ex}")

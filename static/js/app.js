@@ -239,13 +239,32 @@ class DocScanApp {
         this.txtInlineNewFolder = document.getElementById('txtInlineNewFolder');
         this.btnConfirmInlineFolder = document.getElementById('btnConfirmInlineFolder');
         this.btnCancelInlineFolder = document.getElementById('btnCancelInlineFolder');
-        this.btnCloseMoveModal = document.getElementById('btnCloseMoveModal');
         this.btnCancelMoveModal = document.getElementById('btnCancelMoveModal');
         this.btnSubmitMoveModal = document.getElementById('btnSubmitMoveModal');
         this.inlineCreateParentFolderId = null;
+
+        // Orphan Image Modal
+        this.orphanImageModal = document.getElementById('orphanImageModal');
+        this.orphanFileName = document.getElementById('orphanFileName');
+        this.orphanFolderPath = document.getElementById('orphanFolderPath');
+        this.orphanFileSize = document.getElementById('orphanFileSize');
+        this.orphanPreviewImg = document.getElementById('orphanPreviewImg');
+        this.btnOrphanAdopt = document.getElementById('btnOrphanAdopt');
+        this.btnOrphanDelete = document.getElementById('btnOrphanDelete');
+        this.btnOrphanMoveToUnapproved = document.getElementById('btnOrphanMoveToUnapproved');
+        this.btnOrphanCancel = document.getElementById('btnOrphanCancel');
+        this.btnCloseOrphanModal = document.getElementById('btnCloseOrphanModal');
+        this.pendingOrphanImageId = null;
     }
 
     bindEvents() {
+        // Orphan Image Modal Actions
+        if (this.btnOrphanAdopt) this.btnOrphanAdopt.addEventListener('click', () => this.adoptPendingOrphanAsOriginal());
+        if (this.btnOrphanDelete) this.btnOrphanDelete.addEventListener('click', () => this.deletePendingOrphanFile());
+        if (this.btnOrphanMoveToUnapproved) this.btnOrphanMoveToUnapproved.addEventListener('click', () => this.movePendingOrphanToUnapproved());
+        if (this.btnOrphanCancel) this.btnOrphanCancel.addEventListener('click', () => this.dismissPendingOrphanPrompt());
+        if (this.btnCloseOrphanModal) this.btnCloseOrphanModal.addEventListener('click', () => this.dismissPendingOrphanPrompt());
+
         // File Uploads
         this.fileInput.addEventListener('change', (e) => this.handleFilesSelected(e.target.files));
         this.heroFileInput.addEventListener('change', (e) => this.handleFilesSelected(e.target.files));
@@ -834,8 +853,10 @@ class DocScanApp {
                 projectId: this.activeProjectId,
                 name: f.name,
                 parentId: f.parentId,
+                relativePath: f.relativePath,
                 imageIds: f.imageIds || [],
-                isExpanded: true
+                isExpanded: true,
+                is_unapproved: f.is_unapproved || f.relativePath === 'Kho_Chua_Duyet' || f.name === 'Kho ảnh chưa duyệt'
             }));
 
             // Fallback root folder if empty
@@ -889,6 +910,8 @@ class DocScanApp {
                         saving_ratio: null,
                         aiAnalyzed: false,
                         aiDismissed: false,
+                        has_raw_original: p.has_raw_original !== false,
+                        orphanPromptDismissed: false,
                         settings: finalSettings
                     });
                 });
@@ -2201,6 +2224,13 @@ class DocScanApp {
         this.updateMetadataUI(page);
         this.updateHistoryButtons();
 
+        // Check if orphan image (no raw original in _goc/) - skip if in unapproved store
+        const folder = this.getFolder(page.folderId || this.activeFolderId);
+        const isUnapprovedFolder = folder && (folder.is_unapproved || folder.relativePath === 'Kho_Chua_Duyet' || folder.name.includes('chưa duyệt'));
+        if (!isUnapprovedFolder && page.has_raw_original === false && !page.orphanPromptDismissed) {
+            this.openOrphanPrompt(imageId);
+        }
+
         const img = new Image();
         img.onload = () => {
             this.currentImageObj = img;
@@ -2219,6 +2249,219 @@ class DocScanApp {
             }
         };
         img.src = page.preview_url;
+    }
+
+    openOrphanPrompt(imageId) {
+        const page = this.images.get(imageId);
+        if (!page) return;
+
+        const folder = this.getFolder(page.folderId || this.activeFolderId);
+        const folderRel = folder ? this.getFolderBreadcrumbPath(folder.id) : "Thư mục hiện tại";
+
+        this.pendingOrphanImageId = imageId;
+        this.orphanFileName.textContent = page.filename || page.suggested_name;
+        this.orphanFolderPath.textContent = folderRel;
+        this.orphanFileSize.textContent = page.file_size_human || "--";
+        this.orphanPreviewImg.src = page.preview_url || "";
+
+        this.orphanImageModal.style.display = 'flex';
+    }
+
+    closeOrphanPrompt() {
+        this.orphanImageModal.style.display = 'none';
+        this.pendingOrphanImageId = null;
+    }
+
+    async adoptPendingOrphanAsOriginal() {
+        const imageId = this.pendingOrphanImageId;
+        const page = this.images.get(imageId);
+        const proj = this.getActiveProject();
+        const folder = this.getFolder(page ? page.folderId : this.activeFolderId);
+        if (!page || !proj || !proj.rootDiskPath) {
+            if (page) {
+                page.has_raw_original = true;
+                page.orphanPromptDismissed = true;
+            }
+            this.closeOrphanPrompt();
+            return;
+        }
+
+        const relPath = folder ? this.getFolderRelativePath(folder.id) : "";
+        this.showLoading("Đang tạo cặp ảnh gốc và bản sửa...");
+
+        try {
+            const res = await fetch('/api/adopt-as-original', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    root_path: proj.rootDiskPath,
+                    relative_path: relPath,
+                    filename: page.filename,
+                    image_id: imageId
+                })
+            });
+
+            if (!res.ok) {
+                const err = await res.json();
+                throw new Error(err.detail || "Không thể tạo cặp ảnh gốc");
+            }
+
+            page.has_raw_original = true;
+            page.orphanPromptDismissed = true;
+            this.closeOrphanPrompt();
+            this.selectPage(imageId);
+            this.showToast(`✅ Đã tạo cặp ảnh gốc và bản sửa cho '${page.filename}'!`);
+        } catch (e) {
+            this.showToast(e.message || "Lỗi tạo bản gốc", false);
+        } finally {
+            this.hideLoading();
+        }
+    }
+
+    async movePendingOrphanToUnapproved() {
+        const imageId = this.pendingOrphanImageId;
+        const page = this.images.get(imageId);
+        const proj = this.getActiveProject();
+        const currentFolder = this.getFolder(page ? (page.folderId || this.activeFolderId) : this.activeFolderId);
+        if (!page || !proj || !proj.rootDiskPath) return;
+
+        const currentRel = currentFolder ? this.getFolderRelativePath(currentFolder.id) : "";
+        this.showLoading("Đang chuyển ảnh vào Kho ảnh chưa duyệt...");
+
+        try {
+            const res = await fetch('/api/move-to-unapproved', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    root_path: proj.rootDiskPath,
+                    relative_path: currentRel,
+                    filename: page.filename,
+                    image_id: imageId,
+                    unapproved_folder_name: "Kho_Chua_Duyet"
+                })
+            });
+
+            if (!res.ok) {
+                const err = await res.json();
+                throw new Error(err.detail || "Không thể chuyển vào Kho chưa duyệt");
+            }
+
+            const data = await res.json();
+
+            // Ensure unapproved folder exists in frontend state
+            let unapprovedFolder = this.folders.find(f => f.projectId === this.activeProjectId && (f.relativePath === 'Kho_Chua_Duyet' || f.name === 'Kho ảnh chưa duyệt' || f.id === data.folder_id));
+            if (!unapprovedFolder) {
+                unapprovedFolder = {
+                    id: data.folder_id,
+                    projectId: this.activeProjectId,
+                    name: 'Kho ảnh chưa duyệt',
+                    parentId: null,
+                    relativePath: 'Kho_Chua_Duyet',
+                    imageIds: [],
+                    isExpanded: true,
+                    is_unapproved: true
+                };
+                this.folders.push(unapprovedFolder);
+            }
+
+            // Remove from current folder
+            if (currentFolder && currentFolder.imageIds) {
+                const idx = currentFolder.imageIds.indexOf(imageId);
+                if (idx !== -1) currentFolder.imageIds.splice(idx, 1);
+            }
+
+            // Add to unapproved folder
+            if (!unapprovedFolder.imageIds.includes(imageId)) {
+                unapprovedFolder.imageIds.push(imageId);
+            }
+
+            page.folderId = unapprovedFolder.id;
+            page.filename = data.filename || page.filename;
+            page.orphanPromptDismissed = true;
+
+            this.closeOrphanPrompt();
+            this.renderFolderTree();
+            this.selectFolder(unapprovedFolder.id);
+            this.selectPage(imageId);
+            this.showToast(`📥 Đã chuyển '${page.filename}' vào Kho ảnh chưa duyệt!`);
+        } catch (e) {
+            this.showToast(e.message || "Lỗi chuyển vào Kho chưa duyệt", false);
+        } finally {
+            this.hideLoading();
+        }
+    }
+
+    async deletePendingOrphanFile() {
+        const imageId = this.pendingOrphanImageId;
+        const page = this.images.get(imageId);
+        const proj = this.getActiveProject();
+        const folder = this.getFolder(page ? page.folderId : this.activeFolderId);
+        if (!page) return;
+
+        if (!confirm(`Bạn có chắc chắn muốn xóa vĩnh viễn tệp '${page.filename}' khỏi máy tính?`)) {
+            return;
+        }
+
+        const relPath = folder ? this.getFolderRelativePath(folder.id) : "";
+        this.showLoading("Đang xóa tệp ảnh khỏi máy tính...");
+
+        try {
+            if (proj && proj.rootDiskPath) {
+                await fetch('/api/delete-disk-file', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        root_path: proj.rootDiskPath,
+                        relative_path: relPath,
+                        filename: page.filename,
+                        image_id: imageId
+                    })
+                });
+            }
+
+            this.closeOrphanPrompt();
+            this.deletePage(imageId);
+            this.showToast(`🗑️ Đã xóa file '${page.filename}' khỏi máy tính.`);
+        } catch (e) {
+            this.showToast(e.message || "Lỗi xóa file", false);
+        } finally {
+            this.hideLoading();
+        }
+    }
+
+    dismissPendingOrphanPrompt() {
+        const imageId = this.pendingOrphanImageId;
+        const page = this.images.get(imageId);
+        if (page) {
+            page.orphanPromptDismissed = true;
+        }
+        this.closeOrphanPrompt();
+    }
+
+    deletePage(imageId) {
+        const folder = this.getActiveFolder();
+        if (!folder) return;
+
+        const idx = folder.imageIds.indexOf(imageId);
+        if (idx !== -1) {
+            folder.imageIds.splice(idx, 1);
+        }
+        this.images.delete(imageId);
+        this.historyMap.delete(imageId);
+
+        this.renderFolderTree();
+        this.updateActiveFolderUI();
+
+        if (folder.imageIds.length === 0) {
+            this.activeImageId = null;
+            this.emptyState.style.display = 'flex';
+            this.editorStage.style.display = 'none';
+            this.docNameWrapper.style.display = 'none';
+            this.btnDownloadCurrent.disabled = true;
+        } else {
+            const nextIdx = Math.min(idx, folder.imageIds.length - 1);
+            this.selectPage(folder.imageIds[nextIdx]);
+        }
     }
 
     setViewMode(mode) {
