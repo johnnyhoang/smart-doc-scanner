@@ -1,2195 +1,935 @@
-// DocScan Studio Frontend Application
-// Quản lý Dự án & Thư mục Đa cấp, Sắp xếp thứ tự ảnh, Dán ảnh Clipboard & Lưu vào Thư mục Root trên Máy
+/**
+ * DocScan Studio — Frontend Controller
+ *
+ * MÔ HÌNH LÀM VIỆC (khớp 1:1 với backend):
+ *   Một trang tài liệu = (thư mục, tên tệp) và luôn gồm đủ 3 phần trên ổ cứng:
+ *       _goc/<tên>_goc.jpg   ảnh gốc      -> nền để chỉnh sửa, không bao giờ bị ghi đè ngầm
+ *       <tên>.jpg            ảnh đang sửa -> kết quả dựng từ metadata
+ *       .docscan_meta.json   metadata     -> 4 góc, góc xoay, bộ lọc, lịch sử hoàn tác
+ *
+ *   Giao diện KHÔNG giữ ảnh trong bộ nhớ: ảnh được tải theo yêu cầu qua /api/image
+ *   nên mở thư mục hàng trăm trang vẫn nhẹ và tức thì.
+ */
+
+const VIEW = { EDIT: 'edit', COMPARE: 'compare' };
+const AUTOSAVE_MS = 60000;
+const META_SAVE_MS = 1200;
+const PREVIEW_DEBOUNCE_MS = 160;
+const MAX_HISTORY = 30;
+
+const DEFAULT_SETTINGS = {
+    mode: 'natural',
+    shadow_reduction: 0.6,
+    sharpness: 0.6,
+    contrast: 0.2,
+    brightness: 0.0,
+    margin_percent: 0.02,
+    dewarp_enabled: false,
+    dewarp_strength: 0.8,
+    quality: 85,
+    normalize_res: true,
+};
+
+/** Gọi API JSON kèm thông báo lỗi tiếng Việt thân thiện. */
+async function apiJson(url, body, method = 'POST') {
+    const res = await fetch(url, {
+        method,
+        headers: { 'Content-Type': 'application/json' },
+        body: body === undefined ? undefined : JSON.stringify(body),
+    });
+    if (!res.ok) {
+        let detail = 'Thao tác không thực hiện được. Vui lòng thử lại.';
+        try {
+            const err = await res.json();
+            if (err && err.detail) detail = err.detail;
+        } catch (_) { /* giữ thông báo mặc định */ }
+        throw new Error(detail);
+    }
+    return res.json();
+}
+
+function loadImage(src) {
+    return new Promise((resolve, reject) => {
+        const img = new Image();
+        img.onload = () => resolve(img);
+        img.onerror = () => reject(new Error('Không tải được ảnh.'));
+        img.src = src;
+    });
+}
+
+function escapeHtml(text) {
+    const div = document.createElement('div');
+    div.textContent = text == null ? '' : String(text);
+    return div.innerHTML;
+}
+
+function formatBytes(bytes) {
+    if (!bytes) return '--';
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+    return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
+}
+
+
 
 class DocScanApp {
     constructor() {
-        const savedDiskPath = localStorage.getItem('docscan_root_path') || 'C:\\DocScan_Projects\\DuAn1';
+        this.rootPath = localStorage.getItem('docscan_root_path') || '';
+        this.rootName = '';
 
-        // Multi-level Project & Folder Architecture
-        this.projects = [
-            {
-                id: 'proj_default',
-                name: 'Dự án: Tài liệu Scan',
-                rootFolderId: 'folder_root',
-                rootDiskPath: savedDiskPath
-            }
-        ];
-        this.activeProjectId = 'proj_default';
-
-        this.folders = [
-            {
-                id: 'folder_root',
-                projectId: 'proj_default',
-                name: 'Thư mục gốc',
-                parentId: null,
-                imageIds: [],
-                isExpanded: true
-            }
-        ];
+        this.folders = [];
+        this.pages = new Map();
         this.activeFolderId = 'folder_root';
-
-        // Image Map: imageId -> Page Object
-        this.images = new Map();
         this.activeImageId = null;
-        this.currentView = 'crop';
-        this.currentViewMode = 'edited';
-        this.showCropHandles = true;
-        this.isHoldingCompare = false;
 
-        // Undo / Redo History Stacks per image
-        this.historyMap = new Map();
-        this.isApplyingHistory = false;
+        this.viewMode = VIEW.COMPARE;
+        this.holdingCompare = false;
+        this.showHandles = true;
+        this.sliderPos = 0.5;
 
-        // Canvas State with Padding for Free Margin Outpainting
+        this.dirtyPages = new Set();
+        this.selectedPageIds = new Set();
+        this.selectMode = false;
+        this.previewController = null;
+        this.previewUrl = null;
+        this.baselineImg = null;
+        this.baselineKey = null;
+        this.baselineUrl = null;
+
         this.canvas = document.getElementById('cropCanvas');
         this.ctx = this.canvas.getContext('2d');
-        this.currentImageObj = null;
+        this.originalImg = null;
+        this.editedImg = null;
+
         this.draggingCornerIndex = -1;
+        this.isSliding = false;
+        this.isPanning = false;
         this.handleRadius = 14;
         this.canvasPaddingRatio = 0.12;
 
-        // Zoom & Pan State
         this.zoom = 1.0;
         this.panX = 0;
         this.panY = 0;
-        this.isPanning = false;
-        this.panStartX = 0;
-        this.panStartY = 0;
 
-        // Magnifier State
         this.magCanvas = document.getElementById('magnifierCanvas');
         this.magCtx = this.magCanvas.getContext('2d');
         this.magLens = document.getElementById('magnifierLens');
         this.lensLabel = document.getElementById('lensLabel');
 
-        // Comparison Slider State
-        this.isSliding = false;
-
-        // Drag & Drop Reorder State
+        this.folderModalState = { mode: 'create', targetFolderId: null };
+        this.moveModalState = { imageId: null, targetFolderId: null };
+        this.pendingOrphanId = null;
         this.draggedImageId = null;
-
-        // Modal States
-        this.folderModalState = { mode: 'create_subfolder', targetFolderId: null };
-        this.moveModalState = { imageId: null, selectedTargetFolderId: null };
 
         this.initElements();
         this.bindEvents();
         this.initSidebarResizers();
-        this.updateProjectHeaderUI();
         this.renderFolderTree();
-        this.updateActiveFolderUI();
+        this.updateFolderHeader();
+        this.updateHistoryButtons();
+        this.updateFolderActionButtons();
 
-        // Auto load existing directory tree & images from disk
-        if (savedDiskPath) {
-            this.loadProjectFromDisk(savedDiskPath, false);
+        if (this.rootPath) {
+            this.loadProject(this.rootPath, false);
+        } else {
+            this.setStatus('Hãy chọn thư mục tài liệu trên máy để bắt đầu.', 'info');
         }
     }
+
+    // ======================================================
+    // 🔗 THAM CHIẾU PHẦN TỬ GIAO DIỆN
+    // ======================================================
 
     initElements() {
-        this.pageSidebar = document.getElementById('pageSidebar');
-        this.folderSection = document.getElementById('folderSection');
-        this.pagesSection = document.getElementById('pagesSection');
-        this.sidebarDividerH = document.getElementById('sidebarDividerH');
-        this.sidebarResizerV = document.getElementById('sidebarResizerV');
+        const $ = (id) => document.getElementById(id);
 
-        this.btnUndo = document.getElementById('btnUndo');
-        this.btnRedo = document.getElementById('btnRedo');
+        this.pageSidebar = $('pageSidebar');
+        this.folderSection = $('folderSection');
+        this.pagesSection = $('pagesSection');
+        this.sidebarDividerH = $('sidebarDividerH');
+        this.sidebarResizerV = $('sidebarResizerV');
 
-        // Project Selector Elements
-        this.projectDropdownContainer = document.getElementById('projectDropdownContainer');
-        this.btnProjectSelector = document.getElementById('btnProjectSelector');
-        this.currentProjectTitle = document.getElementById('currentProjectTitle');
-        this.projectDropdownMenu = document.getElementById('projectDropdownMenu');
+        this.btnUndo = $('btnUndo');
+        this.btnRedo = $('btnRedo');
 
-        // Physical Root Disk Directory Elements
-        this.btnPickRootDir = document.getElementById('btnPickRootDir');
-        this.btnOpenExplorer = document.getElementById('btnOpenExplorer');
-        this.lblRootPath = document.getElementById('lblRootPath');
+        this.btnPickRootDir = $('btnPickRootDir');
+        this.btnOpenExplorer = $('btnOpenExplorer');
+        this.lblRootPath = $('lblRootPath');
 
-        // Document name box & AI Suggestion Banner
-        this.docNameWrapper = document.getElementById('docNameWrapper');
-        this.txtDocName = document.getElementById('txtDocName');
-        this.btnMagicSuggest = document.getElementById('btnMagicSuggest');
-        this.suggestMenu = document.getElementById('suggestMenu');
+        this.docNameWrapper = $('docNameWrapper');
+        this.txtDocName = $('txtDocName');
+        this.btnMagicSuggest = $('btnMagicSuggest');
+        this.suggestMenu = $('suggestMenu');
 
-        this.aiSuggestBanner = document.getElementById('aiSuggestBanner');
-        this.btnRunAiSuggest = document.getElementById('btnRunAiSuggest');
-        this.btnDismissAiSuggest = document.getElementById('btnDismissAiSuggest');
+        this.fileInput = $('fileInput');
+        this.heroFileInput = $('heroFileInput');
+        this.btnSaveToDisk = $('btnSaveToDisk');
+        this.btnPanelApplyAsOriginal = $('btnPanelApplyAsOriginal');
 
-        this.fileInput = document.getElementById('fileInput');
-        this.heroFileInput = document.getElementById('heroFileInput');
+        this.btnExportPdf = $('btnExportPdf');
+        this.btnDownloadCurrent = $('btnDownloadCurrent');
 
-        // Save to Disk Dropdown in Header & Action Bar
-        this.btnSaveToDiskMenu = document.getElementById('btnSaveToDiskMenu');
-        this.saveDiskDropdown = document.getElementById('saveDiskDropdown');
-        this.menuSaveFolderDisk = document.getElementById('menuSaveFolderDisk');
-        this.menuSaveProjectDisk = document.getElementById('menuSaveProjectDisk');
-        this.btnSaveFolderToDisk = document.getElementById('btnSaveFolderToDisk');
+        this.emptyState = $('emptyState');
+        this.editorStage = $('editorStage');
+        this.dropZone = $('dropZone');
 
-        // Apply as Original buttons
-        this.btnApplyAsOriginal = document.getElementById('btnApplyAsOriginal');
-        this.btnPanelApplyAsOriginal = document.getElementById('btnPanelApplyAsOriginal');
+        this.folderTreeContainer = $('folderTreeContainer');
+        this.btnAddSubfolder = $('btnAddSubfolder');
+        this.activeFolderName = $('activeFolderName');
+        this.pageCount = $('pageCount');
+        this.pageListContainer = $('pageListContainer');
 
-        // Export PDF Dropdown
-        this.btnExportPdf = document.getElementById('btnExportPdf');
-        this.exportDropdown = document.getElementById('exportDropdown');
-        this.menuExportActiveFolder = document.getElementById('menuExportActiveFolder');
-        this.menuExportAllProject = document.getElementById('menuExportAllProject');
+        this.btnToggleSelectAll = $('btnToggleSelectAll');
+        this.lblToggleSelectAll = $('lblToggleSelectAll');
+        this.btnSortMenu = $('btnSortMenu');
+        this.sortDropdown = $('sortDropdown');
+        this.btnExportFolderPdf = $('btnExportFolderPdf');
+        this.lblExportPdf = $('lblExportPdf');
+        this.btnDownloadFolderZip = $('btnDownloadFolderZip');
+        this.lblDownloadZip = $('lblDownloadZip');
+        this.controlPanel = $('controlPanel');
 
-        this.btnDownloadCurrent = document.getElementById('btnDownloadCurrent');
-        this.downloadDropdown = document.getElementById('downloadDropdown');
+        this.selectionActionBar = $('selectionActionBar');
+        this.selectionCount = $('selectionCount');
+        this.btnSelectAllPages = $('btnSelectAllPages');
+        this.btnDeselectAllPages = $('btnDeselectAllPages');
 
-        this.emptyState = document.getElementById('emptyState');
-        this.editorStage = document.getElementById('editorStage');
-        this.dropZone = document.getElementById('dropZone');
+        this.btnModeEdit = $('btnModeEdit');
+        this.btnModeCompare = $('btnModeCompare');
+        this.canvasViewport = $('canvasViewport');
+        this.canvasTransformBox = $('canvasTransformBox');
+        this.resultInfoText = $('resultInfoText');
+        this.statusIcon = $('statusIcon');
+        this.processingPill = $('processingPill');
+        this.saveStatePill = $('saveStatePill');
 
-        // Folder & Page Sidebar Elements
-        this.folderTreeContainer = document.getElementById('folderTreeContainer');
-        this.btnAddSubfolder = document.getElementById('btnAddSubfolder');
-        this.btnNewProject = document.getElementById('btnNewProject');
-        this.activeFolderName = document.getElementById('activeFolderName');
-        this.pageCount = document.getElementById('pageCount');
-        this.pageListContainer = document.getElementById('pageListContainer');
+        this.btnZoomIn = $('btnZoomIn');
+        this.btnZoomOut = $('btnZoomOut');
+        this.btnZoomFit = $('btnZoomFit');
+        this.btnZoom100 = $('btnZoom100');
+        this.lblZoomLevel = $('lblZoomLevel');
 
-        this.btnSortMenu = document.getElementById('btnSortMenu');
-        this.sortDropdown = document.getElementById('sortDropdown');
-        this.btnExportFolderPdf = document.getElementById('btnExportFolderPdf');
+        this.btnResetToRawOriginal = $('btnResetToRawOriginal');
+        this.btnResetCorners = $('btnResetCorners');
+        this.btnAutoDetect = $('btnAutoDetect');
+        this.btnExpandMargin = $('btnExpandMargin');
+        this.btnShrinkMargin = $('btnShrinkMargin');
+        this.btnRotateLeft = $('btnRotateLeft');
+        this.btnRotateRight = $('btnRotateRight');
 
-        // Apple-Style View Switch & Controls (1 Cửa Sổ Duy Nhất)
-        this.btnShowEdited = document.getElementById('btnShowEdited');
-        this.btnShowOriginal = document.getElementById('btnShowOriginal');
-        this.btnHoldCompare = document.getElementById('btnHoldCompare');
-        this.btnToggleCropHandles = document.getElementById('btnToggleCropHandles');
-        this.cropCanvasWrapper = document.getElementById('cropCanvasWrapper');
-        this.canvasViewport = document.getElementById('canvasViewport');
-        this.canvasTransformBox = document.getElementById('canvasTransformBox');
-        this.resultStatusBar = document.getElementById('resultStatusBar');
-        this.resultInfoText = document.getElementById('resultInfoText');
-        this.statusIcon = document.getElementById('statusIcon');
-
-        this.btnZoomIn = document.getElementById('btnZoomIn');
-        this.btnZoomOut = document.getElementById('btnZoomOut');
-        this.btnZoomFit = document.getElementById('btnZoomFit');
-        this.btnZoom100 = document.getElementById('btnZoom100');
-        this.lblZoomLevel = document.getElementById('lblZoomLevel');
-
-        this.btnAutoDetect = document.getElementById('btnAutoDetect');
-        this.btnExpandMargin = document.getElementById('btnExpandMargin');
-        this.btnResetCorners = document.getElementById('btnResetCorners');
-        this.btnResetToRawOriginal = document.getElementById('btnResetToRawOriginal');
-        this.btnRotateLeft = document.getElementById('btnRotateLeft');
-        this.btnRotateRight = document.getElementById('btnRotateRight');
-
-        // Inspector Controls
         this.modeCards = document.querySelectorAll('.mode-card');
-        this.chkDewarp = document.getElementById('chkDewarp');
-        this.dewarpStrengthGroup = document.getElementById('dewarpStrengthGroup');
-        this.rngDewarp = document.getElementById('rngDewarp');
-        this.valDewarp = document.getElementById('valDewarp');
+        this.chkDewarp = $('chkDewarp');
+        this.dewarpStrengthGroup = $('dewarpStrengthGroup');
+        this.rngDewarp = $('rngDewarp');
+        this.valDewarp = $('valDewarp');
+        this.rngShadow = $('rngShadow');
+        this.valShadow = $('valShadow');
+        this.rngSharpness = $('rngSharpness');
+        this.valSharpness = $('valSharpness');
+        this.rngMargin = $('rngMargin');
+        this.valMargin = $('valMargin');
+        this.rngContrast = $('rngContrast');
+        this.valContrast = $('valContrast');
+        this.rngQuality = $('rngQuality');
+        this.valQuality = $('valQuality');
+        this.chkNormalizeDpi = $('chkNormalizeDpi');
 
-        this.rngShadow = document.getElementById('rngShadow');
-        this.valShadow = document.getElementById('valShadow');
+        this.metaOrigDim = $('metaOrigDim');
+        this.metaOrigSize = $('metaOrigSize');
+        this.metaOutDim = $('metaOutDim');
+        this.metaOutSize = $('metaOutSize');
+        this.savingPill = $('savingPill');
+        this.cardFileName = $('cardFileName');
+        this.cardOrigDim = $('cardOrigDim');
+        this.cardOrigSize = $('cardOrigSize');
+        this.cardOutSize = $('cardOutSize');
+        this.cardSavingsPct = $('cardSavingsPct');
+        this.cardOriginalState = $('cardOriginalState');
 
-        this.rngSharpness = document.getElementById('rngSharpness');
-        this.valSharpness = document.getElementById('valSharpness');
+        this.toast = $('toast');
+        this.toastMsg = $('toastMsg');
+        this.toastIcon = $('toastIcon');
+        this.loadingOverlay = $('loadingOverlay');
+        this.loadingText = $('loadingText');
 
-        this.rngMargin = document.getElementById('rngMargin');
-        this.valMargin = document.getElementById('valMargin');
+        this.folderNameModal = $('folderNameModal');
+        this.folderModalTitle = $('folderModalTitle');
+        this.folderModalLabel = $('folderModalLabel');
+        this.txtFolderModalName = $('txtFolderModalName');
+        this.folderModalHint = $('folderModalHint');
+        this.btnCloseFolderModal = $('btnCloseFolderModal');
+        this.btnCancelFolderModal = $('btnCancelFolderModal');
+        this.btnSubmitFolderModal = $('btnSubmitFolderModal');
 
-        this.rngContrast = document.getElementById('rngContrast');
-        this.valContrast = document.getElementById('valContrast');
+        this.moveImageModal = $('moveImageModal');
+        this.moveImageDesc = $('moveImageDesc');
+        this.moveFolderPicker = $('moveFolderPicker');
+        this.btnMoveModalNewFolder = $('btnMoveModalNewFolder');
+        this.moveInlineCreateBox = $('moveInlineCreateBox');
+        this.txtInlineNewFolder = $('txtInlineNewFolder');
+        this.btnConfirmInlineFolder = $('btnConfirmInlineFolder');
+        this.btnCancelInlineFolder = $('btnCancelInlineFolder');
+        this.btnCloseMoveModal = $('btnCloseMoveModal');
+        this.btnCancelMoveModal = $('btnCancelMoveModal');
+        this.btnSubmitMoveModal = $('btnSubmitMoveModal');
 
-        this.rngQuality = document.getElementById('rngQuality');
-        this.valQuality = document.getElementById('valQuality');
-        this.chkNormalizeDpi = document.getElementById('chkNormalizeDpi');
-
-        // Metadata elements
-        this.metaOrigDim = document.getElementById('metaOrigDim');
-        this.metaOrigSize = document.getElementById('metaOrigSize');
-        this.metaOutDim = document.getElementById('metaOutDim');
-        this.metaOutSize = document.getElementById('metaOutSize');
-        this.savingPill = document.getElementById('savingPill');
-
-        this.cardFileName = document.getElementById('cardFileName');
-        this.cardOrigDim = document.getElementById('cardOrigDim');
-        this.cardOrigSize = document.getElementById('cardOrigSize');
-        this.cardMegapixels = document.getElementById('cardMegapixels');
-        this.cardOutSize = document.getElementById('cardOutSize');
-        this.cardSavingRatio = document.getElementById('cardSavingRatio');
-
-        // Modals & Feedback
-        this.toast = document.getElementById('toast');
-        this.toastMsg = document.getElementById('toastMsg');
-        this.loadingOverlay = document.getElementById('loadingOverlay');
-        this.loadingText = document.getElementById('loadingText');
-
-        // Folder Modal
-        this.folderNameModal = document.getElementById('folderNameModal');
-        this.folderModalTitle = document.getElementById('folderModalTitle');
-        this.folderModalLabel = document.getElementById('folderModalLabel');
-        this.txtFolderModalName = document.getElementById('txtFolderModalName');
-        this.folderModalHint = document.getElementById('folderModalHint');
-        this.btnCloseFolderModal = document.getElementById('btnCloseFolderModal');
-        this.btnCancelFolderModal = document.getElementById('btnCancelFolderModal');
-        this.btnSubmitFolderModal = document.getElementById('btnSubmitFolderModal');
-
-        // Move Image Modal
-        this.moveImageModal = document.getElementById('moveImageModal');
-        this.moveImageDesc = document.getElementById('moveImageDesc');
-        this.moveFolderPicker = document.getElementById('moveFolderPicker');
-        this.btnMoveModalNewFolder = document.getElementById('btnMoveModalNewFolder');
-        this.moveInlineCreateBox = document.getElementById('moveInlineCreateBox');
-        this.txtInlineNewFolder = document.getElementById('txtInlineNewFolder');
-        this.btnConfirmInlineFolder = document.getElementById('btnConfirmInlineFolder');
-        this.btnCancelInlineFolder = document.getElementById('btnCancelInlineFolder');
-        this.btnCloseMoveModal = document.getElementById('btnCloseMoveModal');
-        this.btnCancelMoveModal = document.getElementById('btnCancelMoveModal');
-        this.btnSubmitMoveModal = document.getElementById('btnSubmitMoveModal');
-        this.inlineCreateParentFolderId = null;
-
-        // Orphan Image Modal
-        this.orphanImageModal = document.getElementById('orphanImageModal');
-        this.orphanFileName = document.getElementById('orphanFileName');
-        this.orphanFolderPath = document.getElementById('orphanFolderPath');
-        this.orphanFileSize = document.getElementById('orphanFileSize');
-        this.orphanPreviewImg = document.getElementById('orphanPreviewImg');
-        this.btnOrphanAdopt = document.getElementById('btnOrphanAdopt');
-        this.btnOrphanDelete = document.getElementById('btnOrphanDelete');
-        this.btnOrphanMoveToUnapproved = document.getElementById('btnOrphanMoveToUnapproved');
-        this.btnOrphanCancel = document.getElementById('btnOrphanCancel');
-        this.btnCloseOrphanModal = document.getElementById('btnCloseOrphanModal');
-        this.pendingOrphanImageId = null;
+        this.orphanImageModal = $('orphanImageModal');
+        this.orphanFileName = $('orphanFileName');
+        this.orphanFolderPath = $('orphanFolderPath');
+        this.orphanFileSize = $('orphanFileSize');
+        this.orphanPreviewImg = $('orphanPreviewImg');
+        this.btnOrphanAdopt = $('btnOrphanAdopt');
+        this.btnOrphanDelete = $('btnOrphanDelete');
+        this.btnOrphanMoveToUnapproved = $('btnOrphanMoveToUnapproved');
+        this.btnOrphanCancel = $('btnOrphanCancel');
+        this.btnCloseOrphanModal = $('btnCloseOrphanModal');
     }
 
+    // ======================================================
+    // 🎛️ GẮN SỰ KIỆN
+    // ======================================================
+
     bindEvents() {
-        // Orphan Image Modal Actions
-        if (this.btnOrphanAdopt) this.btnOrphanAdopt.addEventListener('click', () => this.adoptPendingOrphanAsOriginal());
-        if (this.btnOrphanDelete) this.btnOrphanDelete.addEventListener('click', () => this.deletePendingOrphanFile());
-        if (this.btnOrphanMoveToUnapproved) this.btnOrphanMoveToUnapproved.addEventListener('click', () => this.movePendingOrphanToUnapproved());
-        if (this.btnOrphanCancel) this.btnOrphanCancel.addEventListener('click', () => this.dismissPendingOrphanPrompt());
-        if (this.btnCloseOrphanModal) this.btnCloseOrphanModal.addEventListener('click', () => this.dismissPendingOrphanPrompt());
+        const on = (el, evt, fn, opts) => { if (el) el.addEventListener(evt, fn, opts); };
 
-        // File Uploads
-        this.fileInput.addEventListener('change', (e) => this.handleFilesSelected(e.target.files));
-        this.heroFileInput.addEventListener('change', (e) => this.handleFilesSelected(e.target.files));
-
-        // Clipboard Paste Listener (Ctrl + V) from anywhere
+        // --- Nhập ảnh ---
+        on(this.fileInput, 'change', (e) => this.importFiles(e.target.files));
+        on(this.heroFileInput, 'change', (e) => this.importFiles(e.target.files));
         window.addEventListener('paste', (e) => this.handleClipboardPaste(e));
 
-        // Drag and Drop Upload
         ['dragenter', 'dragover', 'dragleave', 'drop'].forEach(evt => {
-            this.dropZone.addEventListener(evt, (e) => {
-                e.preventDefault();
-                e.stopPropagation();
-            });
+            on(this.dropZone, evt, (e) => { e.preventDefault(); e.stopPropagation(); });
         });
-
-        this.dropZone.addEventListener('dragover', () => this.dropZone.classList.add('dragover'));
-        this.dropZone.addEventListener('dragleave', () => this.dropZone.classList.remove('dragover'));
-        this.dropZone.addEventListener('drop', (e) => {
+        on(this.dropZone, 'dragover', () => this.dropZone.classList.add('dragover'));
+        on(this.dropZone, 'dragleave', () => this.dropZone.classList.remove('dragover'));
+        on(this.dropZone, 'drop', (e) => {
             this.dropZone.classList.remove('dragover');
-            if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
-                this.handleFilesSelected(e.dataTransfer.files);
-            }
+            if (e.dataTransfer.files?.length) this.importFiles(e.dataTransfer.files);
         });
 
-        // Project Selector Dropdown in Header
-        if (this.btnProjectSelector) {
-            this.btnProjectSelector.addEventListener('click', (e) => {
-                e.stopPropagation();
-                this.renderProjectDropdownMenu();
-                this.projectDropdownContainer.classList.toggle('open');
-            });
-        }
+        // --- Thư mục gốc trên máy ---
+        on(this.btnPickRootDir, 'click', () => this.pickRootDirectory());
+        on(this.btnOpenExplorer, 'click', () => this.openActiveFolderInExplorer());
+        on(this.lblRootPath, 'click', () => this.pickRootDirectory());
 
-        // Physical Disk Root Directory Controls
-        if (this.btnPickRootDir) {
-            this.btnPickRootDir.addEventListener('click', () => this.pickRootDiskDirectory());
-        }
-        if (this.btnOpenExplorer) {
-            this.btnOpenExplorer.addEventListener('click', () => this.openActiveFolderInExplorer());
-        }
-        if (this.lblRootPath) {
-            this.lblRootPath.addEventListener('click', () => this.editRootDiskPath());
-        }
-
-        // Document Name Input & Suggestion dropdown
-        this.txtDocName.addEventListener('input', (e) => {
-            const page = this.getActivePage();
-            if (page) {
-                page.suggested_name = e.target.value;
-                this.cardFileName.textContent = e.target.value;
-                this.updatePageThumbTitle(page.id, e.target.value);
-                this.debounceSaveMetadata(this.activeFolderId);
-                this.scheduleAutoSave(60000);
-            }
-        });
-
-        this.btnMagicSuggest.addEventListener('click', (e) => {
-            e.stopPropagation();
-            this.suggestMenu.classList.toggle('open');
-        });
-
-        if (this.btnRunAiSuggest) {
-            this.btnRunAiSuggest.addEventListener('click', () => this.triggerAiDocumentNaming());
-        }
-        if (this.btnDismissAiSuggest) {
-            this.btnDismissAiSuggest.addEventListener('click', () => {
+        // --- Tên tài liệu: Enter / rời ô = đổi tên cả bộ ba ---
+        on(this.txtDocName, 'keydown', (e) => {
+            if (e.key === 'Enter') { e.preventDefault(); this.txtDocName.blur(); }
+            if (e.key === 'Escape') {
                 const page = this.getActivePage();
-                if (page) page.aiDismissed = true;
-                if (this.aiSuggestBanner) this.aiSuggestBanner.style.display = 'none';
-            });
-        }
+                if (page) this.txtDocName.value = page.docName;
+                this.txtDocName.blur();
+            }
+        });
+        on(this.txtDocName, 'blur', () => this.commitDocumentName());
 
-        // Global dropdown auto-close
+        on(this.btnMagicSuggest, 'click', (e) => {
+            e.stopPropagation();
+            const page = this.getActivePage();
+            if (!page) return;
+            if (page.nameSuggestions && page.nameSuggestions.length > 0) {
+                this.suggestMenu.classList.toggle('open');
+            } else {
+                this.runAiNaming();
+            }
+        });
+
         window.addEventListener('click', () => {
-            this.suggestMenu.classList.remove('open');
+            this.suggestMenu?.classList.remove('open');
             document.querySelectorAll('.dropdown').forEach(d => d.classList.remove('open'));
         });
 
-        // Undo / Redo
-        this.btnUndo.addEventListener('click', () => this.undo());
-        this.btnRedo.addEventListener('click', () => this.redo());
+        // --- Hoàn tác / Làm lại ---
+        on(this.btnUndo, 'click', () => this.undo());
+        on(this.btnRedo, 'click', () => this.redo());
 
         window.addEventListener('keydown', (e) => {
-            if ((e.ctrlKey || e.metaKey) && e.key === 'z' && !e.shiftKey) {
-                e.preventDefault();
-                this.undo();
-            } else if ((e.ctrlKey || e.metaKey) && (e.key === 'y' || (e.key === 'z' && e.shiftKey))) {
-                e.preventDefault();
-                this.redo();
+            const typing = ['INPUT', 'TEXTAREA'].includes(e.target.tagName);
+            if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z' && !e.shiftKey) {
+                e.preventDefault(); this.undo();
+            } else if ((e.ctrlKey || e.metaKey) && (e.key.toLowerCase() === 'y' || (e.key.toLowerCase() === 'z' && e.shiftKey))) {
+                e.preventDefault(); this.redo();
+            } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') {
+                e.preventDefault(); this.saveProject();
+            } else if (!typing && (e.code === 'Space' || e.key === '\\')) {
+                if (!this.holdingCompare) { e.preventDefault(); this.setHoldingCompare(true); }
             }
         });
-
-        // Apple-Style View Switch & Hold-to-Compare
-        if (this.btnShowEdited) {
-            this.btnShowEdited.addEventListener('click', () => {
-                this.setViewMode('edited');
-            });
-        }
-        if (this.btnShowOriginal) {
-            this.btnShowOriginal.addEventListener('click', () => {
-                this.setViewMode('original');
-            });
-        }
-
-        // Hold to compare button (Mouse & Touch)
-        if (this.btnHoldCompare) {
-            const startHold = (e) => {
-                e.preventDefault();
-                this.isHoldingCompare = true;
-                this.btnHoldCompare.classList.add('active');
-                this.renderCropCanvas();
-            };
-            const endHold = (e) => {
-                if (this.isHoldingCompare) {
-                    this.isHoldingCompare = false;
-                    this.btnHoldCompare.classList.remove('active');
-                    this.renderCropCanvas();
-                }
-            };
-            this.btnHoldCompare.addEventListener('mousedown', startHold);
-            this.btnHoldCompare.addEventListener('touchstart', startHold, { passive: false });
-            window.addEventListener('mouseup', endHold);
-            window.addEventListener('touchend', endHold);
-        }
-
-        // Toggle crop corner handles
-        if (this.btnToggleCropHandles) {
-            this.btnToggleCropHandles.addEventListener('click', () => {
-                this.showCropHandles = !this.showCropHandles;
-                this.btnToggleCropHandles.classList.toggle('active', this.showCropHandles);
-                if (this.currentViewMode !== 'original') {
-                    this.setViewMode('original');
-                } else {
-                    this.renderCropCanvas();
-                }
-            });
-        }
-
-        // Keyboard Spacebar / Backslash Hold-to-Compare
-        window.addEventListener('keydown', (e) => {
-            if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
-            if (e.code === 'Space' || e.key === '\\') {
-                if (!this.isHoldingCompare) {
-                    e.preventDefault();
-                    this.isHoldingCompare = true;
-                    if (this.btnHoldCompare) this.btnHoldCompare.classList.add('active');
-                    this.renderCropCanvas();
-                }
-            }
-        });
-
         window.addEventListener('keyup', (e) => {
-            if (e.code === 'Space' || e.key === '\\') {
-                if (this.isHoldingCompare) {
-                    this.isHoldingCompare = false;
-                    if (this.btnHoldCompare) this.btnHoldCompare.classList.remove('active');
-                    this.renderCropCanvas();
-                }
+            if ((e.code === 'Space' || e.key === '\\') && this.holdingCompare) this.setHoldingCompare(false);
+        });
+
+        // --- 2 Chế độ làm việc: Chỉnh sửa & So sánh ---
+        on(this.btnModeEdit, 'click', () => this.setViewMode(VIEW.EDIT));
+        on(this.btnModeCompare, 'click', () => this.setViewMode(VIEW.COMPARE));
+
+        // --- Thu phóng & kéo ---
+        on(this.btnZoomIn, 'click', () => this.setZoom(this.zoom * 1.25));
+        on(this.btnZoomOut, 'click', () => this.setZoom(this.zoom / 1.25));
+        on(this.btnZoomFit, 'click', () => this.zoomFit());
+        on(this.btnZoom100, 'click', () => this.zoom100());
+        on(this.canvasViewport, 'wheel', (e) => {
+            e.preventDefault();
+            const factor = e.deltaY < 0 ? 1.15 : 0.85;
+            this.zoomAt(factor, e.clientX, e.clientY);
+        }, { passive: false });
+
+        on(this.canvasViewport, 'mousedown', (e) => this.onPointerDown(e));
+        on(this.canvasViewport, 'touchstart', (e) => {
+            if (e.touches.length === 1) this.onPointerDown(e.touches[0]);
+        }, { passive: false });
+        on(this.canvasViewport, 'touchmove', (e) => {
+            if (e.touches.length === 1) {
+                if (this.draggingCornerIndex !== -1 || this.isPanning || this.isSliding) e.preventDefault();
+                this.onPointerMove(e.touches[0]);
             }
-        });
+        }, { passive: false });
+        on(this.canvasViewport, 'touchend', () => this.onPointerUp());
+        window.addEventListener('mousemove', (e) => this.onPointerMove(e));
+        window.addEventListener('mouseup', () => this.onPointerUp());
 
-        // Zoom Controls
-        this.btnZoomIn.addEventListener('click', () => this.setZoom(this.zoom * 1.25));
-        this.btnZoomOut.addEventListener('click', () => this.setZoom(this.zoom / 1.25));
-        this.btnZoomFit.addEventListener('click', () => this.resetZoomFit());
-        this.btnZoom100.addEventListener('click', () => this.setZoom(1.0, 0, 0));
+        // --- Công cụ ảnh ---
+        on(this.btnResetToRawOriginal, 'click', () => this.resetToOriginal());
+        on(this.btnResetCorners, 'click', () => this.setCornersToFullFrame());
+        on(this.btnAutoDetect, 'click', () => this.autoDetectCorners());
+        on(this.btnExpandMargin, 'click', () => this.expandMargin());
+        on(this.btnShrinkMargin, 'click', () => this.shrinkMargin());
+        on(this.btnRotateLeft, 'click', () => this.rotate(-90));
+        on(this.btnRotateRight, 'click', () => this.rotate(90));
+        on(this.btnPanelApplyAsOriginal, 'click', () => this.applyAsOriginal());
 
-        this.canvasViewport.addEventListener('wheel', (e) => this.handleWheelZoom(e), { passive: false });
-
-        // Canvas Viewport Mouse & Touch
-        this.canvasViewport.addEventListener('mousedown', (e) => this.onViewportMouseDown(e));
-        this.canvasViewport.addEventListener('touchstart', (e) => this.onTouchStart(e), { passive: false });
-        this.canvasViewport.addEventListener('touchmove', (e) => this.onTouchMove(e), { passive: false });
-        this.canvasViewport.addEventListener('touchend', () => this.onViewportMouseUp());
-
-        // Global mouse moves and mouse up
-        window.addEventListener('mousemove', (e) => this.onViewportMouseMove(e));
-        window.addEventListener('mouseup', () => this.onViewportMouseUp());
-
-        // Corner & Image Tools
-        this.btnAutoDetect.addEventListener('click', () => {
-            this.pushHistoryState("Tự nhận góc");
-            this.autoDetectActivePage();
-        });
-
-        this.btnExpandMargin.addEventListener('click', () => {
-            this.pushHistoryState("Mở rộng lề 2%");
-            this.expandMarginActivePage(0.02);
-        });
-
-        this.btnResetCorners.addEventListener('click', () => {
-            this.pushHistoryState("Trọn ảnh");
-            this.resetCornersToBorder();
-        });
-
-        if (this.btnResetToRawOriginal) {
-            this.btnResetToRawOriginal.addEventListener('click', () => this.resetToRawOriginal());
-        }
-
-        this.btnRotateLeft.addEventListener('click', () => {
-            this.pushHistoryState("Xoay trái 90°");
-            this.rotateActivePage(-90);
-        });
-
-        this.btnRotateRight.addEventListener('click', () => {
-            this.pushHistoryState("Xoay phải 90°");
-            this.rotateActivePage(90);
-        });
-
-        if (this.btnApplyAsOriginal) {
-            this.btnApplyAsOriginal.addEventListener('click', () => this.applyCurrentAsOriginal());
-        }
-        if (this.btnPanelApplyAsOriginal) {
-            this.btnPanelApplyAsOriginal.addEventListener('click', () => this.applyCurrentAsOriginal());
-        }
-
-        // Color & Filter Modes
+        // --- Bộ lọc & thanh trượt ---
         this.modeCards.forEach(card => {
-            card.addEventListener('click', () => {
-                this.modeCards.forEach(c => c.classList.remove('active'));
-                card.classList.add('active');
-                if (this.getActivePage()) {
-                    this.pushHistoryState(`Đổi bộ lọc: ${card.dataset.mode}`);
-                    this.getActivePage().settings.mode = card.dataset.mode;
-                    this.processActivePage();
-                }
+            on(card, 'click', () => {
+                const page = this.getActivePage();
+                if (!page) return;
+                this.pushHistory(`Đổi bộ lọc: ${card.querySelector('.mode-title')?.textContent || ''}`);
+                page.settings.mode = card.dataset.mode;
+                this.modeCards.forEach(c => c.classList.toggle('active', c === card));
+                if (this.viewMode !== VIEW.COMPARE) this.setViewMode(VIEW.COMPARE);
+                this.requestPreview();
             });
         });
 
-        // Inspector Controls
-        this.chkDewarp.addEventListener('change', (e) => {
+        const bindSlider = (input, label, apply, formatter) => {
+            if (!input) return;
+            // Ghi 1 mốc hoàn tác duy nhất cho cả lượt kéo, không phải mỗi pixel.
+            on(input, 'pointerdown', () => { if (this.getActivePage()) this.pushHistory('Chỉnh thanh trượt'); });
+            on(input, 'input', (e) => {
+                const page = this.getActivePage();
+                if (label) label.textContent = formatter(e.target.value);
+                if (!page) return;
+                apply(page, e.target.value);
+                if (this.viewMode !== VIEW.COMPARE) this.setViewMode(VIEW.COMPARE);
+                this.requestPreview();
+            });
+        };
+
+        bindSlider(this.rngDewarp, this.valDewarp,
+            (p, v) => { p.settings.dewarp_strength = parseFloat(v); }, (v) => v);
+        bindSlider(this.rngShadow, this.valShadow,
+            (p, v) => { p.settings.shadow_reduction = v / 100; }, (v) => `${v}%`);
+        bindSlider(this.rngSharpness, this.valSharpness,
+            (p, v) => { p.settings.sharpness = v / 100; }, (v) => `${v}%`);
+        bindSlider(this.rngContrast, this.valContrast,
+            (p, v) => { p.settings.contrast = v / 100; }, (v) => `${v}%`);
+        bindSlider(this.rngQuality, this.valQuality,
+            (p, v) => { p.settings.quality = parseInt(v, 10); }, (v) => `${v}%`);
+        bindSlider(this.rngMargin, this.valMargin,
+            (p, v) => { p.settings.margin_percent = parseFloat(v) / 100; },
+            (v) => `${parseFloat(v).toFixed(1)}%`);
+
+        on(this.chkDewarp, 'change', (e) => {
             this.dewarpStrengthGroup.style.display = e.target.checked ? 'flex' : 'none';
-            if (this.getActivePage()) {
-                this.pushHistoryState(e.target.checked ? "Bật làm phẳng" : "Tắt làm phẳng");
-                this.getActivePage().settings.dewarp_enabled = e.target.checked;
-                this.processActivePage();
-            }
+            const page = this.getActivePage();
+            if (!page) return;
+            this.pushHistory(e.target.checked ? 'Bật làm phẳng trang' : 'Tắt làm phẳng trang');
+            page.settings.dewarp_enabled = e.target.checked;
+            if (this.viewMode !== VIEW.COMPARE) this.setViewMode(VIEW.COMPARE);
+            this.requestPreview();
         });
 
-        this.rngDewarp.addEventListener('input', (e) => {
-            this.valDewarp.textContent = e.target.value;
-            if (this.getActivePage()) {
-                this.getActivePage().settings.dewarp_strength = parseFloat(e.target.value);
-                this.debounceProcess();
-            }
+        on(this.chkNormalizeDpi, 'change', (e) => {
+            const page = this.getActivePage();
+            if (!page) return;
+            page.settings.normalize_res = e.target.checked;
+            this.markDirty(page);
+            this.scheduleMetaSave();
         });
 
-        this.rngShadow.addEventListener('input', (e) => {
-            this.valShadow.textContent = `${e.target.value}%`;
-            if (this.getActivePage()) {
-                this.getActivePage().settings.shadow_reduction = e.target.value / 100;
-                this.debounceProcess();
-            }
-        });
+        // --- Lưu & xuất trên thanh Top Bar (phục vụ trực tiếp cho trang đang mở) ---
+        on(this.btnSaveToDisk, 'click', () => this.saveProject());
+        on(this.btnExportPdf, 'click', () => this.exportCurrentPagePdf());
+        on(this.btnDownloadCurrent, 'click', () => this.downloadCurrentPage('jpeg'));
 
-        this.rngSharpness.addEventListener('input', (e) => {
-            this.valSharpness.textContent = `${e.target.value}%`;
-            if (this.getActivePage()) {
-                this.getActivePage().settings.sharpness = e.target.value / 100;
-                this.debounceProcess();
-            }
-        });
+        // --- Xuất theo Thư mục (ở thanh công cụ Thumbnail) ---
+        on(this.btnExportFolderPdf, 'click', () => this.exportFolderPdf(this.activeFolderId));
+        on(this.btnDownloadFolderZip, 'click', () => this.downloadFolderZip(this.activeFolderId));
 
-        this.rngMargin.addEventListener('input', (e) => {
-            this.valMargin.textContent = `${parseFloat(e.target.value).toFixed(1)}%`;
-            if (this.getActivePage()) {
-                this.getActivePage().settings.margin_percent = parseFloat(e.target.value) / 100;
-            }
-        });
+        // --- Chọn ảnh đa mục tiêu ---
+        on(this.btnToggleSelectAll, 'click', () => this.toggleSelectAll());
+        on(this.btnSelectAllPages, 'click', () => this.selectAllPages());
+        on(this.btnDeselectAllPages, 'click', () => this.deselectAllPages());
 
-        this.rngContrast.addEventListener('input', (e) => {
-            this.valContrast.textContent = `${e.target.value}%`;
-            if (this.getActivePage()) {
-                this.getActivePage().settings.contrast = e.target.value / 100;
-                this.debounceProcess();
-            }
-        });
-
-        this.rngQuality.addEventListener('input', (e) => {
-            this.valQuality.textContent = `${e.target.value}%`;
-            if (this.getActivePage()) {
-                this.getActivePage().settings.quality = parseInt(e.target.value);
-                this.debounceProcess();
-            }
-        });
-
-        this.chkNormalizeDpi.addEventListener('change', (e) => {
-            if (this.getActivePage()) {
-                this.getActivePage().settings.normalize_res = e.target.checked;
-                this.processActivePage();
-            }
-        });
-
-        // Download Single Page Dropdown
-        this.btnDownloadCurrent.addEventListener('click', (e) => {
-            e.stopPropagation();
-            this.btnDownloadCurrent.parentElement.classList.toggle('open');
-        });
-
-        this.downloadDropdown.querySelectorAll('a').forEach(link => {
-            link.addEventListener('click', (e) => {
-                e.preventDefault();
-                const fmt = link.dataset.format;
-                this.downloadCurrentPage(fmt);
-            });
-        });
-
-        // Save to Disk Dropdown in Header & Sidebar Button
-        if (this.btnSaveToDiskMenu) {
-            this.btnSaveToDiskMenu.addEventListener('click', (e) => {
-                e.stopPropagation();
-                this.btnSaveToDiskMenu.parentElement.classList.toggle('open');
-            });
-        }
-
-        if (this.menuSaveFolderDisk) {
-            this.menuSaveFolderDisk.addEventListener('click', (e) => {
-                e.preventDefault();
-                this.saveActiveFolderToDisk();
-            });
-        }
-
-        if (this.menuSaveProjectDisk) {
-            this.menuSaveProjectDisk.addEventListener('click', (e) => {
-                e.preventDefault();
-                this.saveWholeProjectToDisk();
-            });
-        }
-
-        if (this.btnSaveFolderToDisk) {
-            this.btnSaveFolderToDisk.addEventListener('click', () => {
-                this.saveActiveFolderToDisk();
-            });
-        }
-
-        // Export PDF Dropdown in Header
-        this.btnExportPdf.addEventListener('click', (e) => {
-            e.stopPropagation();
-            this.btnExportPdf.parentElement.classList.toggle('open');
-        });
-
-        this.menuExportActiveFolder.addEventListener('click', (e) => {
-            e.preventDefault();
-            this.exportActiveFolderPdf();
-        });
-
-        this.menuExportAllProject.addEventListener('click', (e) => {
-            e.preventDefault();
-            this.exportAllProjectPdf();
-        });
-
-        // Folder Action Bar: Sort & Folder PDF
-        this.btnSortMenu.addEventListener('click', (e) => {
+        // --- Sắp xếp trang ---
+        on(this.btnSortMenu, 'click', (e) => {
             e.stopPropagation();
             this.btnSortMenu.parentElement.classList.toggle('open');
         });
-
-        this.sortDropdown.querySelectorAll('a').forEach(item => {
-            item.addEventListener('click', (e) => {
-                e.preventDefault();
-                const sortType = item.dataset.sort;
-                this.sortActiveFolderImages(sortType);
-            });
+        this.sortDropdown?.querySelectorAll('a').forEach(item => {
+            on(item, 'click', (e) => { e.preventDefault(); this.sortActiveFolder(item.dataset.sort); });
         });
 
-        this.btnExportFolderPdf.addEventListener('click', () => {
-            this.exportActiveFolderPdf();
-        });
-
-        // Folder Tree Top Buttons
-        if (this.btnAddSubfolder) {
-            this.btnAddSubfolder.addEventListener('click', () => {
-                this.openFolderModal('create_subfolder', this.activeFolderId);
-            });
-        }
-
-        if (this.btnNewProject) {
-            this.btnNewProject.addEventListener('click', () => {
-                this.openFolderModal('new_project', null);
-            });
-        }
-
-        // Folder Modal Actions
-        this.btnCloseFolderModal.addEventListener('click', () => this.closeFolderModal());
-        this.btnCancelFolderModal.addEventListener('click', () => this.closeFolderModal());
-        this.btnSubmitFolderModal.addEventListener('click', () => this.submitFolderModal());
-        this.txtFolderModalName.addEventListener('keydown', (e) => {
+        // --- Thư mục ---
+        on(this.btnAddSubfolder, 'click', () => this.openFolderModal('create', this.activeFolderId));
+        on(this.btnCloseFolderModal, 'click', () => this.closeFolderModal());
+        on(this.btnCancelFolderModal, 'click', () => this.closeFolderModal());
+        on(this.btnSubmitFolderModal, 'click', () => this.submitFolderModal());
+        on(this.txtFolderModalName, 'keydown', (e) => {
             if (e.key === 'Enter') this.submitFolderModal();
             if (e.key === 'Escape') this.closeFolderModal();
         });
 
-        // Move Modal Actions
-        this.btnCloseMoveModal.addEventListener('click', () => this.closeMoveModal());
-        this.btnCancelMoveModal.addEventListener('click', () => this.closeMoveModal());
-        this.btnSubmitMoveModal.addEventListener('click', () => this.submitMoveModal());
-
-        if (this.btnMoveModalNewFolder) {
-            this.btnMoveModalNewFolder.addEventListener('click', () => {
-                const parentId = this.moveModalState.selectedTargetFolderId || this.activeFolderId;
-                this.showInlineFolderCreation(parentId);
-            });
-        }
-        if (this.btnConfirmInlineFolder) {
-            this.btnConfirmInlineFolder.addEventListener('click', () => this.confirmInlineFolderCreation());
-        }
-        if (this.btnCancelInlineFolder) {
-            this.btnCancelInlineFolder.addEventListener('click', () => this.hideInlineFolderCreation());
-        }
-        if (this.txtInlineNewFolder) {
-            this.txtInlineNewFolder.addEventListener('keydown', (e) => {
-                if (e.key === 'Enter') this.confirmInlineFolderCreation();
-                if (e.key === 'Escape') this.hideInlineFolderCreation();
-            });
-        }
-
-        window.addEventListener('resize', () => {
-            if (this.currentView === 'crop' && this.getActivePage()) {
-                this.renderCropCanvas();
-            }
+        // --- Chuyển ảnh sang thư mục khác ---
+        on(this.btnCloseMoveModal, 'click', () => this.closeMoveModal());
+        on(this.btnCancelMoveModal, 'click', () => this.closeMoveModal());
+        on(this.btnSubmitMoveModal, 'click', () => this.submitMoveModal());
+        on(this.btnMoveModalNewFolder, 'click', () => this.showInlineFolderBox());
+        on(this.btnConfirmInlineFolder, 'click', () => this.confirmInlineFolder());
+        on(this.btnCancelInlineFolder, 'click', () => this.hideInlineFolderBox());
+        on(this.txtInlineNewFolder, 'keydown', (e) => {
+            if (e.key === 'Enter') this.confirmInlineFolder();
+            if (e.key === 'Escape') this.hideInlineFolderBox();
         });
+
+        // --- Ảnh lẻ chưa có bản gốc ---
+        on(this.btnOrphanAdopt, 'click', () => this.adoptOrphan());
+        on(this.btnOrphanDelete, 'click', () => this.deleteOrphan());
+        on(this.btnOrphanMoveToUnapproved, 'click', () => this.moveOrphanToUnapproved());
+        on(this.btnOrphanCancel, 'click', () => this.closeOrphanPrompt(true));
+        on(this.btnCloseOrphanModal, 'click', () => this.closeOrphanPrompt(true));
+
+        window.addEventListener('resize', () => { if (this.getActivePage()) this.layoutCanvas(); });
+        // Đóng tab: gửi nốt tình trạng đang chỉnh bằng sendBeacon (không chặn người dùng).
+        // Không cần hộp thoại "rời trang?" vì tình trạng đã nằm trên đĩa, còn tệp ảnh nào
+        // chưa kịp kết xuất lại sẽ được đánh dấu và tự lưu ở lần mở sau.
+        window.addEventListener('pagehide', () => this.beaconMetadata());
     }
 
-    // ==========================================
-    // 📐 SIDEBAR & SECTION RESIZERS (KÉO THẢ CHIỀU RỘNG & PHÂN CHIA CHIỀU DỌC)
-    // ==========================================
+    // ======================================================
+    // 📁 DỰ ÁN & CÂY THƯ MỤC
+    // ======================================================
 
-    initSidebarResizers() {
-        if (!this.pageSidebar) return;
-
-        // Restore saved sizes from localStorage
-        const savedWidth = localStorage.getItem('docscan_sidebar_width');
-        if (savedWidth && this.pageSidebar) {
-            this.pageSidebar.style.width = `${savedWidth}px`;
+    async loadProject(path, notify = true) {
+        if (!path) return;
+        if (this.activeImageId && this.dirtyPages.has(this.activeImageId)) {
+            const allowed = await this.confirmUnsavedChanges();
+            if (!allowed) return;
         }
-
-        const savedHeight = localStorage.getItem('docscan_folder_height');
-        if (savedHeight && this.folderSection) {
-            this.folderSection.style.height = `${savedHeight}px`;
-        }
-
-        // 1. Horizontal Width Resizer (Kéo giãn chiều rộng sidebar)
-        if (this.sidebarResizerV) {
-            let isResizingW = false;
-            let startX = 0;
-            let startW = 0;
-
-            this.sidebarResizerV.addEventListener('mousedown', (e) => {
-                isResizingW = true;
-                startX = e.clientX;
-                startW = this.pageSidebar.offsetWidth;
-                this.sidebarResizerV.classList.add('active');
-                document.body.style.cursor = 'col-resize';
-                document.body.style.userSelect = 'none';
-                e.preventDefault();
-            });
-
-            window.addEventListener('mousemove', (e) => {
-                if (!isResizingW) return;
-                const newWidth = Math.max(220, Math.min(650, startW + (e.clientX - startX)));
-                this.pageSidebar.style.width = `${newWidth}px`;
-                localStorage.setItem('docscan_sidebar_width', newWidth);
-                if (this.currentView === 'crop' && this.getActivePage()) {
-                    this.renderCropCanvas();
-                }
-            });
-
-            window.addEventListener('mouseup', () => {
-                if (isResizingW) {
-                    isResizingW = false;
-                    this.sidebarResizerV.classList.remove('active');
-                    document.body.style.cursor = '';
-                    document.body.style.userSelect = '';
-                }
-            });
-        }
-
-        // 2. Vertical Section Divider (Kéo di chuyển phân chia độ cao Cây thư mục / Danh sách ảnh)
-        if (this.sidebarDividerH && this.folderSection) {
-            let isResizingH = false;
-            let startY = 0;
-            let startH = 0;
-
-            this.sidebarDividerH.addEventListener('mousedown', (e) => {
-                isResizingH = true;
-                startY = e.clientY;
-                startH = this.folderSection.offsetHeight;
-                this.sidebarDividerH.classList.add('active');
-                document.body.style.cursor = 'row-resize';
-                document.body.style.userSelect = 'none';
-                e.preventDefault();
-            });
-
-            window.addEventListener('mousemove', (e) => {
-                if (!isResizingH) return;
-                const sidebarHeight = this.pageSidebar.offsetHeight;
-                const newHeight = Math.max(80, Math.min(sidebarHeight - 110, startH + (e.clientY - startY)));
-                this.folderSection.style.height = `${newHeight}px`;
-                localStorage.setItem('docscan_folder_height', newHeight);
-            });
-
-            window.addEventListener('mouseup', () => {
-                if (isResizingH) {
-                    isResizingH = false;
-                    this.sidebarDividerH.classList.remove('active');
-                    document.body.style.cursor = '';
-                    document.body.style.userSelect = '';
-                }
-            });
-        }
-    }
-
-    // ==========================================
-    // 📋 CLIPBOARD PASTE HANDLER (CTRL + V)
-    // ==========================================
-
-    handleClipboardPaste(e) {
-        const items = (e.clipboardData || window.clipboardData)?.items;
-        if (!items) return;
-
-        const imageFiles = [];
-        for (let i = 0; i < items.length; i++) {
-            const item = items[i];
-            if (item.type && item.type.startsWith('image/')) {
-                const blob = item.getAsFile();
-                if (blob) {
-                    const ext = item.type.split('/')[1] || 'png';
-                    const file = new File([blob], `anh_clipboard_${Date.now()}.${ext}`, { type: blob.type });
-                    imageFiles.push(file);
-                }
-            }
-        }
-
-        if (imageFiles.length > 0) {
-            e.preventDefault();
-            this.showToast(`Đã nhận ${imageFiles.length} ảnh dán từ Clipboard!`);
-            this.handleFilesSelected(imageFiles);
-        }
-    }
-
-    // ==========================================
-    // 📁 PROJECT & FOLDER TREE MANAGEMENT
-    // ==========================================
-
-    getActiveProject() {
-        return this.projects.find(p => p.id === this.activeProjectId) || this.projects[0];
-    }
-
-    updateProjectHeaderUI() {
-        const proj = this.getActiveProject();
-        if (proj) {
-            if (this.currentProjectTitle) {
-                this.currentProjectTitle.textContent = proj.name;
-            }
-            if (this.lblRootPath) {
-                this.lblRootPath.textContent = proj.rootDiskPath || 'C:\\DocScan_Projects';
-                this.lblRootPath.title = `Thư mục lưu trên máy: ${proj.rootDiskPath}`;
-            }
-        }
-    }
-
-    async loadProjectFromDisk(diskPath, showSuccessToast = true) {
-        if (!diskPath) return;
-        const proj = this.getActiveProject();
-        this.showLoading(`Đang quét và tải cây thư mục từ máy tính: ${diskPath}...`);
-
+        this.showLoading('Đang mở thư mục tài liệu…');
         try {
-            const res = await fetch('/api/scan-directory', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ path: diskPath, load_images: true })
-            });
+            const data = await apiJson('/api/scan-directory', { path });
 
-            if (!res.ok) {
-                const err = await res.json();
-                throw new Error(err.detail || "Không thể quét thư mục");
-            }
-
-            const data = await res.json();
-            proj.rootDiskPath = data.root_path;
-            proj.name = data.root_name || "Dự án Scan";
+            this.rootPath = data.root_path;
+            this.rootName = data.root_name;
+            this.activeImageId = null;
+            this.originalImg = null;
+            this.editedImg = null;
+            this.editorStage.style.display = 'none';
+            this.emptyState.style.display = 'flex';
+            this.docNameWrapper.style.display = 'none';
+            if (this.btnDownloadCurrent) this.btnDownloadCurrent.disabled = true;
+            this.updateHistoryButtons();
             localStorage.setItem('docscan_root_path', data.root_path);
 
-            // Replace folders for this project
-            this.folders = data.folders.map(f => ({
-                id: f.id,
-                projectId: this.activeProjectId,
-                name: f.name,
-                parentId: f.parentId,
-                relativePath: f.relativePath,
-                imageIds: f.imageIds || [],
-                isExpanded: true,
-                is_unapproved: f.is_unapproved || f.relativePath === 'Kho_Chua_Duyet' || f.name === 'Kho ảnh chưa duyệt'
-            }));
+            this.folders = data.folders.map(f => ({ ...f, isExpanded: true }));
+            this.pages.clear();
+            this.dirtyPages.clear();
+            data.pages.forEach(p => {
+                const page = this.toPage(p);
+                this.pages.set(page.id, page);
+                if (page.isStale) this.dirtyPages.add(page.id);
+            });
 
-            // Fallback root folder if empty
-            if (this.folders.length === 0) {
-                this.folders.push({
-                    id: 'folder_root',
-                    projectId: this.activeProjectId,
-                    name: data.root_name || 'Thư mục gốc',
-                    parentId: null,
-                    imageIds: [],
-                    isExpanded: true
-                });
-            }
+            this.activeImageId = null;
+            this.originalImg = null;
+            this.editedImg = null;
+            this.editorStage.style.display = 'none';
+            this.emptyState.style.display = 'flex';
+            this.docNameWrapper.style.display = 'none';
 
-            // Populate images map with persistent metadata
-            if (data.pages && data.pages.length > 0) {
-                data.pages.forEach(p => {
-                    const defaultSettings = {
-                        mode: 'natural',
-                        shadow_reduction: 0.6,
-                        sharpness: 0.6,
-                        contrast: 0.2,
-                        brightness: 0.0,
-                        margin_percent: 0.02,
-                        dewarp_enabled: false,
-                        dewarp_strength: 0.8,
-                        quality: 85,
-                        normalize_res: true
-                    };
-                    const finalSettings = p.settings ? { ...defaultSettings, ...p.settings } : defaultSettings;
-
-                    if (p.history && (p.history.undo?.length > 0 || p.history.redo?.length > 0)) {
-                        this.historyMap.set(p.id, p.history);
-                    }
-
-                    this.images.set(p.id, {
-                        id: p.id,
-                        filename: p.filename,
-                        suggested_name: p.suggested_name,
-                        name_suggestions: p.name_suggestions || [],
-                        width: p.width,
-                        height: p.height,
-                        megapixels: p.megapixels,
-                        file_size_human: p.file_size_human,
-                        corners: p.corners,
-                        preview_url: p.preview_url,
-                        rotation: p.rotation || 0,
-                        processed_url: p.processed_url || null,
-                        out_dim: null,
-                        out_size_human: null,
-                        saving_ratio: null,
-                        aiAnalyzed: false,
-                        aiDismissed: false,
-                        has_raw_original: p.has_raw_original !== false,
-                        orphanPromptDismissed: false,
-                        settings: finalSettings
-                    });
-                });
-            }
-
-            this.updateProjectHeaderUI();
+            this.lblRootPath.textContent = data.root_path;
+            this.lblRootPath.title = data.root_path;
             this.renderFolderTree();
 
-            // Select root folder or first folder
-            const rootFolder = this.folders.find(f => !f.parentId) || this.folders[0];
-            this.selectFolder(rootFolder.id);
+            const stored = localStorage.getItem('docscan_active_folder');
+            const target = this.folders.find(f => f.id === stored) || this.folders.find(f => !f.parentId) || this.folders[0];
+            if (target) this.selectFolder(target.id);
 
-            if (showSuccessToast) {
-                this.showToast(`✅ Đã tải ${data.total_folders} thư mục & ${data.total_images} ảnh từ máy tính!`);
+            this.updateSaveState();
+            if (notify) {
+                this.toastOk(`Đã mở ${data.total_folders} thư mục · ${data.total_images} trang tài liệu.`);
             }
+            this.offerLegacyPdfCleanup();
         } catch (err) {
-            this.showToast(err.message || "Lỗi khi quét thư mục", false);
-            this.renderFolderTree();
-            this.updateActiveFolderUI();
+            this.toastErr(err.message);
         } finally {
             this.hideLoading();
         }
     }
 
-    async pickRootDiskDirectory() {
-        this.showLoading("Đang mở hộp thoại chọn thư mục trên máy tính...");
+    /**
+     * Dọn các tệp PDF do bản trước TỰ SINH mỗi lần lưu.
+     *
+     * Từ nay PDF chỉ được tạo khi người dùng chủ động bấm xuất, nên những tệp cũ này
+     * không còn được cập nhật và nội dung sẽ lệch dần so với ảnh trong thư mục.
+     * Vì xoá tệp là việc không hoàn tác được, luôn liệt kê rõ từng tệp trước khi xoá.
+     */
+    async offerLegacyPdfCleanup() {
+        const seenKey = `docscan_legacy_pdf_done_${this.rootPath}`;
+        if (localStorage.getItem(seenKey)) return;
+
+        let found;
         try {
-            const res = await fetch('/api/pick-directory', { method: 'POST' });
-            const data = await res.json();
-            if (data.success && data.path) {
-                await this.loadProjectFromDisk(data.path, true);
+            found = await apiJson('/api/legacy-pdfs', { confirm: false });
+        } catch (_) { return; }
+
+        if (!found.total) {
+            localStorage.setItem(seenKey, '1');
+            return;
+        }
+
+        const list = found.files
+            .map(f => `• ${f.relative_path ? f.relative_path + ' / ' : ''}${f.filename}  (${f.file_size_human})`)
+            .join('\n');
+        const agreed = await this.askConfirm(
+            'Dọn tệp PDF cũ',
+            `Tìm thấy ${found.total} tệp PDF do phiên bản trước tự sinh ra mỗi lần lưu.\n\n` +
+            `${list}\n\n` +
+            'Từ nay PDF chỉ được tạo khi bạn chủ động bấm xuất, nên các tệp này sẽ không còn ' +
+            'được cập nhật và nội dung sẽ lệch dần so với ảnh.\n\nXoá chúng khỏi ổ đĩa?',
+            true, `Xoá ${found.total} tệp`, 'Giữ lại',
+        );
+
+        localStorage.setItem(seenKey, '1');
+        if (!agreed) return;
+
+        try {
+            const res = await apiJson('/api/legacy-pdfs', { confirm: true });
+            const failed = (res.failed || []).length;
+            if (failed) {
+                this.toastErr(`Đã xoá ${res.deleted} tệp, còn ${failed} tệp không xoá được.`);
+            } else {
+                this.toastOk(`Đã xoá ${res.deleted} tệp PDF cũ khỏi ổ đĩa.`);
             }
         } catch (err) {
-            this.showToast("Không thể mở hộp thoại chọn thư mục.", false);
-        } finally {
-            this.hideLoading();
+            this.toastErr(err.message);
         }
     }
 
-    async editRootDiskPath() {
-        const proj = this.getActiveProject();
-        const current = proj.rootDiskPath || 'C:\\DocScan_Projects';
-        const newPath = prompt("Nhập hoặc dán đường dẫn Thư mục Root trên máy tính:", current);
-        if (newPath && newPath.trim()) {
-            await this.loadProjectFromDisk(newPath.trim(), true);
+    /** Chuyển bản ghi từ máy chủ thành đối tượng trang của giao diện. */
+    toPage(raw) {
+        return {
+            id: raw.id,
+            filename: raw.filename,
+            folderId: raw.folderId,
+            relativePath: raw.relativePath || '',
+            docName: raw.doc_name || raw.filename,
+            width: raw.width,
+            height: raw.height,
+            megapixels: raw.megapixels,
+            fileSize: raw.file_size,
+            fileSizeHuman: raw.file_size_human,
+            origSize: raw.orig_size || raw.file_size || 0,
+            origSizeHuman: raw.orig_size_human || raw.file_size_human || '--',
+            editedSize: raw.edited_size || raw.file_size || 0,
+            editedSizeHuman: raw.edited_size_human || raw.file_size_human || '--',
+            outSize: raw.edited_size || raw.file_size || 0,
+            outSizeHuman: raw.edited_size_human || raw.file_size_human || '--',
+            corners: raw.corners || this.fullFrameCorners(raw.width, raw.height),
+            rotation: raw.rotation || 0,
+            settings: { ...DEFAULT_SETTINGS, ...(raw.settings || {}) },
+            history: (raw.history && (raw.history.undo || raw.history.redo))
+                ? { undo: [...(raw.history.undo || [])], redo: [...(raw.history.redo || [])] }
+                : { undo: [], redo: [] },
+            hasOriginal: raw.has_raw_original !== false,
+            isStale: raw.is_stale === true,
+            version: raw.version || 0,
+            nameSuggestions: raw.name_suggestions || [],
+            outDim: null,
+            aiDismissed: false,
+            orphanHandled: false,
+        };
+    }
+
+    fullFrameCorners(w, h) {
+        const width = Math.max(1, w || 1);
+        const height = Math.max(1, h || 1);
+        return [[0, 0], [width - 1, 0], [width - 1, height - 1], [0, height - 1]];
+    }
+
+    async pickRootDirectory() {
+        try {
+            const data = await apiJson('/api/pick-directory');
+            if (data.success && data.path) await this.loadProject(data.path, true);
+        } catch (err) {
+            this.toastErr(err.message);
         }
     }
 
     async openActiveFolderInExplorer() {
-        const proj = this.getActiveProject();
-        if (!proj || !proj.rootDiskPath) return;
-
-        const relPath = this.getFolderRelativePath(this.activeFolderId);
-        const fullPath = relPath ? `${proj.rootDiskPath}\\${relPath.replace(/\//g, '\\')}` : proj.rootDiskPath;
-
+        const folder = this.getFolder(this.activeFolderId);
         try {
-            const res = await fetch('/api/open-folder', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ path: fullPath })
-            });
-            if (!res.ok) {
-                // If folder doesn't exist yet, open root
-                await fetch('/api/open-folder', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ path: proj.rootDiskPath })
-                });
-            }
-            this.showToast(`Đã mở thư mục trong Windows Explorer!`);
+            await apiJson('/api/open-folder', { relative_path: folder ? folder.relativePath : '' });
         } catch (err) {
-            this.showToast("Lỗi khi mở thư mục trên máy tính.", false);
+            this.toastErr(err.message);
         }
     }
 
-    renderProjectDropdownMenu() {
-        if (!this.projectDropdownMenu) return;
-        this.projectDropdownMenu.innerHTML = '';
+    getFolder(id) { return this.folders.find(f => f.id === id); }
+    getActiveFolder() { return this.getFolder(this.activeFolderId) || this.folders[0]; }
+    getActivePage() { return this.activeImageId ? this.pages.get(this.activeImageId) : null; }
+    getFolderChildren(id) { return this.folders.filter(f => f.parentId === id); }
 
-        this.projects.forEach(proj => {
-            const item = document.createElement('a');
-            item.href = '#';
-            const isCurrent = proj.id === this.activeProjectId;
-            const imgCount = this.countTotalImagesInProject(proj.id);
-            item.innerHTML = `
-                <i class="fa-solid ${isCurrent ? 'fa-folder-open text-accent' : 'fa-folder'}"></i>
-                <span style="flex: 1; margin-right: 8px;">${proj.name}</span>
-                <span class="tree-badge">${imgCount}</span>
-                ${isCurrent ? '<i class="fa-solid fa-check ml-2 text-accent"></i>' : ''}
-            `;
-            item.addEventListener('click', (e) => {
-                e.preventDefault();
-                this.switchProject(proj.id);
-            });
-            this.projectDropdownMenu.appendChild(item);
-        });
-
-        const divider = document.createElement('div');
-        divider.style.cssText = 'height: 1px; background: var(--border); margin: 4px 0;';
-        this.projectDropdownMenu.appendChild(divider);
-
-        const newItem = document.createElement('a');
-        newItem.href = '#';
-        newItem.innerHTML = `<i class="fa-solid fa-folder-plus text-accent"></i> <strong>+ Tạo Dự án mới</strong>`;
-        newItem.addEventListener('click', (e) => {
-            e.preventDefault();
-            this.openFolderModal('new_project', null);
-        });
-        this.projectDropdownMenu.appendChild(newItem);
+    getFolderPath(folderId) {
+        const folder = this.getFolder(folderId);
+        return folder ? (folder.relativePath || '') : '';
     }
 
-    switchProject(projectId) {
-        const proj = this.projects.find(p => p.id === projectId);
-        if (!proj) return;
-        this.activeProjectId = projectId;
-        this.updateProjectHeaderUI();
-        const rootFolder = this.folders.find(f => f.projectId === projectId && !f.parentId);
-        if (rootFolder) {
-            this.selectFolder(rootFolder.id);
-        } else {
-            this.renderFolderTree();
-        }
-        this.showToast(`Đã chuyển sang ${proj.name}`);
-    }
-
-    countTotalImagesInProject(projectId) {
-        let count = 0;
-        const projFolders = this.folders.filter(f => f.projectId === projectId);
-        projFolders.forEach(f => {
-            count += (f.imageIds || []).length;
-        });
-        return count;
-    }
-
-    getFolder(folderId) {
-        return this.folders.find(f => f.id === folderId) || null;
-    }
-
-    getActiveFolder() {
-        return this.getFolder(this.activeFolderId) || this.folders[0];
-    }
-
-    getFolderChildren(folderId) {
-        return this.folders.filter(f => f.parentId === folderId);
-    }
-
-    getFolderRelativePath(folderId) {
+    getFolderBreadcrumb(folderId) {
         const parts = [];
-        let curr = this.getFolder(folderId);
-        while (curr) {
-            if (curr.parentId) {
-                parts.unshift(curr.name);
-            }
-            curr = curr.parentId ? this.getFolder(curr.parentId) : null;
+        let cur = this.getFolder(folderId);
+        while (cur) {
+            parts.unshift(cur.name);
+            cur = cur.parentId ? this.getFolder(cur.parentId) : null;
         }
-        return parts.join('/');
+        return parts.join(' / ');
     }
 
-    selectFolder(folderId) {
-        const folder = this.getFolder(folderId);
-        if (!folder) return;
-
+    async selectFolder(folderId) {
+        if (this.activeFolderId !== folderId) {
+            if (this.activeImageId && this.dirtyPages.has(this.activeImageId)) {
+                const allowed = await this.confirmUnsavedChanges();
+                if (!allowed) return;
+            }
+        }
         this.activeFolderId = folderId;
+        localStorage.setItem('docscan_active_folder', folderId);
         this.renderFolderTree();
-        this.updateActiveFolderUI();
+        this.updateFolderHeader();
+        this.renderPageList();
 
-        const imagesInFolder = folder.imageIds || [];
-        if (imagesInFolder.length > 0) {
-            if (!this.activeImageId || !imagesInFolder.includes(this.activeImageId)) {
-                this.selectPage(imagesInFolder[0]);
-            } else {
-                this.selectPage(this.activeImageId);
-            }
-        } else {
+        const ids = this.getFolderImageIds();
+        if (!ids.includes(this.activeImageId)) {
             this.activeImageId = null;
-            this.emptyState.style.display = 'flex';
             this.editorStage.style.display = 'none';
+            this.emptyState.style.display = 'flex';
             this.docNameWrapper.style.display = 'none';
-            this.btnExportPdf.disabled = false;
-            if (this.btnSaveToDiskMenu) this.btnSaveToDiskMenu.disabled = false;
-            this.btnDownloadCurrent.disabled = true;
-            this.updateSidebarUI();
+            this.updateHistoryButtons();
         }
+        this.updateFolderActionButtons();
     }
 
-    openFolderModal(mode, targetFolderId = null) {
-        this.folderModalState = { mode, targetFolderId };
-        this.folderNameModal.style.display = 'flex';
-
-        if (mode === 'create_subfolder') {
-            const parent = this.getFolder(targetFolderId);
-            const parentName = parent ? parent.name : "Thư mục gốc";
-            this.folderModalTitle.innerHTML = `<i class="fa-solid fa-folder-plus text-accent"></i> Tạo thư mục con trong '${parentName}'`;
-            this.folderModalLabel.textContent = "Tên thư mục con:";
-            this.txtFolderModalName.value = `Thư mục con ${this.folders.length}`;
-            this.folderModalHint.textContent = "Thư mục con sẽ tương ứng với folder con trên ổ đĩa máy tính.";
-        } else if (mode === 'rename_folder') {
-            const folder = this.getFolder(targetFolderId);
-            this.folderModalTitle.innerHTML = `<i class="fa-solid fa-pen text-accent"></i> Đổi tên thư mục`;
-            this.folderModalLabel.textContent = "Tên mới:";
-            this.txtFolderModalName.value = folder ? folder.name : "";
-            this.folderModalHint.textContent = "Tên thư mục sẽ được dùng làm tên folder trên máy và file PDF.";
-        } else if (mode === 'new_project') {
-            this.folderModalTitle.innerHTML = `<i class="fa-solid fa-folder-tree text-accent"></i> Tạo Dự án (Root Folder) mới`;
-            this.folderModalLabel.textContent = "Tên Dự án:";
-            this.txtFolderModalName.value = `Dự án ${this.projects.length + 1}`;
-            this.folderModalHint.textContent = "Mỗi Dự án là một Thư mục gốc độc lập chứa các nhánh con.";
-        }
-
-        this.txtFolderModalName.focus();
-        this.txtFolderModalName.select();
-    }
-
-    closeFolderModal() {
-        this.folderNameModal.style.display = 'none';
-    }
-
-    async submitFolderModal() {
-        const name = this.txtFolderModalName.value.trim();
-        if (!name) {
-            this.showToast("Vui lòng nhập tên hợp lệ.", false);
-            return;
-        }
-
-        const { mode, targetFolderId } = this.folderModalState;
-        const proj = this.getActiveProject();
-
-        if (mode === 'create_subfolder') {
-            const parent = this.getFolder(targetFolderId);
-            let finalFolderId = 'folder_' + Date.now();
-
-            if (proj && proj.rootDiskPath) {
-                try {
-                    const parentRel = this.getFolderRelativePath(targetFolderId);
-                    const res = await fetch('/api/create-folder', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({
-                            root_path: proj.rootDiskPath,
-                            relative_path: parentRel,
-                            folder_name: name
-                        })
-                    });
-                    if (res.ok) {
-                        const data = await res.json();
-                        finalFolderId = data.folder_id || finalFolderId;
-                    }
-                } catch (e) {
-                    console.error("Lỗi tạo thư mục vật lý:", e);
-                }
-            }
-
-            if (parent) parent.isExpanded = true;
-
-            this.folders.push({
-                id: finalFolderId,
-                projectId: this.activeProjectId,
-                name: name,
-                parentId: targetFolderId,
-                imageIds: [],
-                isExpanded: true
-            });
-
-            this.showToast(`Đã tạo thư mục '${name}' trên ổ đĩa!`);
-            this.renderFolderTree();
-            this.selectFolder(finalFolderId);
-        } else if (mode === 'rename_folder') {
-            const folder = this.getFolder(targetFolderId);
-            if (folder) {
-                const oldRel = this.getFolderRelativePath(targetFolderId);
-                if (proj && proj.rootDiskPath && oldRel) {
-                    try {
-                        await fetch('/api/rename-folder', {
-                            method: 'POST',
-                            headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify({
-                                root_path: proj.rootDiskPath,
-                                old_relative_path: oldRel,
-                                new_folder_name: name
-                            })
-                        });
-                    } catch (e) {
-                        console.error("Lỗi đổi tên trên ổ đĩa:", e);
-                    }
-                }
-                folder.name = name;
-                if (!folder.parentId) {
-                    if (proj) proj.name = name;
-                }
-                this.showToast(`Đã đổi tên thành '${name}'!`);
-                this.updateProjectHeaderUI();
-                this.renderFolderTree();
-                this.updateActiveFolderUI();
-            }
-        } else if (mode === 'new_project') {
-            const projId = 'proj_' + Date.now();
-            const rootFolderId = 'folder_root_' + Date.now();
-            const diskPath = `C:\\DocScan_Projects\\${name.replace(/[^a-zA-Z0-9_\-\s]/g, '_')}`;
-
-            this.projects.push({
-                id: projId,
-                name: name,
-                rootFolderId: rootFolderId,
-                rootDiskPath: diskPath
-            });
-
-            this.folders.push({
-                id: rootFolderId,
-                projectId: projId,
-                name: name,
-                parentId: null,
-                imageIds: [],
-                isExpanded: true
-            });
-
-            this.activeProjectId = projId;
-            this.updateProjectHeaderUI();
-            this.showToast(`Đã tạo Dự án mới '${name}'!`);
-            this.selectFolder(rootFolderId);
-        }
-
-        this.closeFolderModal();
-    }
-
-    deleteFolder(folderId) {
-        const folder = this.getFolder(folderId);
-        if (!folder) return;
-
-        // Check if root folder
-        if (!folder.parentId) {
-            if (this.projects.length <= 1) {
-                if (confirm(`Bạn có chắc muốn làm trống thư mục gốc '${folder.name}' và xóa toàn bộ tài liệu bên trong?`)) {
-                    folder.imageIds.forEach(id => this.images.delete(id));
-                    folder.imageIds = [];
-                    const childIds = this.getAllDescendantFolderIds(folderId);
-                    childIds.forEach(cid => {
-                        const cf = this.getFolder(cid);
-                        if (cf) {
-                            cf.imageIds.forEach(id => this.images.delete(id));
-                        }
-                    });
-                    this.folders = this.folders.filter(f => !childIds.includes(f.id));
-                    this.showToast(`Đã làm trống thư mục gốc.`);
-                    this.selectFolder(folderId);
-                }
-                return;
-            } else {
-                if (confirm(`Xóa Dự án '${folder.name}' cùng toàn bộ tài liệu bên trong?`)) {
-                    const allFolderIds = [folderId, ...this.getAllDescendantFolderIds(folderId)];
-                    allFolderIds.forEach(fid => {
-                        const f = this.getFolder(fid);
-                        if (f) f.imageIds.forEach(id => this.images.delete(id));
-                    });
-                    this.folders = this.folders.filter(f => !allFolderIds.includes(f.id));
-                    this.projects = this.projects.filter(p => p.id !== folder.projectId);
-                    this.activeProjectId = this.projects[0].id;
-                    const nextRoot = this.folders.find(f => f.projectId === this.activeProjectId && !f.parentId);
-                    this.selectFolder(nextRoot ? nextRoot.id : this.folders[0].id);
-                    this.showToast(`Đã xóa Dự án thành công.`);
-                }
-                return;
-            }
-        }
-
-        if (confirm(`Bạn có chắc chắn muốn xóa thư mục '${folder.name}' và các nhánh con bên trong?`)) {
-            const proj = this.getActiveProject();
-            const rel = this.getFolderRelativePath(folderId);
-            if (proj && proj.rootDiskPath && rel) {
-                try {
-                    fetch('/api/delete-folder', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({
-                            root_path: proj.rootDiskPath,
-                            relative_path: rel
-                        })
-                    });
-                } catch (e) {
-                    console.error("Lỗi xóa trên ổ đĩa:", e);
-                }
-            }
-
-            const allFolderIds = [folderId, ...this.getAllDescendantFolderIds(folderId)];
-            allFolderIds.forEach(fid => {
-                const f = this.getFolder(fid);
-                if (f) f.imageIds.forEach(id => this.images.delete(id));
-            });
-            const parentId = folder.parentId;
-            this.folders = this.folders.filter(f => !allFolderIds.includes(f.id));
-
-            this.showToast(`Đã xóa thư mục '${folder.name}'.`);
-            this.selectFolder(parentId || this.folders[0].id);
-        }
-    }
-
-    getAllDescendantFolderIds(folderId) {
-        let result = [];
-        const children = this.getFolderChildren(folderId);
-        children.forEach(ch => {
-            result.push(ch.id);
-            result = result.concat(this.getAllDescendantFolderIds(ch.id));
-        });
-        return result;
+    getFolderImageIds() {
+        const folder = this.getActiveFolder();
+        return folder ? (folder.imageIds || []) : [];
     }
 
     renderFolderTree() {
         if (!this.folderTreeContainer) return;
         this.folderTreeContainer.innerHTML = '';
-
-        const rootFolders = this.folders.filter(f => f.projectId === this.activeProjectId && f.parentId === null);
-
-        rootFolders.forEach(root => {
-            this.renderFolderTreeNode(root, 0, this.folderTreeContainer);
-        });
+        const roots = this.folders.filter(f => !f.parentId);
+        roots.forEach(root => this.renderFolderNode(root, 0, this.folderTreeContainer));
+        if (this.folders.length === 0) {
+            this.folderTreeContainer.innerHTML =
+                '<div class="tree-empty-msg">Chưa mở thư mục nào. Nhấn <strong>Đổi</strong> để chọn thư mục tài liệu trên máy.</div>';
+        }
     }
 
-    renderFolderTreeNode(folder, level, container) {
-        const node = document.createElement('div');
-        node.className = `tree-node ${folder.id === this.activeFolderId ? 'active' : ''}`;
-        node.dataset.folderId = folder.id;
-        node.dataset.level = level;
-
+    renderFolderNode(folder, level, container) {
         const children = this.getFolderChildren(folder.id);
-        const hasChildren = children.length > 0;
-        const imgCount = (folder.imageIds || []).length;
+        const count = (folder.imageIds || []).length;
+        const isActive = folder.id === this.activeFolderId;
 
+        const node = document.createElement('div');
+        node.className = `tree-node ${isActive ? 'active' : ''}`;
+        node.dataset.level = Math.min(4, level);
         node.innerHTML = `
-            <span class="tree-expander ${hasChildren ? (folder.isExpanded ? 'expanded' : '') : 'empty'}">
+            <span class="tree-expander ${children.length ? (folder.isExpanded ? 'expanded' : '') : 'empty'}">
                 <i class="fa-solid fa-chevron-right"></i>
             </span>
-            <i class="fa-solid ${folder.id === this.activeFolderId ? 'fa-folder-open' : (folder.parentId ? 'fa-folder' : 'fa-folder-tree')} tree-icon"></i>
-            <span class="tree-title" title="${folder.name}">${folder.name}</span>
-            <span class="tree-badge">${imgCount}</span>
-            <div class="tree-actions">
-                <button class="tree-action-btn add-sub" title="Thêm thư mục con">
-                    <i class="fa-solid fa-plus"></i>
-                </button>
-                <button class="tree-action-btn edit-name" title="Đổi tên">
-                    <i class="fa-solid fa-pen"></i>
-                </button>
-                <button class="tree-action-btn save-disk" title="Lưu thư mục vào máy tính">
-                    <i class="fa-solid fa-floppy-disk"></i>
-                </button>
-                <button class="tree-action-btn export-pdf" title="Xuất PDF thư mục này">
-                    <i class="fa-solid fa-file-pdf"></i>
-                </button>
-                <button class="tree-action-btn delete" title="Xóa thư mục">
-                    <i class="fa-solid fa-trash-can"></i>
-                </button>
-            </div>
-        `;
+            <i class="tree-icon fa-solid ${folder.isUnapproved ? 'fa-inbox' : (folder.isExpanded && children.length ? 'fa-folder-open' : 'fa-folder')}"></i>
+            <span class="tree-title" title="${escapeHtml(folder.name)}">${escapeHtml(folder.name)}</span>
+            <span class="tree-badge">${count}</span>
+            <span class="tree-actions">
+                <button class="tree-action-btn add-sub" title="Tạo thư mục con"><i class="fa-solid fa-folder-plus"></i></button>
+                <button class="tree-action-btn edit-name" title="Đổi tên thư mục"><i class="fa-solid fa-pen"></i></button>
+                <button class="tree-action-btn export-pdf" title="Xuất PDF thư mục này"><i class="fa-solid fa-file-pdf"></i></button>
+                <button class="tree-action-btn delete" title="Xóa thư mục khỏi máy"><i class="fa-solid fa-trash-can"></i></button>
+            </span>`;
 
-        // Click on expander
-        const expander = node.querySelector('.tree-expander');
-        expander.addEventListener('click', (e) => {
+        node.addEventListener('click', () => this.selectFolder(folder.id));
+        node.querySelector('.tree-expander').addEventListener('click', (e) => {
             e.stopPropagation();
-            if (hasChildren) {
-                folder.isExpanded = !folder.isExpanded;
-                this.renderFolderTree();
-            }
+            folder.isExpanded = !folder.isExpanded;
+            this.renderFolderTree();
         });
-
-        // Click on node body
-        node.addEventListener('click', (e) => {
-            if (e.target.closest('.tree-actions') || e.target.closest('.tree-expander')) return;
-            this.selectFolder(folder.id);
-        });
-
-        // Actions inside node
         node.querySelector('.add-sub').addEventListener('click', (e) => {
-            e.stopPropagation();
-            this.openFolderModal('create_subfolder', folder.id);
+            e.stopPropagation(); this.openFolderModal('create', folder.id);
         });
-
         node.querySelector('.edit-name').addEventListener('click', (e) => {
-            e.stopPropagation();
-            this.openFolderModal('rename_folder', folder.id);
+            e.stopPropagation(); this.openFolderModal('rename', folder.id);
         });
-
-        node.querySelector('.save-disk').addEventListener('click', (e) => {
-            e.stopPropagation();
-            this.saveFolderToDiskById(folder.id);
-        });
-
         node.querySelector('.export-pdf').addEventListener('click', (e) => {
-            e.stopPropagation();
-            this.exportFolderPdf(folder.id);
+            e.stopPropagation(); this.exportFolderPdf(folder.id);
         });
-
         node.querySelector('.delete').addEventListener('click', (e) => {
-            e.stopPropagation();
-            this.deleteFolder(folder.id);
+            e.stopPropagation(); this.deleteFolder(folder.id);
         });
 
         container.appendChild(node);
+        if (folder.isExpanded) children.forEach(c => this.renderFolderNode(c, level + 1, container));
+    }
 
-        if (hasChildren && folder.isExpanded) {
-            children.forEach(child => {
-                this.renderFolderTreeNode(child, level + 1, container);
-            });
+    updateFolderHeader() {
+        const folder = this.getActiveFolder();
+        if (this.activeFolderName) {
+            this.activeFolderName.textContent = folder ? folder.name : 'Thư mục gốc';
+            this.activeFolderName.title = folder ? this.getFolderBreadcrumb(folder.id) : '';
+        }
+        if (this.pageCount) this.pageCount.textContent = folder ? (folder.imageIds || []).length : 0;
+        const hasPages = folder && (folder.imageIds || []).length > 0;
+        if (this.btnExportPdf) this.btnExportPdf.disabled = !hasPages;
+        // Nút "Lưu thay đổi" chỉ có một quy tắc duy nhất: sáng khi còn trang chưa lưu.
+        if (this.btnSaveToDisk) this.btnSaveToDisk.disabled = this.dirtyPages.size === 0;
+    }
+
+    // ======================================================
+    // 🗂️ HỘP THOẠI THƯ MỤC
+    // ======================================================
+
+    openFolderModal(mode, folderId) {
+        this.folderModalState = { mode, targetFolderId: folderId };
+        const folder = this.getFolder(folderId);
+        if (mode === 'rename') {
+            if (!folder || !folder.parentId) {
+                this.toastErr('Không thể đổi tên thư mục gốc của dự án.');
+                return;
+            }
+            this.folderModalTitle.innerHTML = '<i class="fa-solid fa-pen text-accent"></i> Đổi tên thư mục';
+            this.folderModalLabel.textContent = 'Tên mới của thư mục:';
+            this.folderModalHint.textContent = 'Thư mục trên ổ đĩa sẽ được đổi tên ngay lập tức.';
+            this.txtFolderModalName.value = folder.name;
+        } else {
+            this.folderModalTitle.innerHTML = '<i class="fa-solid fa-folder-plus text-accent"></i> Tạo thư mục con';
+            this.folderModalLabel.textContent = `Tên thư mục con trong "${folder ? folder.name : ''}":`;
+            this.folderModalHint.textContent = 'Thư mục được tạo thật trên ổ đĩa và có tệp PDF riêng.';
+            this.txtFolderModalName.value = '';
+        }
+        this.folderNameModal.style.display = 'flex';
+        setTimeout(() => this.txtFolderModalName.focus(), 50);
+    }
+
+    closeFolderModal() { this.folderNameModal.style.display = 'none'; }
+
+    async submitFolderModal() {
+        const name = this.txtFolderModalName.value.trim();
+        if (!name) { this.toastErr('Vui lòng nhập tên thư mục.'); return; }
+        const { mode, targetFolderId } = this.folderModalState;
+
+        try {
+            if (mode === 'rename') {
+                await apiJson('/api/rename-folder', {
+                    relative_path: this.getFolderPath(targetFolderId),
+                    folder_name: name,
+                });
+                this.toastOk(`Đã đổi tên thư mục thành "${name}".`);
+            } else {
+                await apiJson('/api/create-folder', {
+                    relative_path: this.getFolderPath(targetFolderId),
+                    folder_name: name,
+                });
+                this.toastOk(`Đã tạo thư mục "${name}" trên máy tính.`);
+            }
+            this.closeFolderModal();
+            await this.loadProject(this.rootPath, false);
+        } catch (err) {
+            this.toastErr(err.message);
         }
     }
 
-    updateActiveFolderUI() {
-        const folder = this.getActiveFolder();
-        if (!folder) return;
-
-        const path = this.getFolderBreadcrumbPath(folder.id);
-        this.activeFolderName.textContent = path;
-        this.activeFolderName.title = path;
-
+    async deleteFolder(folderId) {
+        const folder = this.getFolder(folderId);
+        if (!folder || !folder.parentId) { this.toastErr('Không thể xóa thư mục gốc của dự án.'); return; }
         const count = (folder.imageIds || []).length;
-        this.pageCount.textContent = count;
-
-        this.updateSidebarUI();
-    }
-
-    getFolderBreadcrumbPath(folderId) {
-        const parts = [];
-        let curr = this.getFolder(folderId);
-        while (curr) {
-            parts.unshift(curr.name);
-            curr = curr.parentId ? this.getFolder(curr.parentId) : null;
-        }
-        return parts.join(' / ') || "Thư mục gốc";
-    }
-
-    // ==========================================
-    // 💾 SAVE TO DISK (LOCAL ROOT & SUBFOLDERS)
-    // ==========================================
-
-    async saveActiveFolderToDisk() {
-        const folder = this.getActiveFolder();
-        if (!folder || !folder.imageIds || folder.imageIds.length === 0) {
-            this.showToast("Thư mục hiện tại chưa có ảnh nào để lưu.", false);
-            return;
-        }
-        await this.saveFolderToDiskById(folder.id);
-    }
-
-    async saveFolderToDiskById(folderId, quiet = false) {
-        const folder = this.getFolder(folderId);
-        if (!folder || !folder.imageIds || folder.imageIds.length === 0) {
-            if (!quiet) this.showToast(`Thư mục '${folder ? folder.name : ""}' không có ảnh nào để lưu vào máy.`, false);
-            return;
-        }
-
-        const proj = this.getActiveProject();
-        if (!proj || !proj.rootDiskPath) {
-            if (!quiet) {
-                this.showToast("Vui lòng chọn Thư mục Root trên máy tính trước khi lưu.", false);
-                this.pickRootDiskDirectory();
-            }
-            return;
-        }
-
-        const relPath = this.getFolderRelativePath(folderId);
-        const items = folder.imageIds.map(iid => {
-            const page = this.images.get(iid);
-            const hist = this.historyMap.get(iid) || { undo: [], redo: [] };
-            return {
-                image_id: iid,
-                filename: page ? page.filename : null,
-                doc_name: page ? (page.suggested_name || page.filename) : "trang",
-                corners: page ? page.corners : null,
-                rotation: page ? (page.rotation || 0) : 0,
-                settings: page ? page.settings : null,
-                history: hist
-            };
-        });
-
-        if (!quiet) {
-            this.showLoading(`Đang lưu ${items.length} ảnh gốc & ảnh chỉnh sửa + PDF vào máy tính...`);
-        }
+        const ok = await this.askConfirm(
+            `Xóa thư mục "${folder.name}"`,
+            `${count} trang tài liệu, ảnh gốc và các thư mục con bên trong sẽ bị xóa vĩnh viễn khỏi máy tính.`,
+            true,
+            'Xóa thư mục'
+        );
+        if (!ok) return;
 
         try {
-            const res = await fetch('/api/save-to-disk', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    root_path: proj.rootDiskPath,
-                    relative_path: relPath,
-                    items: items,
-                    save_original: true,
-                    save_edited: true,
-                    save_pdf: true,
-                    pdf_name: folder.name,
-                    quality: 85,
-                    normalize_res: true
-                })
-            });
-
-            if (!res.ok) {
-                const err = await res.json();
-                throw new Error(err.detail || "Lưu vào thư mục máy thất bại");
-            }
-
-            const data = await res.json();
-            if (!quiet) {
-                this.showToast(`✅ Đã lưu ${data.count} file vào: ${data.target_dir}`);
-            } else {
-                if (this.resultInfoText) {
-                    this.resultInfoText.textContent = `💾 Đã tự động lưu vào máy tính lúc ${new Date().toLocaleTimeString('vi-VN')}`;
-                }
-            }
+            await apiJson('/api/delete-folder', { relative_path: folder.relativePath });
+            this.toastOk(`Đã xóa thư mục "${folder.name}".`);
+            localStorage.removeItem('docscan_active_folder');
+            await this.loadProject(this.rootPath, false);
         } catch (err) {
-            if (!quiet) this.showToast(err.message || "Lỗi khi lưu", false);
-        } finally {
-            if (!quiet) this.hideLoading();
+            this.toastErr(err.message);
         }
     }
 
-    scheduleAutoSave(delayMs = 60000) {
-        clearTimeout(this.autoSaveTimer);
-        this.autoSaveTimer = setTimeout(() => {
-            this.performAutoSave();
-        }, delayMs);
-    }
-
-    async performAutoSave() {
-        const folder = this.getActiveFolder();
-        const proj = this.getActiveProject();
-        if (!folder || !proj || !proj.rootDiskPath || !folder.imageIds || folder.imageIds.length === 0) return;
-
-        try {
-            await this.saveFolderToDiskById(folder.id, true);
-        } catch (e) {
-            console.error("Auto save failed:", e);
-        }
-    }
-
-    async saveWholeProjectToDisk() {
-        const proj = this.getActiveProject();
-        if (!proj || !proj.rootDiskPath) {
-            this.showToast("Vui lòng chọn Thư mục Root trên máy tính trước.", false);
-            this.pickRootDiskDirectory();
-            return;
-        }
-
-        const projectFolders = this.folders.filter(f => f.projectId === this.activeProjectId);
-        let savedFolderCount = 0;
-        let totalFilesCount = 0;
-
-        this.showLoading(`Đang lưu toàn bộ Dự án '${proj.name}' vào thư mục máy...`);
-
-        try {
-            for (const folder of projectFolders) {
-                if (folder.imageIds && folder.imageIds.length > 0) {
-                    const relPath = this.getFolderRelativePath(folder.id);
-                    const items = folder.imageIds.map(iid => {
-                        const page = this.images.get(iid);
-                        return {
-                            image_id: iid,
-                            doc_name: page ? (page.suggested_name || page.filename) : "trang"
-                        };
-                    });
-
-                    const res = await fetch('/api/save-to-disk', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({
-                            root_path: proj.rootDiskPath,
-                            relative_path: relPath,
-                            items: items,
-                            save_original: true,
-                            save_edited: true,
-                            save_pdf: true,
-                            pdf_name: folder.name,
-                            quality: 85,
-                            normalize_res: true
-                        })
-                    });
-
-                    if (res.ok) {
-                        const data = await res.json();
-                        savedFolderCount++;
-                        totalFilesCount += data.count || 0;
-                    }
-                }
-            }
-
-            if (savedFolderCount === 0) {
-                this.showToast("Dự án chưa có ảnh nào để lưu.", false);
-            } else {
-                this.showToast(`✅ Đã lưu hoàn tất ${savedFolderCount} nhánh thư mục (${totalFilesCount} files) vào: ${proj.rootDiskPath}`);
-            }
-        } catch (err) {
-            this.showToast(err.message || "Lỗi khi lưu dự án vào máy", false);
-        } finally {
-            this.hideLoading();
-        }
-    }
-
-    // ==========================================
-    // 📑 PAGE LIST & DRAG-AND-DROP REORDER
-    // ==========================================
-
-    getActiveFolderImageIds() {
-        const folder = this.getActiveFolder();
-        return (folder && folder.imageIds) ? folder.imageIds : [];
-    }
-
-    getActivePage() {
-        if (!this.activeImageId) return null;
-        return this.images.get(this.activeImageId) || null;
-    }
-
-    updateSidebarUI() {
-        const imageIds = this.getActiveFolderImageIds();
-        this.pageCount.textContent = imageIds.length;
-        this.pageListContainer.innerHTML = '';
-
-        if (imageIds.length === 0) {
-            const emptyMsg = document.createElement('div');
-            emptyMsg.className = 'empty-folder-msg';
-            emptyMsg.style.cssText = 'text-align: center; color: var(--text-muted); padding: 24px 10px; font-size: 12px;';
-            emptyMsg.innerHTML = '<i class="fa-regular fa-images" style="font-size: 24px; margin-bottom: 8px; display: block; opacity: 0.6;"></i>Thư mục này chưa có ảnh.<br>Nhấp bên dưới hoặc nhấn <strong>Ctrl+V</strong> để dán ảnh.';
-            this.pageListContainer.appendChild(emptyMsg);
-            return;
-        }
-
-        imageIds.forEach((iid, idx) => {
-            const page = this.images.get(iid);
-            if (!page) return;
-
-            const card = document.createElement('div');
-            card.className = `page-thumb-card ${iid === this.activeImageId ? 'active' : ''}`;
-            card.draggable = true;
-            card.dataset.imageId = iid;
-            card.dataset.index = idx;
-
-            const pageNumberText = `Trang ${idx + 1}`;
-            const titleDisplay = page.suggested_name || page.filename || pageNumberText;
-
-            card.innerHTML = `
-                <div class="thumb-header">
-                    <span class="drag-handle" title="Kéo để đổi thứ tự trang"><i class="fa-solid fa-grip-vertical"></i></span>
-                    <span class="page-index-badge">${pageNumberText}</span>
-                </div>
-                <div class="thumb-img-box">
-                    <img src="${page.processed_url || page.preview_url}" alt="${pageNumberText}">
-                </div>
-                <div class="thumb-footer">
-                    <span class="thumb-title-text" title="${titleDisplay}">${titleDisplay}</span>
-                    <div class="thumb-card-actions">
-                        <button class="thumb-action-btn up-btn" title="Đẩy lên trước (Trang ${idx})" ${idx === 0 ? 'disabled' : ''}>
-                            <i class="fa-solid fa-arrow-up"></i>
-                        </button>
-                        <button class="thumb-action-btn down-btn" title="Đẩy xuống sau (Trang ${idx + 2})" ${idx === imageIds.length - 1 ? 'disabled' : ''}>
-                            <i class="fa-solid fa-arrow-down"></i>
-                        </button>
-                        <button class="thumb-action-btn move-btn" title="Chuyển ảnh sang thư mục khác">
-                            <i class="fa-solid fa-arrow-right-to-bracket"></i>
-                        </button>
-                        <button class="thumb-action-btn delete-btn" title="Xóa trang này">
-                            <i class="fa-solid fa-trash-can"></i>
-                        </button>
-                    </div>
-                </div>
-            `;
-
-            // Card click to select
-            card.addEventListener('click', (e) => {
-                if (e.target.closest('.thumb-card-actions') || e.target.closest('.drag-handle')) return;
-                this.selectPage(iid);
-            });
-
-            // Card actions
-            card.querySelector('.up-btn').addEventListener('click', (e) => {
-                e.stopPropagation();
-                this.moveImageInActiveFolder(idx, idx - 1);
-            });
-
-            card.querySelector('.down-btn').addEventListener('click', (e) => {
-                e.stopPropagation();
-                this.moveImageInActiveFolder(idx, idx + 1);
-            });
-
-            card.querySelector('.move-btn').addEventListener('click', (e) => {
-                e.stopPropagation();
-                this.openMoveModal(iid);
-            });
-
-            card.querySelector('.delete-btn').addEventListener('click', (e) => {
-                e.stopPropagation();
-                this.deletePage(iid);
-            });
-
-            // HTML5 Drag & Drop for reordering
-            this.bindCardDragAndDrop(card, iid);
-
-            this.pageListContainer.appendChild(card);
-        });
-    }
-
-    bindCardDragAndDrop(card, imageId) {
-        card.addEventListener('dragstart', (e) => {
-            this.draggedImageId = imageId;
-            card.classList.add('dragging');
-            e.dataTransfer.effectAllowed = 'move';
-            e.dataTransfer.setData('text/plain', imageId);
-        });
-
-        card.addEventListener('dragend', () => {
-            card.classList.remove('dragging');
-            document.querySelectorAll('.page-thumb-card').forEach(c => {
-                c.classList.remove('drag-over-top', 'drag-over-bottom');
-            });
-            this.draggedImageId = null;
-        });
-
-        card.addEventListener('dragover', (e) => {
-            e.preventDefault();
-            e.dataTransfer.dropEffect = 'move';
-
-            if (this.draggedImageId === imageId) return;
-
-            const rect = card.getBoundingClientRect();
-            const midpoint = rect.top + rect.height / 2;
-
-            if (e.clientY < midpoint) {
-                card.classList.add('drag-over-top');
-                card.classList.remove('drag-over-bottom');
-            } else {
-                card.classList.add('drag-over-bottom');
-                card.classList.remove('drag-over-top');
-            }
-        });
-
-        card.addEventListener('dragleave', () => {
-            card.classList.remove('drag-over-top', 'drag-over-bottom');
-        });
-
-        card.addEventListener('drop', (e) => {
-            e.preventDefault();
-            card.classList.remove('drag-over-top', 'drag-over-bottom');
-
-            if (!this.draggedImageId || this.draggedImageId === imageId) return;
-
-            const folder = this.getActiveFolder();
-            if (!folder) return;
-
-            const fromIndex = folder.imageIds.indexOf(this.draggedImageId);
-            const toIndex = folder.imageIds.indexOf(imageId);
-
-            if (fromIndex === -1 || toIndex === -1) return;
-
-            const rect = card.getBoundingClientRect();
-            const midpoint = rect.top + rect.height / 2;
-            const insertAfter = e.clientY >= midpoint;
-
-            folder.imageIds.splice(fromIndex, 1);
-
-            let newIndex = folder.imageIds.indexOf(imageId);
-            if (insertAfter) newIndex++;
-
-            folder.imageIds.splice(newIndex, 0, this.draggedImageId);
-
-            this.showToast(`Đã sắp xếp lại thứ tự trang!`);
-            this.updateSidebarUI();
-        });
-    }
-
-    moveImageInActiveFolder(fromIdx, toIdx) {
-        const folder = this.getActiveFolder();
-        if (!folder || fromIdx < 0 || toIdx < 0 || fromIdx >= folder.imageIds.length || toIdx >= folder.imageIds.length) return;
-
-        const movedId = folder.imageIds.splice(fromIdx, 1)[0];
-        folder.imageIds.splice(toIdx, 0, movedId);
-
-        this.showToast(`Đã di chuyển trang sang vị trí ${toIdx + 1}`);
-        this.updateSidebarUI();
-    }
-
-    sortActiveFolderImages(type) {
-        const folder = this.getActiveFolder();
-        if (!folder || folder.imageIds.length <= 1) return;
-
-        if (type === 'az') {
-            folder.imageIds.sort((a, b) => {
-                const nameA = (this.images.get(a)?.suggested_name || this.images.get(a)?.filename || "").toLowerCase();
-                const nameB = (this.images.get(b)?.suggested_name || this.images.get(b)?.filename || "").toLowerCase();
-                return nameA.localeCompare(nameB, 'vi');
-            });
-            this.showToast("Đã sắp xếp theo tên A → Z");
-        } else if (type === 'za') {
-            folder.imageIds.sort((a, b) => {
-                const nameA = (this.images.get(a)?.suggested_name || this.images.get(a)?.filename || "").toLowerCase();
-                const nameB = (this.images.get(b)?.suggested_name || this.images.get(b)?.filename || "").toLowerCase();
-                return nameB.localeCompare(nameA, 'vi');
-            });
-            this.showToast("Đã sắp xếp theo tên Z → A");
-        } else if (type === 'reverse') {
-            folder.imageIds.reverse();
-            this.showToast("Đã đảo ngược thứ tự các trang");
-        }
-
-        this.updateSidebarUI();
-    }
-
-    updatePageThumbTitle(imageId, newTitle) {
-        const card = this.pageListContainer.querySelector(`.page-thumb-card[data-image-id="${imageId}"]`);
-        if (card) {
-            const titleEl = card.querySelector('.thumb-title-text');
-            if (titleEl) {
-                titleEl.textContent = newTitle;
-                titleEl.title = newTitle;
-            }
-        }
-    }
-
-    // ==========================================
-    // 🚚 MOVE IMAGE BETWEEN FOLDERS
-    // ==========================================
-
-    openMoveModal(imageId) {
-        this.moveModalState = { imageId, selectedTargetFolderId: null };
-        this.hideInlineFolderCreation();
-        this.btnSubmitMoveModal.disabled = true;
-
-        const page = this.images.get(imageId);
-        const pageTitle = page ? (page.suggested_name || page.filename) : "ảnh này";
-        this.moveImageDesc.textContent = `Chọn thư mục đích hoặc tạo mới để chuyển '${pageTitle}' vào:`;
-
-        this.refreshMovePickerTree();
-        this.moveImageModal.style.display = 'flex';
-    }
-
-    refreshMovePickerTree() {
-        this.moveFolderPicker.innerHTML = '';
-        const rootFolders = this.folders.filter(f => f.projectId === this.activeProjectId && f.parentId === null);
-        rootFolders.forEach(root => {
-            this.renderPickerNode(root, 0, this.moveFolderPicker);
-        });
-    }
-
-    renderPickerNode(folder, level, container) {
-        const item = document.createElement('div');
-        const isCurrent = folder.id === this.activeFolderId;
-        const isSelected = folder.id === this.moveModalState.selectedTargetFolderId;
-
-        item.className = `picker-item ${isCurrent ? 'current-folder' : ''} ${isSelected ? 'selected' : ''}`;
-        item.dataset.level = level;
-        item.dataset.folderId = folder.id;
-
-        item.innerHTML = `
-            <div class="picker-item-content">
-                <i class="fa-solid fa-folder text-accent"></i>
-                <span>${folder.name} ${isCurrent ? '(Thư mục hiện tại)' : ''}</span>
-            </div>
-            <div class="picker-item-actions">
-                <button class="picker-add-btn" title="Tạo thư mục con trong '${folder.name}'">
-                    <i class="fa-solid fa-plus"></i> Con
-                </button>
-            </div>
-        `;
-
-        if (!isCurrent) {
-            item.addEventListener('click', (e) => {
-                if (e.target.closest('.picker-add-btn')) return;
-                container.querySelectorAll('.picker-item').forEach(i => i.classList.remove('selected'));
-                item.classList.add('selected');
-                this.moveModalState.selectedTargetFolderId = folder.id;
-                this.btnSubmitMoveModal.disabled = false;
-            });
-        } else {
-            item.style.opacity = '0.55';
-            item.style.cursor = 'default';
-        }
-
-        // Add child subfolder button
-        item.querySelector('.picker-add-btn').addEventListener('click', (e) => {
-            e.stopPropagation();
-            this.showInlineFolderCreation(folder.id);
-        });
-
-        container.appendChild(item);
-
-        const children = this.getFolderChildren(folder.id);
-        children.forEach(ch => {
-            this.renderPickerNode(ch, level + 1, container);
-        });
-    }
-
-    showInlineFolderCreation(parentFolderId) {
-        this.inlineCreateParentFolderId = parentFolderId;
-        const parent = this.getFolder(parentFolderId);
-        const pName = parent ? parent.name : "Thư mục gốc";
-        this.txtInlineNewFolder.placeholder = `Tên thư mục con trong '${pName}'...`;
-        this.txtInlineNewFolder.value = `Thư mục con ${this.folders.length}`;
-        this.moveInlineCreateBox.style.display = 'flex';
-        this.txtInlineNewFolder.focus();
-        this.txtInlineNewFolder.select();
-    }
-
-    hideInlineFolderCreation() {
-        if (this.moveInlineCreateBox) {
-            this.moveInlineCreateBox.style.display = 'none';
-        }
-        this.inlineCreateParentFolderId = null;
-    }
-
-    async confirmInlineFolderCreation() {
-        const name = this.txtInlineNewFolder.value.trim();
-        if (!name) {
-            this.showToast("Vui lòng nhập tên thư mục.", false);
-            return;
-        }
-
-        const parentId = this.inlineCreateParentFolderId || this.activeFolderId;
-        const parent = this.getFolder(parentId);
-        const proj = this.getActiveProject();
-        let newFolderId = 'folder_' + Date.now();
-
-        if (proj && proj.rootDiskPath) {
-            try {
-                const parentRel = this.getFolderRelativePath(parentId);
-                const res = await fetch('/api/create-folder', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        root_path: proj.rootDiskPath,
-                        relative_path: parentRel,
-                        folder_name: name
-                    })
-                });
-                if (res.ok) {
-                    const data = await res.json();
-                    newFolderId = data.folder_id || newFolderId;
-                }
-            } catch (e) {
-                console.error("Lỗi tạo thư mục vật lý:", e);
-            }
-        }
-
-        if (parent) parent.isExpanded = true;
-
-        this.folders.push({
-            id: newFolderId,
-            projectId: this.activeProjectId,
-            name: name,
-            parentId: parentId,
-            imageIds: [],
-            isExpanded: true
-        });
-
-        this.hideInlineFolderCreation();
-        this.moveModalState.selectedTargetFolderId = newFolderId;
-        this.refreshMovePickerTree();
-
-        this.btnSubmitMoveModal.disabled = false;
-        this.renderFolderTree();
-        this.showToast(`Đã tạo thư mục '${name}' trên ổ đĩa và chọn làm thư mục đích!`);
-    }
-
-    closeMoveModal() {
-        this.moveImageModal.style.display = 'none';
-    }
-
-    submitMoveModal() {
-        const { imageId, selectedTargetFolderId } = this.moveModalState;
-        if (!imageId || !selectedTargetFolderId) return;
-
-        const sourceFolder = this.getActiveFolder();
-        const targetFolder = this.getFolder(selectedTargetFolderId);
-
-        if (!sourceFolder || !targetFolder) return;
-
-        const idx = sourceFolder.imageIds.indexOf(imageId);
-        if (idx !== -1) sourceFolder.imageIds.splice(idx, 1);
-
-        targetFolder.imageIds.push(imageId);
-
-        const page = this.images.get(imageId);
-        const title = page ? page.suggested_name : "ảnh";
-        this.showToast(`Đã chuyển '${title}' sang thư mục '${targetFolder.name}'!`);
-
-        this.closeMoveModal();
-        this.renderFolderTree();
-        this.updateActiveFolderUI();
-
-        if (sourceFolder.imageIds.length > 0) {
-            const nextIdx = Math.min(idx, sourceFolder.imageIds.length - 1);
-            this.selectPage(sourceFolder.imageIds[nextIdx]);
-        } else {
-            this.activeImageId = null;
-            this.emptyState.style.display = 'flex';
-            this.editorStage.style.display = 'none';
-            this.docNameWrapper.style.display = 'none';
-        }
-    }
-
-    // ==========================================
-    // 📤 PDF EXPORT PER FOLDER / PROJECT
-    // ==========================================
-
-    async exportActiveFolderPdf() {
-        const folder = this.getActiveFolder();
-        if (!folder || !folder.imageIds || folder.imageIds.length === 0) {
-            this.showToast("Thư mục hiện tại chưa có ảnh nào để xuất PDF.", false);
-            return;
-        }
-        await this.exportFolderPdf(folder.id, folder.name);
-    }
-
-    async exportFolderPdf(folderId, customName = null) {
-        const folder = this.getFolder(folderId);
-        if (!folder || !folder.imageIds || folder.imageIds.length === 0) {
-            this.showToast(`Thư mục '${folder ? folder.name : ""}' không có ảnh nào để xuất PDF.`, false);
-            return;
-        }
-
-        const docTitle = customName || folder.name || "Tai-Lieu-Scan";
-        this.showLoading(`Đang ghép ${folder.imageIds.length} trang thành PDF cho thư mục '${docTitle}'...`);
-
-        try {
-            const res = await fetch('/api/export-pdf', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    image_ids: folder.imageIds,
-                    doc_name: docTitle,
-                    quality: 85,
-                    normalize_res: true
-                })
-            });
-
-            if (!res.ok) throw new Error("Xuất PDF thất bại");
-
-            const blob = await res.blob();
-            const downloadUrl = window.URL.createObjectURL(blob);
-            const a = document.createElement('a');
-            a.href = downloadUrl;
-            a.download = `${docTitle}.pdf`;
-            document.body.appendChild(a);
-            a.click();
-            document.body.removeChild(a);
-            window.URL.revokeObjectURL(downloadUrl);
-
-            this.showToast(`Đã xuất trọn bộ PDF cho thư mục '${docTitle}' thành công!`);
-        } catch (err) {
-            this.showToast(err.message || "Lỗi khi xuất PDF", false);
-        } finally {
-            this.hideLoading();
-        }
-    }
-
-    async exportAllProjectPdf() {
-        const allImageIds = [];
-        const projectFolders = this.folders.filter(f => f.projectId === this.activeProjectId);
-
-        projectFolders.forEach(f => {
-            if (f.imageIds && f.imageIds.length > 0) {
-                allImageIds.push(...f.imageIds);
-            }
-        });
-
-        if (allImageIds.length === 0) {
-            this.showToast("Dự án chưa có ảnh nào để xuất PDF.", false);
-            return;
-        }
-
-        const proj = this.getActiveProject();
-        const docTitle = proj ? proj.name : "Du-An-Scan";
-
-        this.showLoading(`Đang ghép ${allImageIds.length} trang toàn bộ Dự án '${docTitle}' thành PDF...`);
-
-        try {
-            const res = await fetch('/api/export-pdf', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    image_ids: allImageIds,
-                    doc_name: docTitle,
-                    quality: 85,
-                    normalize_res: true
-                })
-            });
-
-            if (!res.ok) throw new Error("Xuất PDF thất bại");
-
-            const blob = await res.blob();
-            const downloadUrl = window.URL.createObjectURL(blob);
-            const a = document.createElement('a');
-            a.href = downloadUrl;
-            a.download = `${docTitle}.pdf`;
-            document.body.appendChild(a);
-            a.click();
-            document.body.removeChild(a);
-            window.URL.revokeObjectURL(downloadUrl);
-
-            this.showToast(`Đã xuất PDF toàn bộ Dự án (${allImageIds.length} trang) thành công!`);
-        } catch (err) {
-            this.showToast(err.message || "Lỗi khi xuất PDF", false);
-        } finally {
-            this.hideLoading();
-        }
-    }
-
-    // ==========================================
-    // 📸 IMAGE UPLOADS & PAGE PROCESSING
-    // ==========================================
-
-    async handleFilesSelected(files) {
+    // ======================================================
+    // 🖼️ NHẬP ẢNH
+    // ======================================================
+
+    async importFiles(files) {
         if (!files || files.length === 0) return;
-        const targetFolder = this.getActiveFolder();
-        this.showLoading(`Đang tải ảnh vào thư mục '${targetFolder.name}' và gợi ý tên...`);
+        if (!this.rootPath) {
+            this.toastErr('Hãy chọn thư mục tài liệu trên máy trước khi thêm ảnh.');
+            return this.pickRootDirectory();
+        }
+        // Thêm ảnh không làm mất gì của trang đang mở, nên KHÔNG chất vấn người dùng
+        // bằng hộp thoại "chưa lưu" ở đây — chỉ lặng lẽ ghi nốt rồi tiếp tục.
+        // (Trước đây bấm "Thêm tài liệu" lại bị hỏi về một trang chẳng liên quan.)
+        if (this.dirtyPages.size > 0) {
+            await this.saveDirtyPages(true);
+        }
 
+        const folder = this.getActiveFolder();
+        const relPath = folder ? folder.relativePath : '';
+        this.showLoading(`Đang thêm ${files.length} ảnh vào "${folder ? folder.name : ''}"…`);
+
+        let firstId = null;
+        let added = 0;
         try {
-            let firstNewId = null;
-            for (let i = 0; i < files.length; i++) {
-                const file = files[i];
-                const formData = new FormData();
-                formData.append('file', file);
+            for (const file of files) {
+                const form = new FormData();
+                form.append('file', file);
+                form.append('relative_path', relPath);
 
-                const res = await fetch('/api/upload', {
-                    method: 'POST',
-                    body: formData
-                });
-
+                const res = await fetch('/api/import', { method: 'POST', body: form });
                 if (!res.ok) {
-                    const err = await res.json();
-                    throw new Error(err.detail || "Tải ảnh thất bại");
+                    const err = await res.json().catch(() => ({}));
+                    throw new Error(err.detail || `Không thêm được ảnh "${file.name}".`);
                 }
-
-                const data = await res.json();
-                const imageId = data.image_id;
-                if (!firstNewId) firstNewId = imageId;
-
-                const newPage = {
-                    id: imageId,
-                    filename: file.name || `Tài liệu ${this.images.size + 1}`,
-                    suggested_name: data.suggested_name || "Tai-Lieu-Scan",
-                    name_suggestions: data.name_suggestions || [],
-                    width: data.width,
-                    height: data.height,
-                    megapixels: data.megapixels,
-                    file_size_human: data.file_size_human,
-                    corners: data.corners,
-                    preview_url: data.preview_url,
-                    rotation: 0,
-                    processed_url: null,
-                    out_dim: null,
-                    out_size_human: null,
-                    saving_ratio: null,
-                    settings: {
-                        mode: 'natural',
-                        shadow_reduction: 0.6,
-                        sharpness: 0.6,
-                        contrast: 0.2,
-                        brightness: 0.0,
-                        margin_percent: 0.02,
-                        dewarp_enabled: false,
-                        dewarp_strength: 0.8,
-                        quality: 85,
-                        normalize_res: true
-                    }
-                };
-
-                this.images.set(imageId, newPage);
-                targetFolder.imageIds.push(imageId);
+                const raw = await res.json();
+                const page = this.toPage(raw);
+                this.pages.set(page.id, page);
+                if (folder && !folder.imageIds.includes(page.id)) folder.imageIds.push(page.id);
+                if (!firstId) firstId = page.id;
+                added++;
             }
 
             this.renderFolderTree();
-            this.updateActiveFolderUI();
-
-            if (firstNewId) {
-                this.selectPage(firstNewId);
-            }
-
-            if (this.btnSaveToDiskMenu) this.btnSaveToDiskMenu.disabled = false;
-            this.showToast(`Đã thêm ${files.length} ảnh vào thư mục '${targetFolder.name}'!`);
+            this.updateFolderHeader();
+            this.renderPageList();
+            if (firstId) await this.selectPage(firstId);
+            this.updateFolderActionButtons();
+            this.toastOk(`Đã thêm ${added} ảnh và lưu ngay ảnh gốc, ảnh đã sửa & metadata vào máy.`);
         } catch (err) {
-            this.showToast(err.message || "Đã xảy ra lỗi khi tải ảnh.", false);
+            this.toastErr(err.message);
         } finally {
             this.hideLoading();
             this.fileInput.value = '';
@@ -2197,523 +937,1425 @@ class DocScanApp {
         }
     }
 
-    selectPage(imageId) {
-        const page = this.images.get(imageId);
+    handleClipboardPaste(e) {
+        const items = (e.clipboardData || window.clipboardData)?.items;
+        if (!items) return;
+        const files = [];
+        for (const item of items) {
+            if (item.type && item.type.startsWith('image/')) {
+                const file = item.getAsFile();
+                if (file) files.push(file);
+            }
+        }
+        if (files.length) {
+            e.preventDefault();
+            this.importFiles(files);
+        }
+    }
+
+    // ======================================================
+    // 📑 DANH SÁCH TRANG
+    // ======================================================
+
+    thumbUrl(page) {
+        return `/api/image?kind=thumb&rel=${encodeURIComponent(page.relativePath)}` +
+            `&file=${encodeURIComponent(page.filename)}&v=${page.version}`;
+    }
+
+    imageUrl(page, kind) {
+        return `/api/image?kind=${kind}&rel=${encodeURIComponent(page.relativePath)}` +
+            `&file=${encodeURIComponent(page.filename)}&v=${page.version}`;
+    }
+
+    toggleSelectAll() {
+        const ids = this.getFolderImageIds();
+        if (ids.length === 0) return;
+        const selectedInFolder = ids.filter(id => this.selectedPageIds.has(id));
+        if (selectedInFolder.length === ids.length) {
+            // Đang chọn hết -> Bỏ chọn tất cả
+            ids.forEach(id => this.selectedPageIds.delete(id));
+        } else {
+            // Chưa chọn hết -> Chọn tất cả
+            ids.forEach(id => this.selectedPageIds.add(id));
+        }
+        this.updateSelectionUI();
+        this.renderPageList();
+    }
+
+    togglePageSelection(id, e) {
+        if (e) e.stopPropagation();
+        if (this.selectedPageIds.has(id)) {
+            this.selectedPageIds.delete(id);
+        } else {
+            this.selectedPageIds.add(id);
+        }
+        this.updateSelectionUI();
+        this.renderPageList();
+    }
+
+    selectAllPages() {
+        const ids = this.getFolderImageIds();
+        ids.forEach(id => this.selectedPageIds.add(id));
+        this.updateSelectionUI();
+        this.renderPageList();
+    }
+
+    deselectAllPages() {
+        const ids = this.getFolderImageIds();
+        ids.forEach(id => this.selectedPageIds.delete(id));
+        this.updateSelectionUI();
+        this.renderPageList();
+    }
+
+    updateSelectionUI() {
+        const ids = this.getFolderImageIds();
+        const selectedInFolder = ids.filter(id => this.selectedPageIds.has(id));
+        const count = selectedInFolder.length;
+        const allSelected = ids.length > 0 && count === ids.length;
+
+        if (this.btnToggleSelectAll) {
+            this.btnToggleSelectAll.disabled = ids.length === 0;
+            this.btnToggleSelectAll.classList.toggle('active', count > 0);
+            if (this.lblToggleSelectAll) {
+                this.lblToggleSelectAll.textContent = allSelected ? 'Bỏ chọn' : (count > 0 ? `Bỏ chọn (${count})` : 'Chọn tất cả');
+            }
+            const icon = this.btnToggleSelectAll.querySelector('i');
+            if (icon) {
+                icon.className = allSelected ? 'fa-solid fa-square-check' : (count > 0 ? 'fa-solid fa-square-minus' : 'fa-regular fa-square-check');
+            }
+        }
+
+        if (this.selectionActionBar) {
+            this.selectionActionBar.style.display = count > 0 ? 'flex' : 'none';
+        }
+        if (this.selectionCount) {
+            this.selectionCount.innerHTML = `<i class="fa-solid fa-check-double text-accent"></i> Đã chọn: <strong>${count}</strong> / ${ids.length} trang`;
+        }
+        if (this.lblExportPdf) {
+            this.lblExportPdf.textContent = count > 0 ? `Lưu PDF (${count})` : 'Lưu PDF';
+        }
+        if (this.lblDownloadZip) {
+            this.lblDownloadZip.textContent = count > 0 ? `Lưu ảnh (${count})` : 'Lưu ảnh';
+        }
+
+        if (this.btnExportFolderPdf) this.btnExportFolderPdf.disabled = count === 0;
+        if (this.btnDownloadFolderZip) this.btnDownloadFolderZip.disabled = count === 0;
+    }
+
+    updateFolderActionButtons() {
+        const ids = this.getFolderImageIds();
+        const hasImages = ids.length > 0;
+        const selectedInFolder = ids.filter(id => this.selectedPageIds.has(id));
+        const hasSelected = selectedInFolder.length > 0;
+        const page = this.getActivePage();
+        const hasActivePage = !!page;
+
+        if (this.btnToggleSelectAll) this.btnToggleSelectAll.disabled = !hasImages;
+        if (this.btnSortMenu) this.btnSortMenu.disabled = !hasImages;
+        if (this.btnExportFolderPdf) this.btnExportFolderPdf.disabled = !hasSelected;
+        if (this.btnDownloadFolderZip) this.btnDownloadFolderZip.disabled = !hasSelected;
+        if (this.btnExportPdf) this.btnExportPdf.disabled = !hasActivePage;
+        if (this.btnSaveToDisk) this.btnSaveToDisk.disabled = this.dirtyPages.size === 0;
+        if (this.btnDownloadCurrent) this.btnDownloadCurrent.disabled = !hasActivePage;
+
+        // Bảng Inspector bên phải: Chỉ kích hoạt khi đang có 1 ảnh được chọn xem/sửa
+        if (this.controlPanel) {
+            this.controlPanel.classList.toggle('disabled', !hasActivePage);
+        }
+
+        // Floating toolbar buttons
+        if (this.btnResetToRawOriginal) this.btnResetToRawOriginal.disabled = !hasActivePage;
+        if (this.btnResetCorners) this.btnResetCorners.disabled = !hasActivePage;
+        if (this.btnAutoDetect) this.btnAutoDetect.disabled = !hasActivePage;
+        if (this.btnExpandMargin) this.btnExpandMargin.disabled = !hasActivePage;
+        if (this.btnShrinkMargin) this.btnShrinkMargin.disabled = !hasActivePage;
+        if (this.btnRotateLeft) this.btnRotateLeft.disabled = !hasActivePage;
+        if (this.btnRotateRight) this.btnRotateRight.disabled = !hasActivePage;
+        if (this.btnPanelApplyAsOriginal) this.btnPanelApplyAsOriginal.disabled = !hasActivePage;
+    }
+
+    renderPageList() {
+        if (!this.pageListContainer) return;
+        const ids = this.getFolderImageIds();
+        this.pageListContainer.innerHTML = '';
+        if (this.pageCount) this.pageCount.textContent = ids.length;
+
+        // Xóa các ID không còn tồn tại trong folder hiện tại
+        for (const selId of this.selectedPageIds) {
+            if (!ids.includes(selId)) this.selectedPageIds.delete(selId);
+        }
+        this.updateSelectionUI();
+        this.updateFolderActionButtons();
+
+        if (ids.length === 0) {
+            this.pageListContainer.innerHTML =
+                '<div class="empty-folder-msg">' +
+                '<i class="fa-regular fa-images"></i>' +
+                'Thư mục này chưa có trang nào.<br>Nhấn <strong>Thêm ảnh</strong> hoặc dán bằng <strong>Ctrl + V</strong>.' +
+                '</div>';
+            return;
+        }
+
+        ids.forEach((id, idx) => {
+            const page = this.pages.get(id);
+            if (!page) return;
+
+            const isSelected = this.selectedPageIds.has(id);
+            const card = document.createElement('div');
+            card.className = `page-thumb-card ${id === this.activeImageId ? 'active' : ''} ${this.dirtyPages.has(id) ? 'unsaved' : ''} ${isSelected ? 'selected' : ''}`;
+            card.draggable = true;
+            card.dataset.imageId = id;
+            card.innerHTML = `
+                <div class="thumb-header">
+                    <label class="thumb-checkbox-wrap" title="Chọn ảnh này">
+                        <input type="checkbox" class="thumb-checkbox" ${isSelected ? 'checked' : ''}>
+                    </label>
+                    <span class="drag-handle" title="Kéo để đổi thứ tự trang"><i class="fa-solid fa-grip-vertical"></i></span>
+                    <span class="page-index-badge">Trang ${idx + 1}</span>
+                    ${page.hasOriginal ? '' : '<span class="badge-orphan" title="Chưa có ảnh gốc trong _goc/"><i class="fa-solid fa-triangle-exclamation"></i></span>'}
+                </div>
+                <div class="thumb-img-box">
+                    <img src="${this.thumbUrl(page)}" alt="Trang ${idx + 1}" loading="lazy">
+                </div>
+                <div class="thumb-footer">
+                    <span class="thumb-title-text" title="${escapeHtml(page.docName)}">${escapeHtml(page.docName)}</span>
+                    <div class="thumb-card-actions">
+                        <button class="thumb-action-btn up-btn" title="Chuyển lên trước" ${idx === 0 ? 'disabled' : ''}><i class="fa-solid fa-arrow-up"></i></button>
+                        <button class="thumb-action-btn down-btn" title="Chuyển xuống sau" ${idx === ids.length - 1 ? 'disabled' : ''}><i class="fa-solid fa-arrow-down"></i></button>
+                        <button class="thumb-action-btn move-btn" title="Chuyển sang thư mục khác"><i class="fa-solid fa-arrow-right-to-bracket"></i></button>
+                        <button class="thumb-action-btn delete-btn" title="Xóa trang khỏi máy"><i class="fa-solid fa-trash-can"></i></button>
+                    </div>
+                </div>`;
+
+            const chk = card.querySelector('.thumb-checkbox');
+            chk.addEventListener('click', (e) => e.stopPropagation());
+            chk.addEventListener('change', (e) => this.togglePageSelection(id, e));
+
+            card.addEventListener('click', (e) => {
+                if (e.target.closest('.thumb-card-actions') || e.target.closest('.drag-handle') || e.target.closest('.thumb-checkbox-wrap')) return;
+                this.selectPage(id);
+            });
+
+            // Nhấn giữ thumbnail để xem nhanh ảnh gốc
+            const box = card.querySelector('.thumb-img-box');
+            const img = box.querySelector('img');
+            const holdOriginal = () => { img.src = this.imageUrl(page, 'thumb_original'); };
+            const releaseOriginal = () => { img.src = this.thumbUrl(page); };
+            box.addEventListener('mousedown', holdOriginal);
+            box.addEventListener('mouseup', releaseOriginal);
+            box.addEventListener('mouseleave', releaseOriginal);
+            box.addEventListener('touchstart', holdOriginal, { passive: true });
+            box.addEventListener('touchend', releaseOriginal);
+
+            card.querySelector('.up-btn').addEventListener('click', (e) => { e.stopPropagation(); this.reorderPage(idx, idx - 1); });
+            card.querySelector('.down-btn').addEventListener('click', (e) => { e.stopPropagation(); this.reorderPage(idx, idx + 1); });
+            card.querySelector('.move-btn').addEventListener('click', (e) => { e.stopPropagation(); this.openMoveModal(id); });
+            card.querySelector('.delete-btn').addEventListener('click', (e) => { e.stopPropagation(); this.deletePage(id); });
+
+            this.bindThumbDragDrop(card, id);
+            this.pageListContainer.appendChild(card);
+        });
+    }
+
+    bindThumbDragDrop(card, imageId) {
+        card.addEventListener('dragstart', (e) => {
+            this.draggedImageId = imageId;
+            card.classList.add('dragging');
+            e.dataTransfer.effectAllowed = 'move';
+        });
+        const clearDropMarks = () => document.querySelectorAll('.page-thumb-card')
+            .forEach(c => c.classList.remove('drag-over-top', 'drag-over-bottom'));
+
+        card.addEventListener('dragend', () => {
+            card.classList.remove('dragging');
+            clearDropMarks();
+            this.draggedImageId = null;
+        });
+        card.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            if (!this.draggedImageId || this.draggedImageId === imageId) return;
+            const ids = this.getFolderImageIds();
+            const before = ids.indexOf(this.draggedImageId) > ids.indexOf(imageId);
+            card.classList.toggle('drag-over-top', before);
+            card.classList.toggle('drag-over-bottom', !before);
+        });
+        card.addEventListener('dragleave', () => card.classList.remove('drag-over-top', 'drag-over-bottom'));
+        card.addEventListener('drop', (e) => {
+            e.preventDefault();
+            clearDropMarks();
+            if (!this.draggedImageId || this.draggedImageId === imageId) return;
+            const ids = this.getFolderImageIds();
+            this.reorderPage(ids.indexOf(this.draggedImageId), ids.indexOf(imageId));
+        });
+    }
+
+    reorderPage(from, to) {
+        const folder = this.getActiveFolder();
+        if (!folder) return;
+        const ids = folder.imageIds;
+        if (from < 0 || to < 0 || from >= ids.length || to >= ids.length || from === to) return;
+        const [moved] = ids.splice(from, 1);
+        ids.splice(to, 0, moved);
+        this.renderPageList();
+        this.saveFolderOrder(folder);
+    }
+
+    sortActiveFolder(type) {
+        const folder = this.getActiveFolder();
+        if (!folder) return;
+        const nameOf = (id) => (this.pages.get(id)?.docName || '').toLowerCase();
+        if (type === 'az') folder.imageIds.sort((a, b) => nameOf(a).localeCompare(nameOf(b), 'vi'));
+        else if (type === 'za') folder.imageIds.sort((a, b) => nameOf(b).localeCompare(nameOf(a), 'vi'));
+        else if (type === 'reverse') folder.imageIds.reverse();
+        this.renderPageList();
+        this.saveFolderOrder(folder);
+        this.toastOk('Đã sắp xếp lại thứ tự trang và ghi nhớ vào thư mục.');
+    }
+
+    async saveFolderOrder(folder) {
+        if (!this.rootPath) return;
+        const order = (folder.imageIds || []).map(id => this.pages.get(id)?.filename).filter(Boolean);
+        try {
+            await apiJson('/api/save-metadata', {
+                relative_path: folder.relativePath,
+                pages: [],
+                order,
+            });
+        } catch (_) { /* thứ tự sẽ được lưu lại ở lần lưu kế tiếp */ }
+    }
+
+    // ======================================================
+    // 🎯 CHỌN TRANG
+    // ======================================================
+
+    async selectPage(imageId) {
+        const page = this.pages.get(imageId);
         if (!page) return;
 
-        this.activeImageId = imageId;
+        if (this.activeImageId && this.activeImageId !== imageId && this.dirtyPages.has(this.activeImageId)) {
+            const allowed = await this.confirmUnsavedChanges();
+            if (!allowed) return;
+        }
 
+        this.activeImageId = imageId;
+        if (!page._savedSnapshot) {
+            page._savedSnapshot = {
+                corners: JSON.parse(JSON.stringify(page.corners || [])),
+                rotation: page.rotation || 0,
+                settings: JSON.parse(JSON.stringify(page.settings || {})),
+                docName: page.docName || '',
+            };
+        }
         this.emptyState.style.display = 'none';
         this.editorStage.style.display = 'flex';
         this.docNameWrapper.style.display = 'flex';
-        this.btnExportPdf.disabled = false;
-        if (this.btnSaveToDiskMenu) this.btnSaveToDiskMenu.disabled = false;
         this.btnDownloadCurrent.disabled = false;
 
-        this.txtDocName.value = page.suggested_name;
+        this.txtDocName.value = page.docName;
         this.renderNameSuggestions(page);
 
-        // Show/hide on-demand AI banner
-        if (this.aiSuggestBanner) {
-            if (!page.aiAnalyzed && !page.aiDismissed) {
-                this.aiSuggestBanner.style.display = 'flex';
-            } else {
-                this.aiSuggestBanner.style.display = 'none';
+        this.syncInspector(page.settings);
+        this.updateMetrics(page);
+        this.updateHistoryButtons();
+        this.renderPageList();
+        this.resetZoom();
+
+        // Ảnh trên đĩa CHÍNH LÀ trạng thái hiện tại -> mở trang là hiển thị ngay, không xử lý lại.
+        this.originalImg = null;
+        this.editedImg = null;
+        this.clearPreviewUrl();
+        this.clearBaseline();
+
+        try {
+            const [orig, edited] = await Promise.all([
+                loadImage(this.imageUrl(page, 'original')),
+                loadImage(this.imageUrl(page, 'edited')).catch(() => null),
+            ]);
+            if (this.activeImageId !== imageId) return;
+            this.originalImg = orig;
+            this.editedImg = edited;
+            this.layoutCanvas();
+            this.ensureBaseline();
+        } catch (err) {
+            // Máy chủ vừa khởi động lại thì mất phiên làm việc — quét lại một lần
+            // thay vì để người dùng nhìn màn hình trắng không hiểu vì sao.
+            if (!this.recoveringSession && this.rootPath) {
+                this.recoveringSession = true;
+                await this.loadProject(this.rootPath, false);
+                this.recoveringSession = false;
+                const again = [...this.pages.values()].find(p =>
+                    p.filename === page.filename && p.relativePath === page.relativePath);
+                if (again) return this.selectPage(again.id);
             }
+            this.toastErr('Không mở được ảnh của trang này trên ổ đĩa.');
         }
 
-        this.resetZoomFit();
-        this.updateSidebarUI();
-        this.syncInspectorUI(page.settings);
-        this.updateMetadataUI(page);
-        this.updateHistoryButtons();
-
-        // Check if orphan image (no raw original in _goc/) - skip if in unapproved store
-        const folder = this.getFolder(page.folderId || this.activeFolderId);
-        const isUnapprovedFolder = folder && (folder.is_unapproved || folder.relativePath === 'Kho_Chua_Duyet' || folder.name.includes('chưa duyệt'));
-        if (!isUnapprovedFolder && page.has_raw_original === false && !page.orphanPromptDismissed) {
+        if (!page.hasOriginal && !page.orphanHandled && !this.isUnapprovedFolder(page.folderId)) {
             this.openOrphanPrompt(imageId);
         }
-
-        const img = new Image();
-        img.onload = () => {
-            this.currentImageObj = img;
-            if (page.processed_url) {
-                const procImg = new Image();
-                procImg.onload = () => {
-                    page.processedImageObj = procImg;
-                    this.renderCropCanvas();
-                };
-                procImg.src = page.processed_url;
-            } else {
-                this.renderCropCanvas();
-                if (this.currentViewMode === 'edited') {
-                    this.processActivePage();
-                }
-            }
-        };
-        img.src = page.preview_url;
     }
 
-    openOrphanPrompt(imageId) {
-        const page = this.images.get(imageId);
+    isUnapprovedFolder(folderId) {
+        const folder = this.getFolder(folderId);
+        return !!(folder && folder.isUnapproved);
+    }
+
+    renderNameSuggestions(page) {
+        if (!this.suggestMenu) return;
+        const list = page.nameSuggestions || [];
+        if (!list.length) {
+            this.suggestMenu.innerHTML =
+                '<div class="suggest-empty">' +
+                '<i class="fa-solid fa-wand-magic-sparkles text-accent"></i> ' +
+                'Chưa có gợi ý tên. Nhấn <strong>AI gợi ý tên</strong> để đọc nội dung văn bản.' +
+                '</div>';
+            return;
+        }
+        let html = '<div class="suggest-header"><i class="fa-solid fa-wand-magic-sparkles text-accent"></i> Gợi ý tên từ AI:</div>';
+        html += list.map(n => `<a href="#" class="suggest-item"><i class="fa-regular fa-file-lines mr-1 text-muted"></i> ${escapeHtml(n)}</a>`).join('');
+        html += '<div class="suggest-footer"><button class="btn-link-xs w-100 text-center" id="btnRerunAi"><i class="fa-solid fa-rotate mr-1"></i> Quét lại với AI</button></div>';
+        this.suggestMenu.innerHTML = html;
+
+        this.suggestMenu.querySelectorAll('.suggest-item').forEach(item => {
+            item.addEventListener('click', (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                this.txtDocName.value = item.textContent.trim();
+                this.suggestMenu.classList.remove('open');
+                this.commitDocumentName();
+            });
+        });
+        const rerunBtn = this.suggestMenu.querySelector('#btnRerunAi');
+        if (rerunBtn) {
+            rerunBtn.addEventListener('click', (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                this.runAiNaming();
+            });
+        }
+    }
+
+    // ======================================================
+    // ✏️ ĐỔI TÊN TÀI LIỆU (đổi cả bộ ba)
+    // ======================================================
+
+    async commitDocumentName() {
+        const page = this.getActivePage();
         if (!page) return;
-
-        const folder = this.getFolder(page.folderId || this.activeFolderId);
-        const folderRel = folder ? this.getFolderBreadcrumbPath(folder.id) : "Thư mục hiện tại";
-
-        this.pendingOrphanImageId = imageId;
-        this.orphanFileName.textContent = page.filename || page.suggested_name;
-        this.orphanFolderPath.textContent = folderRel;
-        this.orphanFileSize.textContent = page.file_size_human || "--";
-        this.orphanPreviewImg.src = page.preview_url || "";
-
-        this.orphanImageModal.style.display = 'flex';
-    }
-
-    closeOrphanPrompt() {
-        this.orphanImageModal.style.display = 'none';
-        this.pendingOrphanImageId = null;
-    }
-
-    async adoptPendingOrphanAsOriginal() {
-        const imageId = this.pendingOrphanImageId;
-        const page = this.images.get(imageId);
-        const proj = this.getActiveProject();
-        const folder = this.getFolder(page ? page.folderId : this.activeFolderId);
-        if (!page || !proj || !proj.rootDiskPath) {
-            if (page) {
-                page.has_raw_original = true;
-                page.orphanPromptDismissed = true;
-            }
-            this.closeOrphanPrompt();
+        const newName = this.txtDocName.value.trim();
+        if (!newName || newName === page.docName) {
+            this.txtDocName.value = page.docName;
             return;
         }
 
-        const relPath = folder ? this.getFolderRelativePath(folder.id) : "";
-        this.showLoading("Đang tạo cặp ảnh gốc và bản sửa...");
-
         try {
-            const res = await fetch('/api/adopt-as-original', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    root_path: proj.rootDiskPath,
-                    relative_path: relPath,
-                    filename: page.filename,
-                    image_id: imageId
-                })
+            const raw = await apiJson('/api/rename-page', {
+                relative_path: page.relativePath,
+                filename: page.filename,
+                new_name: newName,
             });
 
-            if (!res.ok) {
-                const err = await res.json();
-                throw new Error(err.detail || "Không thể tạo cặp ảnh gốc");
-            }
+            const folder = this.getFolder(page.folderId);
+            const oldId = page.id;
+            const updated = this.toPage(raw);
+            updated.history = page.history;
+            updated.nameSuggestions = page.nameSuggestions;
+            updated.orphanHandled = page.orphanHandled;
 
-            page.has_raw_original = true;
-            page.orphanPromptDismissed = true;
-            this.closeOrphanPrompt();
-            this.selectPage(imageId);
-            this.showToast(`✅ Đã tạo cặp ảnh gốc và bản sửa cho '${page.filename}'!`);
-        } catch (e) {
-            this.showToast(e.message || "Lỗi tạo bản gốc", false);
+            this.pages.delete(oldId);
+            this.pages.set(updated.id, updated);
+            if (folder) {
+                const idx = folder.imageIds.indexOf(oldId);
+                if (idx >= 0) folder.imageIds[idx] = updated.id;
+            }
+            if (this.dirtyPages.delete(oldId)) this.dirtyPages.add(updated.id);
+            this.activeImageId = updated.id;
+
+            this.txtDocName.value = updated.docName;
+            this.renderPageList();
+            this.updateMetrics(updated);
+            this.toastOk(`Đã đổi tên tài liệu thành “${updated.docName}” (ảnh gốc, ảnh sửa & metadata cùng đổi).`);
+        } catch (err) {
+            this.txtDocName.value = page.docName;
+            this.toastErr(err.message);
+        }
+    }
+
+    async runAiNaming() {
+        const page = this.getActivePage();
+        if (!page) return;
+        this.showLoading('AI đang đọc nội dung tài liệu để gợi ý tên…');
+        try {
+            const ids = this.getFolderImageIds();
+            const data = await apiJson('/api/ai-suggest-name', {
+                relative_path: page.relativePath,
+                filename: page.filename,
+                page_index: Math.max(0, ids.indexOf(page.id)) + 1,
+            });
+            page.nameSuggestions = data.suggestions || [];
+            this.renderNameSuggestions(page);
+            if (data.primary_name) {
+                this.txtDocName.value = data.primary_name;
+                await this.commitDocumentName();
+            }
+            this.suggestMenu?.classList.add('open');
+            this.toastOk('Đã nhận diện nội dung và gợi ý tên tài liệu.');
+        } catch (err) {
+            this.toastErr(err.message);
         } finally {
             this.hideLoading();
         }
     }
 
-    async movePendingOrphanToUnapproved() {
-        const imageId = this.pendingOrphanImageId;
-        const page = this.images.get(imageId);
-        const proj = this.getActiveProject();
-        const currentFolder = this.getFolder(page ? (page.folderId || this.activeFolderId) : this.activeFolderId);
-        if (!page || !proj || !proj.rootDiskPath) return;
+    // ======================================================
+    // ⚡ XEM TRƯỚC (không chặn màn hình, hủy được)
+    // ======================================================
 
-        const currentRel = currentFolder ? this.getFolderRelativePath(currentFolder.id) : "";
-        this.showLoading("Đang chuyển ảnh vào Kho ảnh chưa duyệt...");
-
-        try {
-            const res = await fetch('/api/move-to-unapproved', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    root_path: proj.rootDiskPath,
-                    relative_path: currentRel,
-                    filename: page.filename,
-                    image_id: imageId,
-                    unapproved_folder_name: "Kho_Chua_Duyet"
-                })
-            });
-
-            if (!res.ok) {
-                const err = await res.json();
-                throw new Error(err.detail || "Không thể chuyển vào Kho chưa duyệt");
-            }
-
-            const data = await res.json();
-
-            // Ensure unapproved folder exists in frontend state
-            let unapprovedFolder = this.folders.find(f => f.projectId === this.activeProjectId && (f.relativePath === 'Kho_Chua_Duyet' || f.name === 'Kho ảnh chưa duyệt' || f.id === data.folder_id));
-            if (!unapprovedFolder) {
-                unapprovedFolder = {
-                    id: data.folder_id,
-                    projectId: this.activeProjectId,
-                    name: 'Kho ảnh chưa duyệt',
-                    parentId: null,
-                    relativePath: 'Kho_Chua_Duyet',
-                    imageIds: [],
-                    isExpanded: true,
-                    is_unapproved: true
-                };
-                this.folders.push(unapprovedFolder);
-            }
-
-            // Remove from current folder
-            if (currentFolder && currentFolder.imageIds) {
-                const idx = currentFolder.imageIds.indexOf(imageId);
-                if (idx !== -1) currentFolder.imageIds.splice(idx, 1);
-            }
-
-            // Add to unapproved folder
-            if (!unapprovedFolder.imageIds.includes(imageId)) {
-                unapprovedFolder.imageIds.push(imageId);
-            }
-
-            page.folderId = unapprovedFolder.id;
-            page.filename = data.filename || page.filename;
-            page.orphanPromptDismissed = true;
-
-            this.closeOrphanPrompt();
-            this.renderFolderTree();
-            this.selectFolder(unapprovedFolder.id);
-            this.selectPage(imageId);
-            this.showToast(`📥 Đã chuyển '${page.filename}' vào Kho ảnh chưa duyệt!`);
-        } catch (e) {
-            this.showToast(e.message || "Lỗi chuyển vào Kho chưa duyệt", false);
-        } finally {
-            this.hideLoading();
+    clearPreviewUrl() {
+        if (this.previewUrl) {
+            URL.revokeObjectURL(this.previewUrl);
+            this.previewUrl = null;
         }
     }
 
-    async deletePendingOrphanFile() {
-        const imageId = this.pendingOrphanImageId;
-        const page = this.images.get(imageId);
-        const proj = this.getActiveProject();
-        const folder = this.getFolder(page ? page.folderId : this.activeFolderId);
+    clearBaseline() {
+        if (this.baselineUrl) URL.revokeObjectURL(this.baselineUrl);
+        this.baselineUrl = null;
+        this.baselineImg = null;
+        this.baselineKey = null;
+    }
+
+    /** Khóa hình học: chỉ đổi khi 4 góc / góc xoay / làm phẳng thay đổi. */
+    geometryKey(page) {
+        return JSON.stringify([
+            page.id, page.corners, page.rotation,
+            page.settings.dewarp_enabled, page.settings.dewarp_strength,
+        ]);
+    }
+
+    /**
+     * Dựng ảnh nền cho thanh so sánh: CÙNG khung cắt, CÙNG kích thước với bản đã sửa
+     * nhưng chưa áp bộ lọc màu. Nhờ vậy kéo thanh trượt là thấy đúng tác dụng của
+     * việc làm nét, thay vì so một tấm ảnh thô méo tỉ lệ với một tấm đã cắt phẳng.
+     */
+    async ensureBaseline() {
+        const page = this.getActivePage();
+        if (!page || this.viewMode !== VIEW.COMPARE) return;
+
+        const key = this.geometryKey(page);
+        if (this.baselineKey === key && this.baselineImg) return;
+
+        try {
+            const res = await fetch('/api/process', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    relative_path: page.relativePath,
+                    filename: page.filename,
+                    corners: page.corners,
+                    rotation: page.rotation,
+                    settings: { ...page.settings, mode: 'original', shadow_reduction: 0, sharpness: 0, contrast: 0 },
+                }),
+            });
+            if (!res.ok) return;
+            const url = URL.createObjectURL(await res.blob());
+            const img = await loadImage(url);
+            if (this.activeImageId !== page.id) { URL.revokeObjectURL(url); return; }
+            this.clearBaseline();
+            this.baselineUrl = url;
+            this.baselineImg = img;
+            this.baselineKey = key;
+            this.drawCanvas();
+        } catch (_) { /* thiếu ảnh nền thì tạm dùng ảnh gốc, không chặn thao tác */ }
+    }
+
+    markDirty(page) {
+        this.dirtyPages.add(page.id);
+        this.updateSaveState();
+        this.updateFolderActionButtons();
+        // Mọi chỉnh sửa đều phải kéo theo: ghi tình trạng (nhẹ) + hẹn giờ tự động lưu 60s.
+        // Thiếu hai lời gọi này thì cam kết "tự động lưu sau 60 giây" chỉ nằm trên giấy.
+        this.scheduleMetaSave();
+        this.ensureAutoSaveArmed();
+        const card = this.pageListContainer?.querySelector(`.page-thumb-card[data-image-id="${page.id}"]`);
+        card?.classList.add('unsaved');
+    }
+
+    /** Dựng lại ảnh xem trước sau một khoảng lặng ngắn; yêu cầu cũ bị hủy ngay. */
+    requestPreview() {
+        const page = this.getActivePage();
+        if (!page) return;
+        this.markDirty(page);
+
+        clearTimeout(this.previewTimer);
+        this.previewTimer = setTimeout(() => this.renderPreview(), PREVIEW_DEBOUNCE_MS);
+    }
+
+    async renderPreview() {
+        const page = this.getActivePage();
         if (!page) return;
 
-        if (!confirm(`Bạn có chắc chắn muốn xóa vĩnh viễn tệp '${page.filename}' khỏi máy tính?`)) {
-            return;
-        }
-
-        const relPath = folder ? this.getFolderRelativePath(folder.id) : "";
-        this.showLoading("Đang xóa tệp ảnh khỏi máy tính...");
+        if (this.previewController) this.previewController.abort();
+        const controller = new AbortController();
+        this.previewController = controller;
+        this.setProcessing(true);
 
         try {
-            if (proj && proj.rootDiskPath) {
-                await fetch('/api/delete-disk-file', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        root_path: proj.rootDiskPath,
-                        relative_path: relPath,
-                        filename: page.filename,
-                        image_id: imageId
-                    })
-                });
+            const res = await fetch('/api/process', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    relative_path: page.relativePath,
+                    filename: page.filename,
+                    corners: page.corners,
+                    rotation: page.rotation,
+                    settings: page.settings,
+                }),
+                signal: controller.signal,
+            });
+            if (!res.ok) {
+                const err = await res.json().catch(() => ({}));
+                throw new Error(err.detail || 'Không dựng được ảnh xem trước.');
             }
 
-            this.closeOrphanPrompt();
-            this.deletePage(imageId);
-            this.showToast(`🗑️ Đã xóa file '${page.filename}' khỏi máy tính.`);
-        } catch (e) {
-            this.showToast(e.message || "Lỗi xóa file", false);
+            const blob = await res.blob();
+            if (this.previewController !== controller || this.activeImageId !== page.id) return;
+
+            const url = URL.createObjectURL(blob);
+            const img = await loadImage(url);
+            if (this.activeImageId !== page.id) { URL.revokeObjectURL(url); return; }
+
+            this.clearPreviewUrl();
+            this.previewUrl = url;
+            this.editedImg = img;
+
+            page.outDim = `${res.headers.get('X-Out-Width')} × ${res.headers.get('X-Out-Height')} px`;
+            page.outSize = blob.size;
+            page.outSizeHuman = formatBytes(blob.size);
+            this.updateMetrics(page);
+            this.layoutCanvas();
+            this.ensureBaseline();
+        } catch (err) {
+            if (err.name !== 'AbortError') this.toastErr(err.message);
         } finally {
-            this.hideLoading();
+            if (this.previewController === controller) {
+                this.previewController = null;
+                this.setProcessing(false);
+            }
         }
     }
 
-    dismissPendingOrphanPrompt() {
-        const imageId = this.pendingOrphanImageId;
-        const page = this.images.get(imageId);
-        if (page) {
-            page.orphanPromptDismissed = true;
-        }
-        this.closeOrphanPrompt();
+    setProcessing(on) {
+        if (this.processingPill) this.processingPill.style.display = on ? 'inline-flex' : 'none';
     }
 
-    deletePage(imageId) {
-        const folder = this.getActiveFolder();
-        if (!folder) return;
+    // ======================================================
+    // 💾 LƯU XUỐNG ĐĨA
+    // ======================================================
 
-        const idx = folder.imageIds.indexOf(imageId);
-        if (idx !== -1) {
-            folder.imageIds.splice(idx, 1);
-        }
-        this.images.delete(imageId);
-        this.historyMap.delete(imageId);
-
-        this.renderFolderTree();
-        this.updateActiveFolderUI();
-
-        if (folder.imageIds.length === 0) {
-            this.activeImageId = null;
-            this.emptyState.style.display = 'flex';
-            this.editorStage.style.display = 'none';
-            this.docNameWrapper.style.display = 'none';
-            this.btnDownloadCurrent.disabled = true;
+    updateSaveState() {
+        if (!this.saveStatePill) return;
+        const n = this.dirtyPages.size;
+        if (n === 0) {
+            this.saveStatePill.className = 'save-state-pill saved';
+            this.saveStatePill.innerHTML = '<i class="fa-solid fa-hard-drive"></i> Đã lưu';
         } else {
-            const nextIdx = Math.min(idx, folder.imageIds.length - 1);
-            this.selectPage(folder.imageIds[nextIdx]);
+            this.saveStatePill.className = 'save-state-pill unsaved';
+            this.saveStatePill.innerHTML = `<i class="fa-solid fa-pen-to-square"></i> ${n} trang chưa lưu`;
+        }
+        if (this.btnSaveToDisk) this.btnSaveToDisk.disabled = n === 0;
+    }
+
+    scheduleMetaSave() {
+        clearTimeout(this.metaTimer);
+        this.metaTimer = setTimeout(() => this.saveMetadata(this.activeFolderId), META_SAVE_MS);
+    }
+
+    scheduleAutoSave() {
+        clearTimeout(this.autoSaveTimer);
+        this.autoSaveTimer = setTimeout(() => {
+            this.autoSaveTimer = null;
+            this.saveDirtyPages(true);
+        }, AUTOSAVE_MS);
+    }
+
+    /** Còn trang chờ ghi ảnh thì luôn phải có một hẹn giờ tự động lưu đang chạy. */
+    ensureAutoSaveArmed() {
+        if (this.dirtyPages.size > 0 && !this.autoSaveTimer) this.scheduleAutoSave();
+    }
+
+    /** Lưu nhanh tình trạng chỉnh sửa (không kết xuất lại ảnh). */
+    async saveMetadata(folderId) {
+        const folder = this.getFolder(folderId);
+        if (!folder || !this.rootPath) return;
+        const pages = (folder.imageIds || [])
+            .map(id => this.pages.get(id))
+            .filter(Boolean)
+            .map(p => ({
+                filename: p.filename,
+                doc_name: p.docName,
+                corners: p.corners,
+                rotation: p.rotation,
+                settings: p.settings,
+                history: p.history,
+            }));
+        if (!pages.length) return;
+
+        try {
+            await apiJson('/api/save-metadata', {
+                relative_path: folder.relativePath,
+                pages,
+                order: (folder.imageIds || []).map(id => this.pages.get(id)?.filename).filter(Boolean),
+            });
+        } catch (_) { /* sẽ được lưu lại ở lần lưu đầy đủ kế tiếp */ }
+    }
+
+    /** Kết xuất & ghi đè ảnh đã sửa của các trang đang có thay đổi. */
+    async saveDirtyPages(quiet = false) {
+        if (!this.rootPath || this.dirtyPages.size === 0) return 0;
+        const ids = [...this.dirtyPages];
+        const byFolder = new Map();
+
+        ids.forEach(id => {
+            const page = this.pages.get(id);
+            if (!page) return;
+            if (!byFolder.has(page.relativePath)) byFolder.set(page.relativePath, []);
+            byFolder.get(page.relativePath).push(page);
+        });
+
+        let saved = 0;
+        const failures = [];
+        for (const [rel, pages] of byFolder) {
+            const folder = this.folders.find(f => (f.relativePath || '') === rel);
+            try {
+                const data = await apiJson('/api/save-folder', {
+                    relative_path: rel,
+                    pages: pages.map(p => this.pageStatePayload(p)),
+                    // Lưu = ghi ảnh + metadata. Không ghép PDF ở đây: việc đó phải đọc lại
+                    // toàn bộ ảnh của thư mục, làm mỗi lần lưu chậm dần theo số trang.
+                    save_pdf: false,
+                });
+                // Chỉ trang nào máy chủ khẳng định đã ghi được mới coi là đã lưu. Trang ghi
+                // thất bại phải GIỮ cờ "chưa lưu", nếu không người dùng thấy "Đã lưu" trong
+                // khi công sức chỉnh sửa đã mất (ổ đầy, tệp bị khoá, hết quyền ghi...).
+                saved += this.markPagesSaved(pages, data.saved_filenames);
+                (data.failed_pages || []).forEach(f => failures.push(f));
+            } catch (err) {
+                failures.push({ filename: '', reason: err.message });
+            }
+        }
+
+        this.updateSaveState();
+        this.updateFolderActionButtons();
+        this.renderPageList();
+
+        if (failures.length) {
+            const reason = failures[0].reason || 'Không ghi được tệp xuống ổ đĩa.';
+            this.toastErr(`Chưa lưu được ${failures.length} trang. ${reason}`);
+            this.setStatus(`Còn ${this.dirtyPages.size} trang chưa lưu được — ${reason}`, 'warn');
+        } else if (quiet && saved > 0) {
+            this.setStatus(`Đã lưu ${saved} trang vào máy lúc ${new Date().toLocaleTimeString('vi-VN')}.`, 'ok');
+        }
+        return saved;
+    }
+
+    /**
+     * Đánh dấu đã lưu cho đúng những trang máy chủ báo thành công.
+     * savedFilenames vắng mặt thì coi như tất cả thành công (tương thích ngược).
+     */
+    markPagesSaved(pages, savedFilenames) {
+        const ok = Array.isArray(savedFilenames) ? new Set(savedFilenames) : null;
+        let count = 0;
+        pages.forEach(p => {
+            if (ok && !ok.has(p.filename)) return;
+            p.version = Math.floor(Date.now() / 1000);
+            p.isStale = false;
+            p._savedSnapshot = {
+                corners: JSON.parse(JSON.stringify(p.corners || [])),
+                rotation: p.rotation || 0,
+                settings: JSON.parse(JSON.stringify(p.settings || {})),
+                docName: p.docName || '',
+            };
+            this.dirtyPages.delete(p.id);
+            count++;
+        });
+        return count;
+    }
+
+    pageStatePayload(page) {
+        return {
+            filename: page.filename,
+            doc_name: page.docName,
+            corners: page.corners,
+            rotation: page.rotation,
+            settings: page.settings,
+            history: page.history,
+        };
+    }
+
+    /**
+     * Nút "Lưu thay đổi": lưu mọi nhánh thư mục ĐANG CÓ thay đổi chưa ghi.
+     * Cố tình không kết xuất lại những trang đã khớp đĩa — với dự án hàng trăm trang,
+     * dựng lại tất cả sẽ treo máy hàng phút mà không thay đổi gì.
+     */
+    async saveProject() {
+        if (!this.rootPath) { this.toastErr('Hãy chọn thư mục tài liệu trên máy trước.'); return; }
+        if (this.dirtyPages.size === 0) {
+            this.toastOk('Mọi thay đổi đã được lưu vào máy.');
+            return;
+        }
+
+        const dirty = [...this.dirtyPages].map(id => this.pages.get(id)).filter(Boolean);
+        const folders = this.folders
+            .map(f => ({ folder: f, pages: dirty.filter(p => p.folderId === f.id) }))
+            .filter(x => x.pages.length > 0)
+            .map(x => ({
+                relative_path: x.folder.relativePath,
+                pages: x.pages.map(p => this.pageStatePayload(p)),
+                save_pdf: false,
+            }));
+
+        if (folders.length === 0) {
+            this.toastOk('Mọi thay đổi đã được lưu vào máy.');
+            return;
+        }
+
+        this.showLoading(`Đang lưu ${dirty.length} trang vào máy tính…`);
+        try {
+            const data = await apiJson('/api/save-project', { folders });
+            const saved = this.markPagesSaved(dirty, data.saved_filenames);
+            this.updateSaveState();
+            this.updateFolderActionButtons();
+            this.renderPageList();
+
+            const failed = data.failed_pages || [];
+            if (failed.length) {
+                const reason = failed[0].reason || 'Không ghi được tệp xuống ổ đĩa.';
+                this.toastErr(`Đã lưu ${saved} trang, còn ${failed.length} trang chưa lưu được. ${reason}`);
+            } else {
+                this.toastOk(
+                    `Đã lưu ${data.pages_saved} trang trong ${data.folders_saved} thư mục vào: ` +
+                    `${data.root_path}`
+                );
+            }
+        } catch (err) {
+            this.toastErr(err.message);
+        } finally {
+            this.hideLoading();
         }
     }
+
+    /** Gửi tình trạng chỉnh sửa lúc đóng tab — chạy được cả khi trang đang bị hủy. */
+    beaconMetadata() {
+        const folder = this.getActiveFolder();
+        if (!folder || !this.rootPath || !navigator.sendBeacon) return;
+        const pages = (folder.imageIds || [])
+            .map(id => this.pages.get(id)).filter(Boolean)
+            .map(p => this.pageStatePayload(p));
+        if (!pages.length) return;
+        const body = JSON.stringify({
+            relative_path: folder.relativePath,
+            pages,
+            order: (folder.imageIds || []).map(id => this.pages.get(id)?.filename).filter(Boolean),
+        });
+        navigator.sendBeacon('/api/save-metadata', new Blob([body], { type: 'application/json' }));
+    }
+
+    // ======================================================
+    // 🧭 CÔNG CỤ CHỈNH ẢNH
+    // ======================================================
+
+    /** Đảm bảo đang ở chế độ Chỉnh sửa để người dùng thấy ngay khung 4 góc vừa thay đổi. */
+    ensureCornerView() {
+        if (this.viewMode !== VIEW.EDIT) this.setViewMode(VIEW.EDIT);
+        this.showHandles = true;
+    }
+
+    async autoDetectCorners() {
+        const page = this.getActivePage();
+        if (!page) return;
+        this.ensureCornerView();
+        this.pushHistory('Tự động nhận diện 4 góc');
+        try {
+            const data = await apiJson('/api/auto-detect', {
+                relative_path: page.relativePath,
+                filename: page.filename,
+                margin_percent: 0.0,
+            });
+            page.corners = data.corners;
+            this.drawCanvas();
+            this.requestPreview();
+            this.toastOk(data.detected
+                ? 'Đã nhận diện chính xác mép giấy.'
+                : 'Không thấy mép giấy rõ ràng — đã căn toàn bộ trang.');
+        } catch (err) {
+            this.toastErr(err.message);
+        }
+    }
+
+    expandMargin(margin = 0.02) {
+        const page = this.getActivePage();
+        if (!page || !page.corners) return;
+        this.ensureCornerView();
+        this.pushHistory('Mở rộng lề 2%');
+
+        const pts = page.corners;
+        const cx = pts.reduce((s, p) => s + p[0], 0) / 4;
+        const cy = pts.reduce((s, p) => s + p[1], 0) / 4;
+        const factor = 1 + margin * 2;
+        page.corners = pts.map(([x, y]) => [cx + (x - cx) * factor, cy + (y - cy) * factor]);
+
+        this.drawCanvas();
+        this.requestPreview();
+        this.toastOk('Đã mở rộng lề 2%.');
+    }
+
+    shrinkMargin(margin = 0.02) {
+        const page = this.getActivePage();
+        if (!page || !page.corners) return;
+        this.ensureCornerView();
+        this.pushHistory('Thu hẹp lề 2%');
+
+        const pts = page.corners;
+        const cx = pts.reduce((s, p) => s + p[0], 0) / 4;
+        const cy = pts.reduce((s, p) => s + p[1], 0) / 4;
+        const factor = 1 - margin * 2;
+        page.corners = pts.map(([x, y]) => [cx + (x - cx) * factor, cy + (y - cy) * factor]);
+
+        this.drawCanvas();
+        this.requestPreview();
+        this.toastOk('Đã thu hẹp lề 2%.');
+    }
+
+    setCornersToFullFrame() {
+        const page = this.getActivePage();
+        if (!page) return;
+        this.ensureCornerView();
+        this.pushHistory('Bao trọn toàn ảnh');
+        page.corners = this.fullFrameCorners(page.width, page.height);
+        this.drawCanvas();
+        this.requestPreview();
+        this.toastOk('Đã đặt 4 góc bao trọn toàn bộ ảnh.');
+    }
+
+    async resetToOriginal() {
+        const page = this.getActivePage();
+        if (!page) return;
+        const ok = await this.askConfirm(
+            'Khôi phục về ảnh chụp gốc',
+            'Mọi góc cắt, góc xoay và bộ lọc đang áp dụng sẽ được đặt lại về ảnh chụp gốc ban đầu.',
+            false,
+            'Khôi phục',
+            'Giữ nguyên'
+        );
+        if (!ok) return;
+
+        this.pushHistory('Khôi phục về ảnh gốc');
+        page.rotation = 0;
+        page.settings = { ...DEFAULT_SETTINGS };
+        page.corners = this.fullFrameCorners(page.width, page.height);
+        this.syncInspector(page.settings);
+        this.clearBaseline();
+        this.drawCanvas();
+        this.requestPreview();
+        this.toastOk('Đã khôi phục trang về ảnh chụp gốc ban đầu.');
+    }
+
+    rotate(deg) {
+        const page = this.getActivePage();
+        if (!page) return;
+        this.pushHistory(deg < 0 ? 'Xoay trái 90°' : 'Xoay phải 90°');
+        page.rotation = (page.rotation + deg + 360) % 360;
+        this.clearBaseline();
+        this.drawCanvas();
+        this.requestPreview();
+    }
+
+    async applyAsOriginal() {
+        const page = this.getActivePage();
+        if (!page) return;
+        const ok = await this.askConfirm(
+            'Lưu ảnh sửa thành ảnh gốc',
+            'Ảnh gốc cũ trong thư mục _goc/ sẽ được thay thế bằng bản ảnh nét hiện tại và lịch sử hoàn tác được làm mới. Bạn vẫn tiếp tục chỉnh sửa được trên nền ảnh mới.',
+            false,
+            'Lưu thành ảnh gốc',
+            'Hủy'
+        );
+        if (!ok) return;
+
+        this.showLoading('Đang lưu ảnh sửa thành ảnh gốc…');
+        try {
+            await this.saveDirtyPages(true);
+            const raw = await apiJson('/api/apply-as-original', {
+                relative_path: page.relativePath,
+                filename: page.filename,
+            });
+            const updated = this.toPage(raw);
+            updated.nameSuggestions = page.nameSuggestions;
+            updated.aiDismissed = page.aiDismissed;
+            updated.orphanHandled = true;
+            this.pages.set(updated.id, updated);
+            this.dirtyPages.delete(updated.id);
+
+            this.activeImageId = null;
+            await this.selectPage(updated.id);
+            this.updateSaveState();
+            this.toastOk('Đã lưu ảnh sửa thành ảnh gốc.');
+        } catch (err) {
+            this.toastErr(err.message);
+        } finally {
+            this.hideLoading();
+        }
+    }
+
+    // ======================================================
+    // ⏪ HOÀN TÁC / LÀM LẠI
+    // ======================================================
+
+    snapshot(page) {
+        return {
+            corners: JSON.parse(JSON.stringify(page.corners)),
+            rotation: page.rotation,
+            settings: { ...page.settings },
+        };
+    }
+
+    pushHistory(description = '') {
+        const page = this.getActivePage();
+        if (!page) return;
+        page.history.undo.push({ ...this.snapshot(page), description });
+        if (page.history.undo.length > MAX_HISTORY) page.history.undo.shift();
+        page.history.redo = [];
+        this.updateHistoryButtons();
+        this.scheduleMetaSave();
+    }
+
+    applySnapshot(page, snap) {
+        page.corners = JSON.parse(JSON.stringify(snap.corners));
+        page.rotation = snap.rotation;
+        page.settings = { ...DEFAULT_SETTINGS, ...snap.settings };
+        this.syncInspector(page.settings);
+        this.drawCanvas();
+        this.requestPreview();
+        this.updateHistoryButtons();
+    }
+
+    undo() {
+        const page = this.getActivePage();
+        if (!page || page.history.undo.length === 0) return;
+        page.history.redo.push(this.snapshot(page));
+        const prev = page.history.undo.pop();
+        this.applySnapshot(page, prev);
+        this.setStatus(`Đã hoàn tác: ${prev.description || 'thao tác trước'}`, 'info');
+    }
+
+    redo() {
+        const page = this.getActivePage();
+        if (!page || page.history.redo.length === 0) return;
+        page.history.undo.push(this.snapshot(page));
+        const next = page.history.redo.pop();
+        this.applySnapshot(page, next);
+        this.setStatus('Đã làm lại thao tác.', 'info');
+    }
+
+    updateHistoryButtons() {
+        const page = this.getActivePage();
+        const hasPage = !!page;
+        const undoLen = (page && page.history && Array.isArray(page.history.undo)) ? page.history.undo.length : 0;
+        const redoLen = (page && page.history && Array.isArray(page.history.redo)) ? page.history.redo.length : 0;
+
+        if (this.btnUndo) this.btnUndo.disabled = !hasPage || undoLen === 0;
+        if (this.btnRedo) this.btnRedo.disabled = !hasPage || redoLen === 0;
+    }
+
+    // ======================================================
+    // 🎨 KHUNG XEM CANVAS
+    // ======================================================
 
     setViewMode(mode) {
-        this.currentViewMode = mode;
-        if (this.btnShowEdited) this.btnShowEdited.classList.toggle('active', mode === 'edited');
-        if (this.btnShowOriginal) this.btnShowOriginal.classList.toggle('active', mode === 'original');
-        
-        const page = this.getActivePage();
-        if (mode === 'edited' && page && !page.processedImageObj) {
-            this.processActivePage();
-        } else {
-            this.renderCropCanvas();
-        }
+        this.viewMode = mode;
+        if (mode === VIEW.COMPARE) this.ensureBaseline();
+        this.btnModeEdit?.classList.toggle('active', mode === VIEW.EDIT);
+        this.btnModeCompare?.classList.toggle('active', mode === VIEW.COMPARE);
+        this.showHandles = (mode === VIEW.EDIT);
+        this.layoutCanvas();
     }
 
-    // ==========================================
-    // 🎨 UNIFIED CANVAS VIEWER (APPLE-STYLE)
-    // ==========================================
+    setHoldingCompare(on) {
+        if (this.holdingCompare === on) return;
+        this.holdingCompare = on;
+        this.layoutCanvas();
+    }
 
-    renderCropCanvas() {
+    isShowingOriginal() {
+        return this.holdingCompare || this.viewMode === VIEW.EDIT || !this.editedImg;
+    }
+
+    layoutCanvas() {
         const page = this.getActivePage();
-        if (!page || !this.currentImageObj) return;
+        if (!page || !this.originalImg) return;
 
-        const viewport = this.canvasViewport;
-        const rect = viewport ? viewport.getBoundingClientRect() : null;
-        const vW = (rect && rect.width > 50) ? rect.width : (viewport && viewport.clientWidth > 50 ? viewport.clientWidth : window.innerWidth - 650);
-        const vH = (rect && rect.height > 50) ? rect.height : (viewport && viewport.clientHeight > 50 ? viewport.clientHeight : window.innerHeight - 200);
-        const availWidth = Math.max(200, vW - 40);
-        const availHeight = Math.max(200, vH - 40);
+        const rect = this.canvasViewport.getBoundingClientRect();
+        const availWidth = Math.max(200, (rect.width || 800) - 40);
+        const availHeight = Math.max(200, (rect.height || 600) - 40);
 
-        const isViewingOriginal = this.isHoldingCompare || this.currentViewMode === 'original';
-        const displayImg = (!isViewingOriginal && page.processedImageObj) ? page.processedImageObj : this.currentImageObj;
+        const showingOriginal = this.isShowingOriginal();
+        const displayImg = showingOriginal ? this.originalImg : this.editedImg;
+        // Khi căn 4 góc cần chừa lề để kéo góc ra ngoài mép ảnh.
+        const padRatio = showingOriginal ? this.canvasPaddingRatio : 0.04;
 
-        const padRatio = isViewingOriginal ? this.canvasPaddingRatio : 0.04;
-
-        const paddedAspect = (displayImg.width && displayImg.height) ? (displayImg.width / displayImg.height) : 1.414;
+        const rot = (showingOriginal && page.rotation) ? (page.rotation % 360) : 0;
+        const isSwapped = (rot === 90 || rot === 270);
+        let origW = (displayImg.naturalWidth || displayImg.width || 1000);
+        let origH = (displayImg.naturalHeight || displayImg.height || 1000);
+        if (showingOriginal && isSwapped) {
+            const tmp = origW; origW = origH; origH = tmp;
+        }
+        const aspect = origW / origH;
         const screenAspect = availWidth / availHeight;
 
-        let imgRenderW, imgRenderH;
-        if (paddedAspect > screenAspect) {
-            imgRenderW = availWidth / (1 + padRatio * 2);
-            imgRenderH = imgRenderW / paddedAspect;
+        let renderW, renderH;
+        if (aspect > screenAspect) {
+            renderW = availWidth / (1 + padRatio * 2);
+            renderH = renderW / aspect;
         } else {
-            imgRenderH = availHeight / (1 + padRatio * 2);
-            imgRenderW = imgRenderH * paddedAspect;
+            renderH = availHeight / (1 + padRatio * 2);
+            renderW = renderH * aspect;
         }
 
-        this.imgOffsetX = imgRenderW * padRatio;
-        this.imgOffsetY = imgRenderH * padRatio;
-        this.imgRenderW = imgRenderW;
-        this.imgRenderH = imgRenderH;
+        this.imgOffsetX = renderW * padRatio;
+        this.imgOffsetY = renderH * padRatio;
+        this.imgRenderW = renderW;
+        this.imgRenderH = renderH;
 
-        this.canvas.width = imgRenderW + this.imgOffsetX * 2;
-        this.canvas.height = imgRenderH + this.imgOffsetY * 2;
+        // Đệm vẽ độ phân giải cao để phóng to vẫn sắc nét.
+        const nativeW = displayImg.naturalWidth || displayImg.width || 2000;
+        this.dpr = Math.min(3.0, Math.max(1.5, nativeW / renderW));
 
-        this.scaleX = imgRenderW / page.width;
-        this.scaleY = imgRenderH / page.height;
+        const cssW = Math.round(renderW + this.imgOffsetX * 2);
+        const cssH = Math.round(renderH + this.imgOffsetY * 2);
+        this.canvas.width = Math.round(cssW * this.dpr);
+        this.canvas.height = Math.round(cssH * this.dpr);
+        this.canvas.style.width = `${cssW}px`;
+        this.canvas.style.height = `${cssH}px`;
 
-        this.drawCanvasContent();
+        this.scaleX = renderW / page.width;
+        this.scaleY = renderH / page.height;
+
+        this.drawCanvas();
     }
 
-    drawCanvasContent() {
+    drawCanvas() {
         const page = this.getActivePage();
-        if (!page || !this.currentImageObj) return;
+        if (!page || !this.originalImg) return;
 
         const ctx = this.ctx;
-        const w = this.canvas.width;
-        const h = this.canvas.height;
+        const dpr = this.dpr || 1;
+        const totalW = this.canvas.width / dpr;
+        const totalH = this.canvas.height / dpr;
 
-        ctx.clearRect(0, 0, w, h);
+        ctx.save();
+        ctx.scale(dpr, dpr);
+        ctx.imageSmoothingEnabled = true;
+        ctx.imageSmoothingQuality = 'high';
+        ctx.clearRect(0, 0, totalW, totalH);
         ctx.fillStyle = '#090d16';
-        ctx.fillRect(0, 0, w, h);
+        ctx.fillRect(0, 0, totalW, totalH);
 
-        const isViewingOriginal = this.isHoldingCompare || this.currentViewMode === 'original';
+        const showingOriginal = this.isShowingOriginal();
+        const comparing = !showingOriginal && this.viewMode === VIEW.COMPARE && this.editedImg;
 
-        if (isViewingOriginal || !page.processedImageObj) {
-            // Draw original photo
-            ctx.drawImage(this.currentImageObj, this.imgOffsetX, this.imgOffsetY, this.imgRenderW, this.imgRenderH);
-
-            if (this.resultInfoText) {
-                this.resultInfoText.textContent = this.isHoldingCompare ? 
-                    "Đang giữ xem: Ảnh gốc ban đầu" : "Chế độ xem: Ảnh gốc ban đầu (Chỉnh 4 góc)";
-            }
-            if (this.statusIcon) {
-                this.statusIcon.className = "fa-regular fa-image text-warning";
-            }
-
-            // Draw crop quad & corner handles if in original mode and handles active
-            if ((this.currentViewMode === 'original' || this.isHoldingCompare) && this.showCropHandles) {
-                const corners = page.corners || [
-                    [0, 0],
-                    [page.width - 1, 0],
-                    [page.width - 1, page.height - 1],
-                    [0, page.height - 1]
-                ];
-
-                const screenPts = corners.map(pt => [
-                    this.imgOffsetX + pt[0] * this.scaleX,
-                    this.imgOffsetY + pt[1] * this.scaleY
-                ]);
-
-                ctx.fillStyle = 'rgba(0, 0, 0, 0.55)';
-                ctx.beginPath();
-                ctx.rect(0, 0, w, h);
-                ctx.moveTo(screenPts[0][0], screenPts[0][1]);
-                for (let i = screenPts.length - 1; i >= 0; i--) {
-                    ctx.lineTo(screenPts[i][0], screenPts[i][1]);
+        if (showingOriginal) {
+            const rot = (page.rotation || 0) % 360;
+            ctx.save();
+            if (rot) {
+                const cx = this.imgOffsetX + this.imgRenderW / 2;
+                const cy = this.imgOffsetY + this.imgRenderH / 2;
+                ctx.translate(cx, cy);
+                ctx.rotate((rot * Math.PI) / 180);
+                if (rot === 90 || rot === 270) {
+                    ctx.drawImage(this.originalImg, -this.imgRenderH / 2, -this.imgRenderW / 2, this.imgRenderH, this.imgRenderW);
+                } else {
+                    ctx.drawImage(this.originalImg, -this.imgRenderW / 2, -this.imgRenderH / 2, this.imgRenderW, this.imgRenderH);
                 }
-                ctx.closePath();
-                ctx.fill();
-
-                ctx.strokeStyle = '#38bdf8';
-                ctx.lineWidth = 2.5;
-                ctx.setLineDash([]);
-                ctx.beginPath();
-                ctx.moveTo(screenPts[0][0], screenPts[0][1]);
-                for (let i = 1; i < screenPts.length; i++) {
-                    ctx.lineTo(screenPts[i][0], screenPts[i][1]);
-                }
-                ctx.closePath();
-                ctx.stroke();
-
-                this.drawGrid(ctx, screenPts);
-
-                screenPts.forEach((pt, idx) => {
-                    const isDragging = idx === this.draggingCornerIndex;
-
-                    ctx.beginPath();
-                    ctx.arc(pt[0], pt[1], this.handleRadius + (isDragging ? 4 : 0), 0, Math.PI * 2);
-                    ctx.fillStyle = isDragging ? '#38bdf8' : '#ffffff';
-                    ctx.fill();
-                    ctx.strokeStyle = '#0284c7';
-                    ctx.lineWidth = 3;
-                    ctx.stroke();
-
-                    ctx.beginPath();
-                    ctx.arc(pt[0], pt[1], 4, 0, Math.PI * 2);
-                    ctx.fillStyle = '#0284c7';
-                    ctx.fill();
-                });
+                if (this.showHandles) this.drawCropOverlay(ctx, page, true);
+            } else {
+                ctx.drawImage(this.originalImg, this.imgOffsetX, this.imgOffsetY, this.imgRenderW, this.imgRenderH);
+                if (this.showHandles) this.drawCropOverlay(ctx, page, false);
             }
+            ctx.restore();
+            this.setStatus(this.holdingCompare
+                ? 'Đang giữ để xem ảnh gốc — thả ra để về bản so sánh.'
+                : 'Chế độ Chỉnh sửa — kéo 4 chấm tròn để căn đúng mép giấy.', 'warn');
+        } else if (comparing) {
+            const sliderX = this.imgOffsetX + this.imgRenderW * this.sliderPos;
+
+            this.drawContain(ctx, this.editedImg, this.imgOffsetX, this.imgOffsetY, this.imgRenderW, this.imgRenderH);
+            ctx.save();
+            ctx.beginPath();
+            ctx.rect(0, 0, sliderX, totalH);
+            ctx.clip();
+            this.drawContain(ctx, this.baselineImg || this.originalImg,
+                this.imgOffsetX, this.imgOffsetY, this.imgRenderW, this.imgRenderH);
+            ctx.restore();
+
+            ctx.save();
+            ctx.shadowColor = 'rgba(0,0,0,0.7)';
+            ctx.shadowBlur = 8;
+            ctx.strokeStyle = '#38bdf8';
+            ctx.lineWidth = 2.5;
+            ctx.beginPath();
+            ctx.moveTo(sliderX, this.imgOffsetY);
+            ctx.lineTo(sliderX, this.imgOffsetY + this.imgRenderH);
+            ctx.stroke();
+
+            const handleY = this.imgOffsetY + this.imgRenderH / 2;
+            ctx.beginPath();
+            ctx.arc(sliderX, handleY, 18, 0, Math.PI * 2);
+            ctx.fillStyle = '#38bdf8';
+            ctx.fill();
+            ctx.strokeStyle = '#ffffff';
+            ctx.lineWidth = 2.5;
+            ctx.stroke();
+            ctx.fillStyle = '#0b1120';
+            ctx.font = 'bold 11px sans-serif';
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            ctx.fillText('◀ ▶', sliderX, handleY);
+            ctx.restore();
+
+            this.drawComparePills(ctx, sliderX, this.imgOffsetY + 16);
+            this.setStatus('Chế độ So sánh — kéo thanh trượt để xem chi tiết Trước và Sau.', 'ok');
         } else {
-            // Draw processed enhanced image
-            ctx.drawImage(page.processedImageObj, this.imgOffsetX, this.imgOffsetY, this.imgRenderW, this.imgRenderH);
-
-            if (this.resultInfoText) {
-                this.resultInfoText.textContent = "Chế độ xem: Đã làm rõ nét chữ & cân bằng ánh sáng";
-            }
-            if (this.statusIcon) {
-                this.statusIcon.className = "fa-solid fa-circle-check text-success";
-            }
+            ctx.drawImage(this.editedImg, this.imgOffsetX, this.imgOffsetY, this.imgRenderW, this.imgRenderH);
+            this.setStatus('Bản đã chỉnh sửa — chữ đã được làm nét và cân bằng ánh sáng.', 'ok');
         }
+
+        ctx.restore();
     }
 
-    drawGrid(ctx, pts) {
-        ctx.strokeStyle = 'rgba(56, 189, 248, 0.35)';
+    drawCropOverlay(ctx, page, isRotatedContext = false) {
+        const corners = page.corners || this.fullFrameCorners(page.width, page.height);
+        const rot = (page.rotation || 0) % 360;
+        const isSwapped = (rot === 90 || rot === 270);
+        const drawW = isSwapped ? this.imgRenderH : this.imgRenderW;
+        const drawH = isSwapped ? this.imgRenderW : this.imgRenderH;
+        const originX = isRotatedContext ? -drawW / 2 : this.imgOffsetX;
+        const originY = isRotatedContext ? -drawH / 2 : this.imgOffsetY;
+        const scaleX = drawW / page.width;
+        const scaleY = drawH / page.height;
+
+        const pts = corners.map(([x, y]) => [
+            originX + x * scaleX,
+            originY + y * scaleY,
+        ]);
+
+        ctx.save();
+        ctx.beginPath();
+        ctx.moveTo(pts[0][0], pts[0][1]);
+        for (let i = 1; i < 4; i++) ctx.lineTo(pts[i][0], pts[i][1]);
+        ctx.closePath();
+
+        ctx.fillStyle = 'rgba(56, 189, 248, 0.10)';
+        ctx.fill();
+        ctx.strokeStyle = '#38bdf8';
+        ctx.lineWidth = 2;
+        ctx.stroke();
+
+        // Lưới 1/3 giúp căn tài liệu cân đối
+        ctx.strokeStyle = 'rgba(56, 189, 248, 0.28)';
         ctx.lineWidth = 1;
-        ctx.setLineDash([4, 4]);
-
-        for (let t = 0.333; t < 1.0; t += 0.333) {
-            const top = this.lerpPoint(pts[0], pts[1], t);
-            const bottom = this.lerpPoint(pts[3], pts[2], t);
-            ctx.beginPath();
-            ctx.moveTo(top[0], top[1]);
-            ctx.lineTo(bottom[0], bottom[1]);
-            ctx.stroke();
-
-            const left = this.lerpPoint(pts[0], pts[3], t);
-            const right = this.lerpPoint(pts[1], pts[2], t);
-            ctx.beginPath();
-            ctx.moveTo(left[0], left[1]);
-            ctx.lineTo(right[0], right[1]);
-            ctx.stroke();
+        for (let i = 1; i <= 2; i++) {
+            const t = i / 3;
+            const top = this.lerp(pts[0], pts[1], t);
+            const bottom = this.lerp(pts[3], pts[2], t);
+            const left = this.lerp(pts[0], pts[3], t);
+            const right = this.lerp(pts[1], pts[2], t);
+            ctx.beginPath(); ctx.moveTo(top[0], top[1]); ctx.lineTo(bottom[0], bottom[1]); ctx.stroke();
+            ctx.beginPath(); ctx.moveTo(left[0], left[1]); ctx.lineTo(right[0], right[1]); ctx.stroke();
         }
-        ctx.setLineDash([]);
+
+        pts.forEach(([x, y], i) => {
+            const active = i === this.draggingCornerIndex;
+            ctx.beginPath();
+            ctx.arc(x, y, active ? this.handleRadius + 3 : this.handleRadius, 0, Math.PI * 2);
+            ctx.fillStyle = active ? '#0ea5e9' : '#38bdf8';
+            ctx.fill();
+            ctx.strokeStyle = '#ffffff';
+            ctx.lineWidth = 3;
+            ctx.stroke();
+        });
+        ctx.restore();
     }
 
-    lerpPoint(p1, p2, t) {
-        return [p1[0] + (p2[0] - p1[0]) * t, p1[1] + (p2[1] - p1[1]) * t];
+    drawComparePills(ctx, sliderX, y) {
+        const pill = (text, cx, bg) => {
+            ctx.font = '600 12px "Plus Jakarta Sans", sans-serif';
+            const w = ctx.measureText(text).width + 20;
+            const x = Math.max(this.imgOffsetX + 6, Math.min(cx - w / 2, this.imgOffsetX + this.imgRenderW - w - 6));
+            ctx.fillStyle = bg;
+            this.roundRect(ctx, x, y, w, 24, 12);
+            ctx.fill();
+            ctx.fillStyle = '#ffffff';
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            ctx.fillText(text, x + w / 2, y + 12);
+        };
+        pill('Trước khi làm nét', this.imgOffsetX + (sliderX - this.imgOffsetX) / 2, 'rgba(245, 158, 11, 0.92)');
+        pill('Sau khi làm nét', sliderX + (this.imgOffsetX + this.imgRenderW - sliderX) / 2, 'rgba(16, 185, 129, 0.92)');
     }
 
-    // ==========================================
-    // 🔍 VIEWPORT ZOOM, PAN & CORNER DRAG
-    // ==========================================
+    roundRect(ctx, x, y, w, h, r) {
+        ctx.beginPath();
+        ctx.moveTo(x + r, y);
+        ctx.arcTo(x + w, y, x + w, y + h, r);
+        ctx.arcTo(x + w, y + h, x, y + h, r);
+        ctx.arcTo(x, y + h, x, y, r);
+        ctx.arcTo(x, y, x + w, y, r);
+        ctx.closePath();
+    }
 
-    setZoom(newZoom) {
-        this.zoom = Math.max(0.25, Math.min(5.0, newZoom));
+    lerp(a, b, t) { return [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t]; }
+
+    /**
+     * Vẽ ảnh vừa khung mà GIỮ NGUYÊN tỉ lệ gốc.
+     * Ảnh gốc và bản đã cắt có tỉ lệ khác nhau, nếu kéo giãn cho bằng khung
+     * thì thanh so sánh sẽ cho cảm giác sai lệch về hình dáng tài liệu.
+     */
+    drawContain(ctx, img, x, y, w, h) {
+        const aspect = (img.width && img.height) ? img.width / img.height : 1;
+        let dw = w;
+        let dh = w / aspect;
+        if (dh > h) { dh = h; dw = h * aspect; }
+        ctx.drawImage(img, x + (w - dw) / 2, y + (h - dh) / 2, dw, dh);
+    }
+
+    // ======================================================
+    // 🖱️ TƯƠNG TÁC CHUỘT / CẢM ỨNG
+    // ======================================================
+
+    setZoom(value) {
+        this.zoom = Math.max(0.25, Math.min(5.0, value));
         this.lblZoomLevel.textContent = `${Math.round(this.zoom * 100)}%`;
-        this.applyZoomTransform();
+        this.applyTransform();
     }
 
-    resetZoomFit() {
+    zoomAt(factor, clientX, clientY) {
+        const oldZoom = this.zoom;
+        const newZoom = Math.max(0.25, Math.min(5.0, oldZoom * factor));
+        if (newZoom === oldZoom) return;
+
+        if (clientX !== undefined && clientY !== undefined && this.canvasViewport) {
+            const rect = this.canvasViewport.getBoundingClientRect();
+            const mouseX = clientX - rect.left - rect.width / 2;
+            const mouseY = clientY - rect.top - rect.height / 2;
+
+            this.panX = mouseX - (mouseX - this.panX) * (newZoom / oldZoom);
+            this.panY = mouseY - (mouseY - this.panY) * (newZoom / oldZoom);
+        }
+
+        this.zoom = newZoom;
+        this.lblZoomLevel.textContent = `${Math.round(this.zoom * 100)}%`;
+        this.applyTransform();
+    }
+
+    zoomFit() {
         this.zoom = 1.0;
         this.panX = 0;
         this.panY = 0;
-        this.lblZoomLevel.textContent = "100%";
-        this.applyZoomTransform();
+        this.lblZoomLevel.textContent = 'Vừa khung';
+        this.applyTransform();
     }
 
-    applyZoomTransform() {
-        const transformStr = `translate(${this.panX}px, ${this.panY}px) scale(${this.zoom})`;
+    zoom100() {
+        const page = this.getActivePage();
+        const displayImg = this.isShowingOriginal() ? this.originalImg : this.editedImg;
+        const nativeW = (displayImg && displayImg.naturalWidth) ? displayImg.naturalWidth : (page ? page.width : 2000);
+        const ratio = (nativeW && this.imgRenderW) ? (nativeW / this.imgRenderW) : 2.5;
+
+        this.zoom = Math.max(0.25, Math.min(5.0, ratio));
+        this.panX = 0;
+        this.panY = 0;
+        this.lblZoomLevel.textContent = `${Math.round(this.zoom * 100)}% (1:1)`;
+        this.applyTransform();
+    }
+
+    resetZoom() {
+        this.zoomFit();
+    }
+
+    applyTransform() {
         if (this.canvasTransformBox) {
-            this.canvasTransformBox.style.transform = transformStr;
-        }
-        if (this.resultZoomBox) {
-            this.resultZoomBox.style.transform = transformStr;
+            this.canvasTransformBox.style.transform =
+                `translate(${this.panX}px, ${this.panY}px) scale(${this.zoom})`;
         }
     }
 
-    handleWheelZoom(e) {
-        e.preventDefault();
-        const delta = e.deltaY < 0 ? 1.15 : 0.85;
-        this.setZoom(this.zoom * delta);
-    }
-
-    getCanvasCoords(e) {
+    /** Toạ độ trên bộ đệm canvas (hệ MÀN HÌNH, chưa nghịch-xoay). */
+    screenCoords(e) {
         const rect = this.canvas.getBoundingClientRect();
         return {
             x: (e.clientX - rect.left) / this.zoom,
-            y: (e.clientY - rect.top) / this.zoom
+            y: (e.clientY - rect.top) / this.zoom,
         };
     }
 
-    onViewportMouseDown(e) {
-        const pos = this.getCanvasCoords(e);
+    canvasCoords(e) {
+        const rect = this.canvas.getBoundingClientRect();
+        let x = (e.clientX - rect.left) / this.zoom;
+        let y = (e.clientY - rect.top) / this.zoom;
+
+        const page = this.getActivePage();
+        const rot = (page && page.rotation) ? (page.rotation % 360) : 0;
+        if (rot && this.isShowingOriginal()) {
+            const cx = this.imgOffsetX + this.imgRenderW / 2;
+            const cy = this.imgOffsetY + this.imgRenderH / 2;
+            const rad = (-rot * Math.PI) / 180;
+            const cos = Math.cos(rad);
+            const sin = Math.sin(rad);
+            const dx = x - cx;
+            const dy = y - cy;
+            x = cx + dx * cos - dy * sin;
+            y = cy + dx * sin + dy * cos;
+        }
+        return { x, y };
+    }
+
+    onPointerDown(e) {
         const page = this.getActivePage();
         if (!page) return;
+        const pos = this.canvasCoords(e);
+        // Kính lúp lấy mẫu từ bộ đệm canvas (hệ toạ độ MÀN HÌNH), còn `pos` đã bị
+        // nghịch-xoay về hệ toạ độ ảnh. Dùng lẫn hai hệ này thì kính lúp soi sai vùng.
+        const screen = this.screenCoords(e);
 
-        const corners = page.corners || [
-            [0, 0],
-            [page.width - 1, 0],
-            [page.width - 1, page.height - 1],
-            [0, page.height - 1]
-        ];
+        if (this.viewMode === VIEW.COMPARE && !this.holdingCompare && this.editedImg) {
+            const sliderX = this.imgOffsetX + this.imgRenderW * this.sliderPos;
+            if (Math.abs(pos.x - sliderX) <= 22) { this.isSliding = true; return; }
+        }
 
-        const screenPts = corners.map(pt => [
-            this.imgOffsetX + pt[0] * this.scaleX,
-            this.imgOffsetY + pt[1] * this.scaleY
-        ]);
+        if (this.showHandles && this.isShowingOriginal()) {
+            const corners = page.corners || this.fullFrameCorners(page.width, page.height);
+            const rot = (page.rotation || 0) % 360;
+            const isSwapped = (rot === 90 || rot === 270);
+            const drawW = isSwapped ? this.imgRenderH : this.imgRenderW;
+            const drawH = isSwapped ? this.imgRenderW : this.imgRenderH;
+            const cx = this.imgOffsetX + this.imgRenderW / 2;
+            const cy = this.imgOffsetY + this.imgRenderH / 2;
+            const originX = cx - drawW / 2;
+            const originY = cy - drawH / 2;
+            const scaleX = drawW / page.width;
+            const scaleY = drawH / page.height;
 
-        if ((this.currentViewMode === 'original' || this.isHoldingCompare) && this.showCropHandles) {
-            for (let i = 0; i < screenPts.length; i++) {
-                const dist = Math.hypot(pos.x - screenPts[i][0], pos.y - screenPts[i][1]);
-                if (dist <= this.handleRadius + 8) {
+            const hit = Math.max(this.handleRadius + 8, 22 / Math.max(0.1, this.zoom));
+            for (let i = 0; i < corners.length; i++) {
+                const sx = originX + corners[i][0] * scaleX;
+                const sy = originY + corners[i][1] * scaleY;
+                if (Math.hypot(pos.x - sx, pos.y - sy) <= hit) {
                     this.draggingCornerIndex = i;
-                    this.pushHistoryState("Kéo chỉnh góc");
-                    this.showMagnifier(pos.x, pos.y, i);
-                    this.drawCanvasContent();
+                    this.pushHistory('Kéo chỉnh góc mép giấy');
+                    this.drawCanvas();
+                    this.showMagnifier(screen.x, screen.y, i);
                     return;
                 }
             }
@@ -2725,107 +2367,98 @@ class DocScanApp {
         this.canvasViewport.classList.add('panning');
     }
 
-    onViewportMouseMove(e) {
+    onPointerMove(e) {
+        if (this.isSliding) {
+            const pos = this.canvasCoords(e);
+            this.sliderPos = Math.max(0.01, Math.min(0.99, (pos.x - this.imgOffsetX) / this.imgRenderW));
+            this.drawCanvas();
+            return;
+        }
+
         if (this.isPanning) {
             this.panX = e.clientX - this.panStartX;
             this.panY = e.clientY - this.panStartY;
-            this.applyZoomTransform();
-            return;
-        }
-
-        if (this.isSliding) {
-            this.onSlideMove(e);
+            this.applyTransform();
             return;
         }
 
         if (this.draggingCornerIndex !== -1) {
-            const pos = this.getCanvasCoords(e);
             const page = this.getActivePage();
             if (!page) return;
+            const pos = this.canvasCoords(e);
+            const screen = this.screenCoords(e);
+            const rot = (page.rotation || 0) % 360;
+            const isSwapped = (rot === 90 || rot === 270);
+            const drawW = isSwapped ? this.imgRenderH : this.imgRenderW;
+            const drawH = isSwapped ? this.imgRenderW : this.imgRenderH;
+            const cx = this.imgOffsetX + this.imgRenderW / 2;
+            const cy = this.imgOffsetY + this.imgRenderH / 2;
+            const originX = cx - drawW / 2;
+            const originY = cy - drawH / 2;
+            const scaleX = drawW / page.width;
+            const scaleY = drawH / page.height;
 
-            const origX = (pos.x - this.imgOffsetX) / this.scaleX;
-            const origY = (pos.y - this.imgOffsetY) / this.scaleY;
-
-            const minBound = -page.width * 0.1;
-            const maxBoundW = page.width * 1.1;
-            const maxBoundH = page.height * 1.1;
-
+            const x = (pos.x - originX) / scaleX;
+            const y = (pos.y - originY) / scaleY;
+            // Cho phép kéo ra ngoài mép ảnh 10% để đắp thêm viền giấy.
             page.corners[this.draggingCornerIndex] = [
-                Math.max(minBound, Math.min(maxBoundW, origX)),
-                Math.max(minBound, Math.min(maxBoundH, origY))
+                Math.max(-page.width * 0.1, Math.min(page.width * 1.1, x)),
+                Math.max(-page.height * 0.1, Math.min(page.height * 1.1, y)),
             ];
+            this.drawCanvas();
+            this.showMagnifier(screen.x, screen.y, this.draggingCornerIndex);
+            return;
+        }
 
-            this.drawCanvasContent();
-            this.showMagnifier(pos.x, pos.y, this.draggingCornerIndex);
+        if (this.viewMode === VIEW.COMPARE && !this.holdingCompare && this.editedImg && this.imgRenderW) {
+            const pos = this.canvasCoords(e);
+            const sliderX = this.imgOffsetX + this.imgRenderW * this.sliderPos;
+            this.canvasViewport.style.cursor = Math.abs(pos.x - sliderX) <= 18 ? 'ew-resize' : '';
+        } else {
+            this.canvasViewport.style.cursor = '';
         }
     }
 
-    onViewportMouseUp() {
+    onPointerUp() {
+        this.isSliding = false;
         if (this.draggingCornerIndex !== -1) {
             this.draggingCornerIndex = -1;
             this.hideMagnifier();
-            this.drawCanvasContent();
-            this.debounceProcess();
-            this.debounceSaveMetadata(this.activeFolderId);
+            this.drawCanvas();
+            this.requestPreview();
         }
         if (this.isPanning) {
             this.isPanning = false;
             this.canvasViewport.classList.remove('panning');
         }
-        if (this.isSliding) {
-            this.isSliding = false;
-        }
     }
 
-    onTouchStart(e) {
-        if (e.touches.length === 1) {
-            const touch = e.touches[0];
-            const fakeEvent = { clientX: touch.clientX, clientY: touch.clientY };
-            this.onViewportMouseDown(fakeEvent);
-        }
-    }
-
-    onTouchMove(e) {
-        if (e.touches.length === 1) {
-            const touch = e.touches[0];
-            if (this.isPanning) {
-                e.preventDefault();
-                this.panX = touch.clientX - this.panStartX;
-                this.panY = touch.clientY - this.panStartY;
-                this.applyZoomTransform();
-            } else if (this.draggingCornerIndex !== -1) {
-                e.preventDefault();
-                const fakeEvent = { clientX: touch.clientX, clientY: touch.clientY };
-                this.onViewportMouseMove(fakeEvent);
-            }
-        }
-    }
-
+    /**
+     * Kính lúp 2.5x. Toạ độ nhận vào là pixel CSS, còn bộ đệm canvas được nhân
+     * theo hệ số nét cao — phải quy đổi, nếu không kính lúp soi nhầm vùng ảnh.
+     */
     showMagnifier(canvasX, canvasY, cornerIdx) {
-        if (!this.currentImageObj || !this.magLens) return;
-
+        if (!this.magLens || !this.originalImg) return;
         this.magLens.style.display = 'block';
-        this.magLens.style.left = '20px';
-        this.magLens.style.top = '20px';
 
-        const labels = ['Góc Trên - Trái', 'Góc Trên - Phải', 'Góc Dưới - Phải', 'Góc Dưới - Trái'];
-        this.lensLabel.textContent = labels[cornerIdx] || "Góc";
+        const labels = ['Góc trên - trái', 'Góc trên - phải', 'Góc dưới - phải', 'Góc dưới - trái'];
+        this.lensLabel.textContent = labels[cornerIdx] || 'Góc';
 
-        const ctx = this.magCtx;
+        const dpr = this.dpr || 1;
         const mw = this.magCanvas.width;
         const mh = this.magCanvas.height;
+        const zoomFactor = 2.5;
+        const srcW = (mw / zoomFactor) * dpr;
+        const srcH = (mh / zoomFactor) * dpr;
 
+        const ctx = this.magCtx;
         ctx.clearRect(0, 0, mw, mh);
+        ctx.imageSmoothingEnabled = true;
+        ctx.imageSmoothingQuality = 'high';
         ctx.drawImage(
             this.canvas,
-            canvasX - mw / 4,
-            canvasY - mh / 4,
-            mw / 2,
-            mh / 2,
-            0,
-            0,
-            mw,
-            mh
+            canvasX * dpr - srcW / 2, canvasY * dpr - srcH / 2, srcW, srcH,
+            0, 0, mw, mh
         );
     }
 
@@ -2833,174 +2466,380 @@ class DocScanApp {
         if (this.magLens) this.magLens.style.display = 'none';
     }
 
-    // ==========================================
-    // ⚡ AUTO DETECT, EXPAND MARGIN, ROTATE
-    // ==========================================
+    // ======================================================
+    // 🔄 CHUYỂN / XÓA TRANG
+    // ======================================================
 
-    async autoDetectActivePage() {
-        const page = this.getActivePage();
+    openMoveModal(imageId) {
+        const page = this.pages.get(imageId);
         if (!page) return;
+        this.moveModalState = { imageId, targetFolderId: null };
+        this.moveImageDesc.textContent = `Chuyển "${page.docName}" sang thư mục nào?`;
+        this.btnSubmitMoveModal.disabled = true;
+        this.hideInlineFolderBox();
+        this.renderMovePicker();
+        this.moveImageModal.style.display = 'flex';
+    }
 
-        this.showLoading("Đang nhận diện lại mép giấy...");
-        try {
-            const formData = new FormData();
-            formData.append('image_id', page.id);
-            formData.append('margin_percent', page.settings.margin_percent);
+    closeMoveModal() { this.moveImageModal.style.display = 'none'; }
 
-            fetch('/api/detect', {
-                method: 'POST',
-                body: formData
-            }).then(res => res.json()).then(data => {
-                page.corners = data.corners;
-                this.renderCropCanvas();
-                this.debounceProcess();
-                this.debounceSaveMetadata(this.activeFolderId);
-                this.showToast("Đã tự động nhận diện mép tài liệu!");
-            }).catch(err => {
-                this.showToast("Lỗi nhận diện", false);
-            }).finally(() => {
-                this.hideLoading();
+    renderMovePicker() {
+        this.moveFolderPicker.innerHTML = '';
+        const roots = this.folders.filter(f => !f.parentId);
+        roots.forEach(f => this.renderMovePickerNode(f, 0));
+    }
+
+    renderMovePickerNode(folder, level) {
+        const page = this.pages.get(this.moveModalState.imageId);
+        const isCurrent = page && page.folderId === folder.id;
+
+        const item = document.createElement('div');
+        item.className = `picker-item ${isCurrent ? 'disabled' : ''}`;
+        item.dataset.level = Math.min(3, level);
+        item.innerHTML = `
+            <span class="picker-item-content">
+                <i class="fa-solid ${folder.isUnapproved ? 'fa-inbox text-warning' : 'fa-folder text-accent'}"></i>
+                <span>${escapeHtml(folder.name)}</span>
+                <span class="tree-badge">${(folder.imageIds || []).length}</span>
+            </span>
+            ${isCurrent ? '<span class="picker-current-tag">đang ở đây</span>' : ''}`;
+
+        if (!isCurrent) {
+            item.addEventListener('click', () => {
+                this.moveFolderPicker.querySelectorAll('.picker-item').forEach(i => i.classList.remove('selected'));
+                item.classList.add('selected');
+                this.moveModalState.targetFolderId = folder.id;
+                this.btnSubmitMoveModal.disabled = false;
             });
+        }
+
+        this.moveFolderPicker.appendChild(item);
+        this.getFolderChildren(folder.id).forEach(c => this.renderMovePickerNode(c, level + 1));
+    }
+
+    showInlineFolderBox() {
+        this.moveInlineCreateBox.style.display = 'flex';
+        this.txtInlineNewFolder.value = '';
+        this.txtInlineNewFolder.focus();
+    }
+
+    hideInlineFolderBox() {
+        this.moveInlineCreateBox.style.display = 'none';
+    }
+
+    async confirmInlineFolder() {
+        const name = this.txtInlineNewFolder.value.trim();
+        if (!name) { this.toastErr('Vui lòng nhập tên thư mục.'); return; }
+        const parentId = this.moveModalState.targetFolderId || this.activeFolderId;
+        try {
+            const data = await apiJson('/api/create-folder', {
+                relative_path: this.getFolderPath(parentId),
+                folder_name: name,
+            });
+            this.folders.push({
+                id: data.folder_id,
+                name: data.folder_name,
+                parentId: data.parent_id,
+                relativePath: data.relative_path,
+                imageIds: [],
+                isUnapproved: false,
+                isExpanded: true,
+            });
+            this.hideInlineFolderBox();
+            this.renderMovePicker();
+            this.renderFolderTree();
+            this.toastOk(`Đã tạo thư mục "${name}".`);
         } catch (err) {
-            this.showToast("Lỗi nhận diện", false);
+            this.toastErr(err.message);
+        }
+    }
+
+    async submitMoveModal() {
+        const { imageId, targetFolderId } = this.moveModalState;
+        const page = this.pages.get(imageId);
+        const target = this.getFolder(targetFolderId);
+        if (!page || !target) return;
+
+        try {
+            const raw = await apiJson('/api/move-page', {
+                relative_path: page.relativePath,
+                filename: page.filename,
+                target_relative_path: target.relativePath,
+            });
+
+            const source = this.getFolder(page.folderId);
+            if (source) source.imageIds = source.imageIds.filter(id => id !== imageId);
+            this.pages.delete(imageId);
+            this.dirtyPages.delete(imageId);
+
+            const moved = this.toPage(raw);
+            this.pages.set(moved.id, moved);
+            target.imageIds.push(moved.id);
+
+            if (this.activeImageId === imageId) {
+                this.activeImageId = null;
+                this.editorStage.style.display = 'none';
+                this.emptyState.style.display = 'flex';
+                this.docNameWrapper.style.display = 'none';
+            }
+
+            this.closeMoveModal();
+            this.renderFolderTree();
+            this.updateFolderHeader();
+            this.renderPageList();
+            this.updateSaveState();
+            this.toastOk(`Đã chuyển "${moved.docName}" sang "${target.name}" (kèm ảnh gốc và metadata).`);
+        } catch (err) {
+            this.toastErr(err.message);
+        }
+    }
+
+    async deletePage(imageId) {
+        const page = this.pages.get(imageId);
+        if (!page) return;
+        const ok = await this.askConfirm(
+            `Xóa trang "${page.docName}"`,
+            'Cả ảnh gốc, ảnh đã chỉnh sửa và metadata của trang này sẽ bị xóa vĩnh viễn khỏi máy tính.',
+            true,
+            'Xóa trang'
+        );
+        if (!ok) return;
+
+        try {
+            await apiJson('/api/delete-page', {
+                relative_path: page.relativePath,
+                filename: page.filename,
+            });
+            const folder = this.getFolder(page.folderId);
+            if (folder) folder.imageIds = folder.imageIds.filter(id => id !== imageId);
+            this.pages.delete(imageId);
+            this.dirtyPages.delete(imageId);
+
+            if (this.activeImageId === imageId) {
+                const remaining = this.getFolderImageIds();
+                if (remaining.length > 0) {
+                    await this.selectPage(remaining[0]);
+                } else {
+                    this.activeImageId = null;
+                    this.editorStage.style.display = 'none';
+                    this.emptyState.style.display = 'flex';
+                    this.docNameWrapper.style.display = 'none';
+                    if (this.btnDownloadCurrent) this.btnDownloadCurrent.disabled = true;
+                    this.updateHistoryButtons();
+                }
+            }
+            this.renderFolderTree();
+            this.updateFolderHeader();
+            this.renderPageList();
+            this.updateSaveState();
+            this.toastOk(`Đã xóa trang "${page.docName}".`);
+        } catch (err) {
+            this.toastErr(err.message);
+        }
+    }
+
+    // ======================================================
+    // 🧩 ẢNH LẺ CHƯA CÓ BẢN GỐC
+    // ======================================================
+
+    openOrphanPrompt(imageId) {
+        const page = this.pages.get(imageId);
+        if (!page) return;
+        this.pendingOrphanId = imageId;
+        this.orphanFileName.textContent = page.filename;
+        this.orphanFolderPath.textContent = this.getFolderBreadcrumb(page.folderId);
+        this.orphanFileSize.textContent = page.fileSizeHuman || '--';
+        this.orphanPreviewImg.src = this.thumbUrl(page);
+        this.orphanImageModal.style.display = 'flex';
+    }
+
+    closeOrphanPrompt(markHandled = false) {
+        if (markHandled && this.pendingOrphanId) {
+            const page = this.pages.get(this.pendingOrphanId);
+            if (page) page.orphanHandled = true;
+        }
+        this.orphanImageModal.style.display = 'none';
+        this.pendingOrphanId = null;
+    }
+
+    async adoptOrphan() {
+        const page = this.pages.get(this.pendingOrphanId);
+        if (!page) return this.closeOrphanPrompt();
+        try {
+            const raw = await apiJson('/api/adopt-as-original', {
+                relative_path: page.relativePath,
+                filename: page.filename,
+            });
+            const updated = this.toPage(raw);
+            updated.orphanHandled = true;
+            this.pages.set(updated.id, updated);
+            this.closeOrphanPrompt();
+
+            this.activeImageId = null;
+            await this.selectPage(updated.id);
+            this.renderPageList();
+            this.toastOk('Đã tạo bản gốc trong _goc/ — trang này giờ chỉnh sửa an toàn được.');
+        } catch (err) {
+            this.closeOrphanPrompt();
+            this.toastErr(err.message);
+        }
+    }
+
+    async moveOrphanToUnapproved() {
+        const page = this.pages.get(this.pendingOrphanId);
+        if (!page) return this.closeOrphanPrompt();
+        try {
+            await apiJson('/api/move-to-unapproved', {
+                relative_path: page.relativePath,
+                filename: page.filename,
+            });
+            this.closeOrphanPrompt();
+            this.toastOk('Đã chuyển ảnh vào Kho ảnh chưa duyệt.');
+            await this.loadProject(this.rootPath, false);
+        } catch (err) {
+            this.closeOrphanPrompt();
+            this.toastErr(err.message);
+        }
+    }
+
+    async deleteOrphan() {
+        const imageId = this.pendingOrphanId;
+        this.closeOrphanPrompt();
+        if (imageId) await this.deletePage(imageId);
+    }
+
+    // ======================================================
+    // 📤 XUẤT PDF & TẢI ẢNH
+    // ======================================================
+
+    /**
+     * Hỏi người dùng nơi lưu tệp qua hộp thoại của hệ điều hành.
+     * Thư mục mặc định là thư mục tài liệu đang mở — nơi người dùng mong muốn nhất,
+     * thay vì ném vào Downloads của trình duyệt rồi phải đi tìm.
+     * Trả về null nếu người dùng bấm Huỷ.
+     */
+    async askSavePath(suggestedName, extension, relativePath) {
+        const folder = this.getActiveFolder();
+        const data = await apiJson('/api/pick-save-path', {
+            relative_path: relativePath !== undefined
+                ? relativePath
+                : (folder ? folder.relativePath : ''),
+            suggested_name: suggestedName,
+            extension,
+        });
+        return data.success && data.path ? data.path : null;
+    }
+
+    /** Ghi tệp xuất ra nơi người dùng vừa chọn và báo lại đường dẫn đầy đủ. */
+    async exportToChosenPath(url, body, savePath) {
+        const data = await apiJson(url, { ...body, save_path: savePath });
+        return data;
+    }
+
+    /** Câu thông báo chung sau khi lưu xong, có nêu rõ tệp nằm ở đâu. */
+    savedMessage(what, data) {
+        return `Đã lưu ${what} vào: ${data.saved_to}`;
+    }
+
+    async exportFolderPdf(folderId) {
+        const folder = this.getFolder(folderId);
+        if (!folder) return;
+        const selectedInFolder = (folder.imageIds || []).filter(id => this.selectedPageIds.has(id));
+        if (selectedInFolder.length === 0) {
+            this.toastErr('Hãy tích chọn ít nhất 1 trang để xuất PDF.');
+            return;
+        }
+
+        const filenames = selectedInFolder.map(id => this.pages.get(id)?.filename).filter(Boolean);
+        const docTitle = `${folder.name}_${selectedInFolder.length}_trang`;
+
+        try {
+            const savePath = await this.askSavePath(docTitle, 'pdf', folder.relativePath);
+            if (!savePath) return;   // người dùng bấm Huỷ
+
+            this.showLoading(`Đang tạo tệp PDF gồm ${filenames.length} trang đã chọn…`);
+            await this.saveDirtyPages(true);
+            const data = await this.exportToChosenPath('/api/export-pdf', {
+                relative_path: folder.relativePath,
+                filenames,
+                doc_name: docTitle,
+            }, savePath);
+            this.toastOk(this.savedMessage(`PDF ${filenames.length} trang`, data));
+        } catch (err) {
+            this.toastErr(err.message);
+        } finally {
             this.hideLoading();
         }
     }
 
-    expandMarginActivePage(margin = 0.02) {
-        const page = this.getActivePage();
-        if (!page || !page.corners) return;
+    async downloadFolderZip(folderId) {
+        const folder = this.getFolder(folderId);
+        if (!folder) return;
+        const selectedInFolder = (folder.imageIds || []).filter(id => this.selectedPageIds.has(id));
+        if (selectedInFolder.length === 0) {
+            this.toastErr('Hãy tích chọn ít nhất 1 ảnh để tải về.');
+            return;
+        }
 
-        const pts = page.corners;
-        const cx = (pts[0][0] + pts[1][0] + pts[2][0] + pts[3][0]) / 4.0;
-        const cy = (pts[0][1] + pts[1][1] + pts[2][1] + pts[3][1]) / 4.0;
-
-        const factor = 1.0 + margin * 2.0;
-        page.corners = pts.map(pt => [
-            cx + (pt[0] - cx) * factor,
-            cy + (pt[1] - cy) * factor
-        ]);
-
-        this.renderCropCanvas();
-        this.debounceProcess();
-        this.debounceSaveMetadata(this.activeFolderId);
-        this.showToast(`Đã mở rộng lề ${(margin * 100).toFixed(0)}% và đắp viền giấy.`);
-    }
-
-    resetCornersToBorder() {
-        const page = this.getActivePage();
-        if (!page) return;
-
-        page.corners = [
-            [0, 0],
-            [page.width - 1, 0],
-            [page.width - 1, page.height - 1],
-            [0, page.height - 1]
-        ];
-        this.renderCropCanvas();
-        this.debounceProcess();
-        this.debounceSaveMetadata(this.activeFolderId);
-        this.showToast("Đã đặt 4 góc trọn toàn bộ ảnh.");
-    }
-
-    resetToRawOriginal() {
-        const page = this.getActivePage();
-        if (!page) return;
-
-        this.pushHistoryState("Khôi phục về ảnh chụp gốc ban đầu");
-        page.rotation = 0;
-        page.settings = {
-            mode: 'natural',
-            shadow_reduction: 0.6,
-            sharpness: 0.6,
-            contrast: 0.2,
-            brightness: 0.0,
-            margin_percent: 0.02,
-            dewarp_enabled: false,
-            dewarp_strength: 0.8,
-            quality: 85,
-            normalize_res: true
-        };
-        this.syncInspectorUI(page.settings);
-        this.autoDetectActivePage();
-        this.debounceSaveMetadata(this.activeFolderId);
-        this.showToast("Đã khôi phục về trạng thái ảnh chụp ban đầu.");
-    }
-
-    rotateActivePage(deg) {
-        const page = this.getActivePage();
-        if (!page) return;
-
-        page.rotation = (page.rotation + deg + 360) % 360;
-        this.showToast(`Đã xoay ảnh ${page.rotation}°`);
-        this.processActivePage();
-        this.debounceSaveMetadata(this.activeFolderId);
-    }
-
-    // ==========================================
-    // ✨ PROCESS ENHANCEMENT & PREVIEWS
-    // ==========================================
-
-    debounceProcess() {
-        clearTimeout(this.processTimer);
-        this.processTimer = setTimeout(() => {
-            this.processActivePage();
-        }, 250);
-        this.scheduleAutoSave(60000);
-    }
-
-    async processActivePage() {
-        const page = this.getActivePage();
-        if (!page) return;
-
-        this.showLoading("Đang xử lý làm rõ chữ & đắp viền giấy...");
+        const filenames = selectedInFolder.map(id => this.pages.get(id)?.filename).filter(Boolean);
+        const zipTitle = `${folder.name}_${selectedInFolder.length}_anh`;
 
         try {
-            const reqBody = {
-                image_id: page.id,
-                corners: page.corners,
-                rotation: page.rotation,
-                margin_percent: page.settings.margin_percent,
-                dewarp_enabled: page.settings.dewarp_enabled,
-                dewarp_strength: page.settings.dewarp_strength,
-                mode: page.settings.mode,
-                shadow_reduction: page.settings.shadow_reduction,
-                sharpness: page.settings.sharpness,
-                contrast: page.settings.contrast,
-                brightness: page.settings.brightness,
-                quality: page.settings.quality,
-                format: 'jpeg',
-                normalize_res: page.settings.normalize_res
-            };
+            const savePath = await this.askSavePath(zipTitle, 'zip', folder.relativePath);
+            if (!savePath) return;
 
-            const res = await fetch('/api/process', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(reqBody)
-            });
-
-            if (!res.ok) {
-                const err = await res.json();
-                throw new Error(err.detail || "Xử lý thất bại");
-            }
-
-            const data = await res.json();
-            page.processed_url = data.image_data;
-            page.out_dim = `${data.width} × ${data.height} px`;
-            page.out_size_human = data.file_size_human;
-            page.saving_ratio = data.saving_ratio;
-
-            const procImg = new Image();
-            procImg.onload = () => {
-                page.processedImageObj = procImg;
-                this.renderCropCanvas();
-            };
-            procImg.src = data.image_data;
-
-            this.updateMetadataUI(page);
-            this.updateSidebarUI();
+            this.showLoading(`Đang nén ${filenames.length} ảnh đã chọn thành tệp ZIP…`);
+            await this.saveDirtyPages(true);
+            const data = await this.exportToChosenPath('/api/export-images-zip', {
+                relative_path: folder.relativePath,
+                filenames,
+                zip_name: zipTitle,
+            }, savePath);
+            this.toastOk(this.savedMessage(`tệp ZIP gồm ${filenames.length} ảnh`, data));
         } catch (err) {
-            this.showToast(err.message || "Lỗi khi xử lý hình ảnh", false);
+            this.toastErr(err.message);
+        } finally {
+            this.hideLoading();
+        }
+    }
+
+    async exportProjectPdf() {
+        if (this.pages.size === 0) { this.toastErr('Dự án chưa có trang nào để xuất PDF.'); return; }
+        try {
+            const title = this.rootName || 'Tai-Lieu-Scan';
+            const savePath = await this.askSavePath(title, 'pdf', '');
+            if (!savePath) return;
+
+            this.showLoading('Đang ghép toàn bộ dự án thành một tệp PDF…');
+            await this.saveDirtyPages(true);
+            const data = await this.exportToChosenPath('/api/export-project-pdf',
+                { doc_name: title }, savePath);
+            this.toastOk(this.savedMessage(`PDF toàn bộ dự án (${data.pages} trang)`, data));
+        } catch (err) {
+            this.toastErr(err.message);
+        } finally {
+            this.hideLoading();
+        }
+    }
+
+    async exportCurrentPagePdf() {
+        const page = this.getActivePage();
+        if (!page) { this.toastErr('Hãy chọn một trang tài liệu để xuất PDF.'); return; }
+        try {
+            const title = page.docName || 'Trang-Tai-Lieu';
+            const savePath = await this.askSavePath(title, 'pdf', page.relativePath);
+            if (!savePath) return;
+
+            this.showLoading(`Đang xuất PDF cho trang “${title}”…`);
+            await this.saveDirtyPages(true);
+            const data = await this.exportToChosenPath('/api/export-pdf', {
+                relative_path: page.relativePath,
+                filenames: [page.filename],
+                doc_name: title,
+            }, savePath);
+            this.toastOk(this.savedMessage(`PDF trang “${title}”`, data));
+        } catch (err) {
+            this.toastErr(err.message);
         } finally {
             this.hideLoading();
         }
@@ -3009,405 +2848,325 @@ class DocScanApp {
     async downloadCurrentPage(format = 'jpeg') {
         const page = this.getActivePage();
         if (!page) return;
-
-        this.showLoading("Đang chuẩn bị tải về...");
+        const ext = format === 'jpeg' ? 'jpg' : format;
         try {
-            const docName = encodeURIComponent(this.txtDocName.value.trim() || page.suggested_name || "scan");
-            const url = `/api/download/${page.id}?format=${format}&quality=${page.settings.quality}&doc_name=${docName}`;
-            const link = document.createElement('a');
-            link.href = url;
-            link.download = `${this.txtDocName.value.trim() || page.suggested_name}.${format === 'jpeg' ? 'jpg' : format}`;
-            document.body.appendChild(link);
-            link.click();
-            document.body.removeChild(link);
-            this.showToast("Đã tải ảnh về máy thành công!");
+            const title = page.docName || 'Trang-Tai-Lieu';
+            const savePath = await this.askSavePath(title, ext, page.relativePath);
+            if (!savePath) return;
+
+            this.showLoading('Đang chuẩn bị tệp ảnh…');
+            await this.saveDirtyPages(true);
+            const data = await this.exportToChosenPath('/api/download-single', {
+                relative_path: page.relativePath,
+                filename: page.filename,
+                format,
+                doc_name: title,
+            }, savePath);
+            this.toastOk(this.savedMessage(`ảnh ${ext.toUpperCase()}`, data));
         } catch (err) {
-            this.showToast("Lỗi khi tải file", false);
+            this.toastErr(err.message);
         } finally {
             this.hideLoading();
         }
     }
 
-    async applyCurrentAsOriginal() {
-        const page = this.getActivePage();
-        if (!page) return;
+    // ======================================================
+    // 🎚️ ĐỒNG BỘ BẢNG ĐIỀU KHIỂN & THÔNG SỐ
+    // ======================================================
 
-        if (!page.processed_url) {
-            this.showToast("Vui lòng xem kết quả làm nét trước khi lưu làm ảnh gốc.", false);
-            return;
-        }
-
-        const confirmApply = confirm("Bạn có chắc chắn muốn lấy hình đã chỉnh sửa này thay thế làm Hình Gốc mới không?\n(Bạn sẽ có thể tiếp tục kéo cắt 4 góc hoặc xử lý tiếp trên nền bức ảnh mới này).");
-        if (!confirmApply) return;
-
-        this.showLoading("Đang lưu hình đã sửa thành hình gốc mới...");
-        try {
-            const proj = this.getActiveProject();
-            const relPath = this.getFolderRelativePath(this.activeFolderId);
-            const res = await fetch('/api/apply-as-original', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    image_id: page.id,
-                    root_path: proj ? proj.rootDiskPath : null,
-                    relative_path: relPath,
-                    doc_name: page.suggested_name
-                })
-            });
-
-            if (!res.ok) {
-                const err = await res.json();
-                throw new Error(err.detail || "Không thể lưu làm ảnh gốc");
-            }
-
-            const data = await res.json();
-            page.preview_url = data.preview_url;
-            page.corners = data.corners;
-            page.width = data.width;
-            page.height = data.height;
-            page.megapixels = data.megapixels;
-            page.rotation = 0;
-            page.processed_url = null;
-            page.out_dim = null;
-            page.out_size_human = null;
-            page.saving_ratio = null;
-
-            // Reset history stack for this image
-            this.historyMap.set(page.id, { undo: [], redo: [] });
-            this.updateHistoryButtons();
-
-            const img = new Image();
-            img.onload = () => {
-                this.currentImageObj = img;
-                this.switchView('crop');
-                this.resetZoomFit();
-                this.renderCropCanvas();
-                this.updateMetadataUI(page);
-                this.updateSidebarUI();
-            };
-            img.src = data.preview_url;
-
-            this.showToast("✅ Đã thay thế ảnh gốc thành công! Bạn có thể tiếp tục chỉnh sửa.");
-        } catch (err) {
-            this.showToast(err.message || "Lỗi khi lưu làm ảnh gốc", false);
-        } finally {
-            this.hideLoading();
-        }
-    }
-
-    // ==========================================
-    // ⏪ UNDO / REDO HISTORY
-    // ==========================================
-
-    getHistoryForActivePage() {
-        const page = this.getActivePage();
-        if (!page) return null;
-        if (!this.historyMap.has(page.id)) {
-            this.historyMap.set(page.id, { undo: [], redo: [] });
-        }
-        return this.historyMap.get(page.id);
-    }
-
-    pushHistoryState(description = "") {
-        if (this.isApplyingHistory) return;
-        const page = this.getActivePage();
-        if (!page) return;
-
-        const hist = this.getHistoryForActivePage();
-        const snapshot = {
-            corners: JSON.parse(JSON.stringify(page.corners)),
-            rotation: page.rotation,
-            settings: JSON.parse(JSON.stringify(page.settings)),
-            description: description
-        };
-
-        hist.undo.push(snapshot);
-        if (hist.undo.length > 30) hist.undo.shift();
-        hist.redo = [];
-        this.updateHistoryButtons();
-        this.debounceSaveMetadata(this.activeFolderId);
-        this.scheduleAutoSave(60000);
-    }
-
-    undo() {
-        const page = this.getActivePage();
-        if (!page) return;
-        const hist = this.getHistoryForActivePage();
-        if (!hist || hist.undo.length === 0) return;
-
-        const currentSnapshot = {
-            corners: JSON.parse(JSON.stringify(page.corners)),
-            rotation: page.rotation,
-            settings: JSON.parse(JSON.stringify(page.settings))
-        };
-        hist.redo.push(currentSnapshot);
-
-        const prevState = hist.undo.pop();
-        this.isApplyingHistory = true;
-
-        page.corners = JSON.parse(JSON.stringify(prevState.corners));
-        page.rotation = prevState.rotation;
-        page.settings = JSON.parse(JSON.stringify(prevState.settings));
-
-        this.syncInspectorUI(page.settings);
-        this.renderCropCanvas();
-
-        this.isApplyingHistory = false;
-        this.updateHistoryButtons();
-        this.debounceSaveMetadata(this.activeFolderId);
-        this.scheduleAutoSave(60000);
-        this.showToast(`Đã hoàn tác: ${prevState.description || "thao tác trước"}`);
-    }
-
-    redo() {
-        const page = this.getActivePage();
-        if (!page) return;
-        const hist = this.getHistoryForActivePage();
-        if (!hist || hist.redo.length === 0) return;
-
-        const currentSnapshot = {
-            corners: JSON.parse(JSON.stringify(page.corners)),
-            rotation: page.rotation,
-            settings: JSON.parse(JSON.stringify(page.settings))
-        };
-        hist.redo.push(currentSnapshot);
-
-        const nextState = hist.redo.pop();
-        this.isApplyingHistory = true;
-
-        page.corners = JSON.parse(JSON.stringify(nextState.corners));
-        page.rotation = nextState.rotation;
-        page.settings = JSON.parse(JSON.stringify(nextState.settings));
-
-        this.syncInspectorUI(page.settings);
-        this.renderCropCanvas();
-
-        this.isApplyingHistory = false;
-        this.updateHistoryButtons();
-        this.debounceSaveMetadata(this.activeFolderId);
-        this.scheduleAutoSave(60000);
-        this.showToast("Đã làm lại thao tác");
-    }
-
-    debounceSaveMetadata(folderId) {
-        clearTimeout(this.saveMetaTimer);
-        this.saveMetaTimer = setTimeout(() => {
-            this.saveMetadataToDisk(folderId);
-        }, 1200);
-    }
-
-    async saveMetadataToDisk(folderId) {
-        const folder = this.getFolder(folderId);
-        const proj = this.getActiveProject();
-        if (!folder || !proj || !proj.rootDiskPath) return;
-
-        const relPath = this.getFolderRelativePath(folderId);
-        const pagesPayload = (folder.imageIds || []).map(imgId => {
-            const p = this.images.get(imgId);
-            if (!p) return null;
-            const hist = this.historyMap.get(imgId) || { undo: [], redo: [] };
-            return {
-                filename: p.filename,
-                doc_name: p.suggested_name,
-                corners: p.corners,
-                rotation: p.rotation || 0,
-                settings: p.settings,
-                history: hist
-            };
-        }).filter(Boolean);
-
-        if (pagesPayload.length === 0) return;
-
-        try {
-            await fetch('/api/save-metadata', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    root_path: proj.rootDiskPath,
-                    relative_path: relPath,
-                    pages: pagesPayload
-                })
-            });
-        } catch (e) {
-            console.error("Failed to auto-save metadata:", e);
-        }
-    }
-
-    updateHistoryButtons() {
-        const hist = this.getHistoryForActivePage();
-        this.btnUndo.disabled = !hist || hist.undo.length === 0;
-        this.btnRedo.disabled = !hist || hist.redo.length === 0;
-    }
-
-    // ==========================================
-    // 🔔 TOAST & FEEDBACK UTILITIES
-    // ==========================================
-
-    showToast(msg, isSuccess = true) {
-        this.toastMsg.textContent = msg;
-        const icon = document.getElementById('toastIcon');
-        icon.className = isSuccess ? 'fa-solid fa-circle-check text-success' : 'fa-solid fa-triangle-exclamation text-warning';
-        this.toast.classList.add('show');
-        clearTimeout(this.toastTimer);
-        this.toastTimer = setTimeout(() => this.toast.classList.remove('show'), 3000);
-    }
-
-    showLoading(text = "Đang tối ưu hóa tài liệu...") {
-        this.loadingText.textContent = text;
-        this.loadingOverlay.style.display = 'flex';
-    }
-
-    hideLoading() {
-        this.loadingOverlay.style.display = 'none';
-    }
-
-    // ==========================================
-    // 🎛️ INSPECTOR UI & METADATA SYNC
-    // ==========================================
-
-    renderNameSuggestions(page) {
-        if (!this.suggestMenu) return;
-        this.suggestMenu.innerHTML = '';
-        const suggestions = (page && page.name_suggestions && page.name_suggestions.length > 0) ? 
-            page.name_suggestions : [(page ? page.suggested_name : null) || "Tai-Lieu-Scan"];
-
-        suggestions.forEach(name => {
-            const item = document.createElement('div');
-            item.className = 'suggest-item';
-            item.innerHTML = `<i class="fa-solid fa-file-signature text-accent"></i> <span>${name}</span>`;
-            item.addEventListener('click', () => {
-                this.txtDocName.value = name;
-                if (page) {
-                    page.suggested_name = name;
-                    if (this.cardFileName) this.cardFileName.textContent = name;
-                    this.updatePageThumbTitle(page.id, name);
-                    this.debounceSaveMetadata(this.activeFolderId);
-                    this.scheduleAutoSave(60000);
-                }
-                this.suggestMenu.classList.remove('open');
-            });
-            this.suggestMenu.appendChild(item);
-        });
-    }
-
-    syncInspectorUI(settings) {
+    syncInspector(settings) {
         if (!settings) return;
-        if (this.modeCards) {
-            this.modeCards.forEach(card => {
-                card.classList.toggle('active', card.dataset.mode === (settings.mode || 'natural'));
-            });
-        }
-        if (this.chkDewarp) {
-            this.chkDewarp.checked = !!settings.dewarp_enabled;
-        }
-        if (this.dewarpStrengthGroup) {
-            this.dewarpStrengthGroup.style.display = settings.dewarp_enabled ? 'flex' : 'none';
-        }
-        if (this.rngDewarp) {
-            this.rngDewarp.value = settings.dewarp_strength ?? 0.8;
-            if (this.valDewarp) this.valDewarp.textContent = this.rngDewarp.value;
-        }
-        if (this.rngShadow) {
-            const shVal = Math.round((settings.shadow_reduction ?? 0.6) * 100);
-            this.rngShadow.value = shVal;
-            if (this.valShadow) this.valShadow.textContent = `${shVal}%`;
-        }
-        if (this.rngSharpness) {
-            const spVal = Math.round((settings.sharpness ?? 0.6) * 100);
-            this.rngSharpness.value = spVal;
-            if (this.valSharpness) this.valSharpness.textContent = `${spVal}%`;
-        }
-        if (this.rngMargin) {
-            const mgVal = ((settings.margin_percent ?? 0.02) * 100).toFixed(1);
-            this.rngMargin.value = mgVal;
-            if (this.valMargin) this.valMargin.textContent = `${mgVal}%`;
-        }
-        if (this.rngContrast) {
-            const ctVal = Math.round((settings.contrast ?? 0.2) * 100);
-            this.rngContrast.value = ctVal;
-            if (this.valContrast) this.valContrast.textContent = `${ctVal}%`;
-        }
-        if (this.rngQuality) {
-            const qVal = settings.quality ?? 85;
-            this.rngQuality.value = qVal;
-            if (this.valQuality) this.valQuality.textContent = `${qVal}%`;
-        }
-        if (this.chkNormalizeDpi) {
-            this.chkNormalizeDpi.checked = settings.normalize_res !== false;
-        }
+        this.modeCards.forEach(c => c.classList.toggle('active', c.dataset.mode === (settings.mode || 'natural')));
+
+        this.chkDewarp.checked = !!settings.dewarp_enabled;
+        this.dewarpStrengthGroup.style.display = settings.dewarp_enabled ? 'flex' : 'none';
+        this.rngDewarp.value = settings.dewarp_strength ?? 0.8;
+        this.valDewarp.textContent = this.rngDewarp.value;
+
+        const pct = (v, d) => Math.round((v ?? d) * 100);
+        this.rngShadow.value = pct(settings.shadow_reduction, 0.6);
+        this.valShadow.textContent = `${this.rngShadow.value}%`;
+        this.rngSharpness.value = pct(settings.sharpness, 0.6);
+        this.valSharpness.textContent = `${this.rngSharpness.value}%`;
+        this.rngContrast.value = pct(settings.contrast, 0.2);
+        this.valContrast.textContent = `${this.rngContrast.value}%`;
+
+        this.rngMargin.value = ((settings.margin_percent ?? 0.02) * 100).toFixed(1);
+        this.valMargin.textContent = `${this.rngMargin.value}%`;
+
+        this.rngQuality.value = settings.quality ?? 85;
+        this.valQuality.textContent = `${this.rngQuality.value}%`;
+        this.chkNormalizeDpi.checked = settings.normalize_res !== false;
     }
 
-    updateMetadataUI(page) {
+    updateMetrics(page) {
         if (!page) return;
         const origDim = `${page.width || '--'} × ${page.height || '--'} px`;
-        const origSize = page.file_size_human || '--';
-        const outDim = page.out_dim || origDim;
-        const outSize = page.out_size_human || origSize;
-        const saving = page.saving_ratio ? `Tiết kiệm ${page.saving_ratio}` : 'Chuẩn in A4';
+        const origBytes = page.origSize || page.fileSize || 0;
+        const origSize = page.origSizeHuman || page.fileSizeHuman || formatBytes(origBytes);
+
+        const outDim = page.outDim || origDim;
+        const outBytes = page.outSize || page.editedSize || origBytes;
+        const outSize = page.outSizeHuman || page.editedSizeHuman || formatBytes(outBytes);
 
         if (this.metaOrigDim) this.metaOrigDim.textContent = origDim;
         if (this.metaOrigSize) this.metaOrigSize.textContent = origSize;
         if (this.metaOutDim) this.metaOutDim.textContent = outDim;
         if (this.metaOutSize) this.metaOutSize.textContent = outSize;
-        if (this.savingPill) this.savingPill.textContent = saving;
 
-        if (this.cardFileName) this.cardFileName.textContent = page.suggested_name || page.filename || '--';
+        // Tính % tiết kiệm hoặc % tăng dung lượng so với ảnh gốc
+        if (this.savingPill) {
+            if (origBytes > 0 && outBytes > 0) {
+                const diff = origBytes - outBytes;
+                const pct = Math.round((diff / origBytes) * 100);
+                if (pct > 0) {
+                    this.savingPill.textContent = `Tiết kiệm ${pct}%`;
+                    this.savingPill.className = 'saving-pill saving-positive';
+                    this.savingPill.title = `Giảm từ ${origSize} xuống ${outSize} (tiết kiệm ${pct}% dung lượng)`;
+                    this.savingPill.style.display = 'inline-flex';
+                } else if (pct < 0) {
+                    const inc = Math.abs(pct);
+                    this.savingPill.textContent = `Tăng ${inc}%`;
+                    this.savingPill.className = 'saving-pill saving-neutral';
+                    this.savingPill.title = `Tăng từ ${origSize} lên ${outSize} (+${inc}% do xử lý làm nét & chuẩn hóa DPI)`;
+                    this.savingPill.style.display = 'inline-flex';
+                } else {
+                    this.savingPill.textContent = 'Dung lượng 1:1';
+                    this.savingPill.className = 'saving-pill';
+                    this.savingPill.title = 'Dung lượng tương đương bản gốc';
+                    this.savingPill.style.display = 'inline-flex';
+                }
+            } else {
+                this.savingPill.style.display = 'none';
+            }
+        }
+
+        if (this.cardFileName) this.cardFileName.textContent = page.filename;
         if (this.cardOrigDim) this.cardOrigDim.textContent = origDim;
         if (this.cardOrigSize) this.cardOrigSize.textContent = origSize;
-        if (this.cardMegapixels) this.cardMegapixels.textContent = page.megapixels || '--';
         if (this.cardOutSize) this.cardOutSize.textContent = outSize;
-        if (this.cardSavingRatio) this.cardSavingRatio.textContent = page.saving_ratio || '--';
-    }
-
-    async triggerAiDocumentNaming() {
-        const page = this.getActivePage();
-        if (!page) return;
-
-        this.showLoading("AI đang đọc nội dung văn bản để gợi ý tên...");
-        try {
-            const folderImgIds = this.getActiveFolderImageIds();
-            const pageIndex = (folderImgIds.indexOf(page.id) >= 0 ? folderImgIds.indexOf(page.id) : 0) + 1;
-
-            const res = await fetch('/api/ai-suggest-name', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    image_id: page.id,
-                    page_index: pageIndex
-                })
-            });
-
-            if (!res.ok) throw new Error("Gợi ý AI thất bại");
-            const data = await res.json();
-            if (data.primary_name) {
-                page.suggested_name = data.primary_name;
-                this.txtDocName.value = data.primary_name;
-                if (this.cardFileName) this.cardFileName.textContent = data.primary_name;
-                this.updatePageThumbTitle(page.id, data.primary_name);
+        if (this.cardSavingsPct) {
+            if (origBytes > 0 && outBytes > 0) {
+                const diff = origBytes - outBytes;
+                const pct = Math.round((diff / origBytes) * 100);
+                if (pct > 0) {
+                    this.cardSavingsPct.textContent = `Tiết kiệm ${pct}%`;
+                    this.cardSavingsPct.className = 'meta-v text-success';
+                } else if (pct < 0) {
+                    this.cardSavingsPct.textContent = `Tăng ${Math.abs(pct)}%`;
+                    this.cardSavingsPct.className = 'meta-v text-accent';
+                } else {
+                    this.cardSavingsPct.textContent = '100% (không đổi)';
+                    this.cardSavingsPct.className = 'meta-v';
+                }
+            } else {
+                this.cardSavingsPct.textContent = '--';
             }
-            if (data.suggestions) {
-                page.name_suggestions = data.suggestions;
-                this.renderNameSuggestions(page);
-            }
-            page.aiAnalyzed = true;
-            if (this.aiSuggestBanner) this.aiSuggestBanner.style.display = 'none';
-            this.showToast(`✨ AI đã đặt tên: ${data.primary_name}`);
-            this.debounceSaveMetadata(this.activeFolderId);
-            this.scheduleAutoSave(60000);
-        } catch (err) {
-            this.showToast(err.message || "Lỗi đọc AI", false);
-        } finally {
-            this.hideLoading();
+        }
+        if (this.cardOriginalState) {
+            this.cardOriginalState.textContent = page.hasOriginal ? 'Đã có trong _goc/' : 'Chưa có';
+            this.cardOriginalState.className = page.hasOriginal ? 'meta-v text-success' : 'meta-v text-warning';
         }
     }
 
-    switchView(view) {
-        this.currentView = view;
-        this.setViewMode(view === 'crop' ? 'original' : (this.currentViewMode || 'edited'));
+    // ======================================================
+    // 📐 KÉO CHỈNH KÍCH THƯỚC SIDEBAR
+    // ======================================================
+
+    initSidebarResizers() {
+        if (!this.pageSidebar) return;
+
+        const savedWidth = localStorage.getItem('docscan_sidebar_width');
+        if (savedWidth) this.pageSidebar.style.width = `${savedWidth}px`;
+        const savedHeight = localStorage.getItem('docscan_folder_height');
+        if (savedHeight && this.folderSection) this.folderSection.style.height = `${savedHeight}px`;
+
+        if (this.sidebarResizerV) {
+            this.sidebarResizerV.addEventListener('mousedown', (e) => {
+                e.preventDefault();
+                const startX = e.clientX;
+                const startW = this.pageSidebar.offsetWidth;
+                const onMove = (ev) => {
+                    const w = Math.max(240, Math.min(620, startW + (ev.clientX - startX)));
+                    this.pageSidebar.style.width = `${w}px`;
+                };
+                const onUp = () => {
+                    document.removeEventListener('mousemove', onMove);
+                    document.removeEventListener('mouseup', onUp);
+                    localStorage.setItem('docscan_sidebar_width', this.pageSidebar.offsetWidth);
+                    if (this.getActivePage()) this.layoutCanvas();
+                };
+                document.addEventListener('mousemove', onMove);
+                document.addEventListener('mouseup', onUp);
+            });
+        }
+
+        if (this.sidebarDividerH && this.folderSection) {
+            this.sidebarDividerH.addEventListener('mousedown', (e) => {
+                e.preventDefault();
+                const startY = e.clientY;
+                const startH = this.folderSection.offsetHeight;
+                const onMove = (ev) => {
+                    const h = Math.max(120, Math.min(this.pageSidebar.offsetHeight - 200, startH + (ev.clientY - startY)));
+                    this.folderSection.style.height = `${h}px`;
+                };
+                const onUp = () => {
+                    document.removeEventListener('mousemove', onMove);
+                    document.removeEventListener('mouseup', onUp);
+                    localStorage.setItem('docscan_folder_height', this.folderSection.offsetHeight);
+                };
+                document.addEventListener('mousemove', onMove);
+                document.addEventListener('mouseup', onUp);
+            });
+        }
     }
 
-    onSlideMove(e) {
-        // comparison slider handler
+    // ======================================================
+    // 🔔 THÔNG BÁO
+    // ======================================================
+
+    setStatus(text, tone = 'info') {
+        if (this.resultInfoText) this.resultInfoText.textContent = text;
+        if (!this.statusIcon) return;
+        const icons = {
+            ok: 'fa-solid fa-circle-check text-success',
+            info: 'fa-solid fa-circle-info text-accent',
+            warn: 'fa-regular fa-image text-warning',
+        };
+        this.statusIcon.className = icons[tone] || icons.info;
+    }
+
+    showToast(msg, ok = true) {
+        this.toastMsg.textContent = msg;
+        this.toastIcon.className = ok
+            ? 'fa-solid fa-circle-check text-success'
+            : 'fa-solid fa-triangle-exclamation text-warning';
+        this.toast.classList.toggle('is-error', !ok);
+        this.toast.classList.add('show');
+        clearTimeout(this.toastTimer);
+        this.toastTimer = setTimeout(() => this.toast.classList.remove('show'), ok ? 3200 : 5000);
+    }
+
+    async confirmUnsavedChanges() {
+        if (!this.activeImageId || !this.dirtyPages.has(this.activeImageId)) {
+            return true;
+        }
+        const activePage = this.getActivePage();
+        if (!activePage) return true;
+
+        return new Promise((resolve) => {
+            const $ = (id) => document.getElementById(id);
+            const modal = $('unsavedModal');
+            const msgEl = $('unsavedModalMessage');
+            const btnSave = $('btnUnsavedSave');
+            const btnDiscard = $('btnUnsavedDiscard');
+            const btnCancel = $('btnUnsavedCancel');
+            const btnClose = $('btnCloseUnsavedModal');
+
+            if (!modal) {
+                resolve(true);
+                return;
+            }
+
+            msgEl.innerHTML = `Trang <strong>"${escapeHtml(activePage.docName || activePage.filename)}"</strong> có những thay đổi chưa lưu.<br><br>Bạn có muốn lưu các chỉnh sửa của trang này vào máy trước khi chuyển không?`;
+            modal.style.display = 'flex';
+
+            const cleanup = async (action) => {
+                modal.style.display = 'none';
+                btnSave.onclick = null;
+                btnDiscard.onclick = null;
+                btnCancel.onclick = null;
+                btnClose.onclick = null;
+
+                if (action === 'save') {
+                    this.showLoading('Đang lưu thay đổi trang…');
+                    try {
+                        await this.saveDirtyPages(true);
+                        this.toastOk(`Đã lưu thay đổi trang "${activePage.docName || activePage.filename}".`);
+                        resolve(true);
+                    } catch (err) {
+                        this.toastErr(err.message);
+                        resolve(false);
+                    } finally {
+                        this.hideLoading();
+                    }
+                } else if (action === 'discard') {
+                    // Revert active page to saved snapshot
+                    if (activePage._savedSnapshot) {
+                        const snap = JSON.parse(JSON.stringify(activePage._savedSnapshot));
+                        activePage.corners = snap.corners;
+                        activePage.rotation = snap.rotation;
+                        activePage.settings = snap.settings;
+                        activePage.docName = snap.docName;
+                    }
+                    this.dirtyPages.delete(activePage.id);
+                    this.updateSaveState();
+                    const card = this.pageListContainer?.querySelector(`.page-thumb-card[data-image-id="${activePage.id}"]`);
+                    card?.classList.remove('unsaved');
+                    resolve(true);
+                } else {
+                    // Cancel navigation
+                    resolve(false);
+                }
+            };
+
+            btnSave.onclick = () => cleanup('save');
+            btnDiscard.onclick = () => cleanup('discard');
+            btnCancel.onclick = () => cleanup('cancel');
+            btnClose.onclick = () => cleanup('cancel');
+        });
+    }
+
+    async askConfirm(title, message, isDanger = true, okText = 'Đồng ý', cancelText = 'Hủy') {
+        return new Promise((resolve) => {
+            const $ = (id) => document.getElementById(id);
+            const modal = $('confirmModal');
+            const titleEl = $('confirmModalTitle');
+            const msgEl = $('confirmModalMessage');
+            const okBtn = $('btnConfirmOk');
+            const cancelBtn = $('btnConfirmCancel');
+            const closeBtn = $('btnCancelConfirmModal');
+
+            if (!modal) {
+                resolve(true);
+                return;
+            }
+
+            titleEl.innerHTML = isDanger
+                ? `<i class="fa-solid fa-triangle-exclamation text-warning"></i> ${escapeHtml(title)}`
+                : `<i class="fa-solid fa-circle-question text-accent"></i> ${escapeHtml(title)}`;
+
+            msgEl.innerHTML = escapeHtml(message).replace(/\n/g, '<br>');
+            okBtn.className = isDanger ? 'btn btn-danger' : 'btn btn-primary';
+            okBtn.textContent = okText;
+            cancelBtn.textContent = cancelText;
+
+            modal.style.display = 'flex';
+
+            const cleanup = (result) => {
+                modal.style.display = 'none';
+                okBtn.onclick = null;
+                cancelBtn.onclick = null;
+                closeBtn.onclick = null;
+                resolve(result);
+            };
+
+            okBtn.onclick = () => cleanup(true);
+            cancelBtn.onclick = () => cleanup(false);
+            closeBtn.onclick = () => cleanup(false);
+        });
+    }
+
+    toastOk(msg) { this.showToast(msg, true); }
+    toastErr(msg) { this.showToast(msg || 'Đã xảy ra lỗi, vui lòng thử lại.', false); }
+
+    showLoading(text) {
+        if (this.loadingText) this.loadingText.textContent = text;
+        if (this.loadingOverlay) this.loadingOverlay.style.display = 'flex';
+    }
+
+    hideLoading() {
+        if (this.loadingOverlay) this.loadingOverlay.style.display = 'none';
     }
 }
 

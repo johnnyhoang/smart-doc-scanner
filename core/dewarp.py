@@ -1,6 +1,6 @@
 import cv2
 import numpy as np
-from typing import Tuple, List, Optional
+from typing import Tuple, Optional
 
 
 def extract_horizontal_flows(gray: np.ndarray, num_bands: int = 10, num_cols: int = 12) -> np.ndarray:

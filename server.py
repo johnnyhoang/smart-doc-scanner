@@ -1,90 +1,181 @@
+"""
+server.py — DocScan Studio Backend (FastAPI).
+
+MÔ HÌNH TRUNG TÂM
+    Một "trang tài liệu" luôn là một bộ ba trên đĩa, định danh bằng (thư_mục, tên_tệp):
+
+        <thư_mục>/_goc/<stem>_goc.jpg  -> ảnh gốc (bất biến)
+        <thư_mục>/<stem>.jpg           -> ảnh đang sửa (dựng lại được từ metadata)
+        <thư_mục>/.docscan_meta.json   -> tình trạng hiện tại của trang
+
+    Không có "trang chỉ nằm trong RAM": ảnh vừa nhập được ghi đủ bộ ba ngay lập tức,
+    nên người dùng bắt đầu từ thư mục nào cũng thấy dữ liệu nhất quán như nhau.
+
+    Mọi thao tác ghi đĩa đi qua core/pagestore.py; mọi kết xuất ảnh đi qua core/renderer.py.
+"""
+
+import errno
 import os
-import io
-import json
-import time
-import shutil
-import datetime
-import uuid
-import base64
+import threading
+from collections import OrderedDict
+from typing import List, Optional, Dict, Any
+
 import cv2
 import numpy as np
-from typing import List, Optional
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query
-from fastapi.responses import JSONResponse, Response, StreamingResponse
+from fastapi.responses import Response
 from fastapi.staticfiles import StaticFiles
-from fastapi.middleware.cors import CORSMiddleware
+from starlette.concurrency import run_in_threadpool
 from pydantic import BaseModel
 
-from core.detector import detect_document_corners, four_point_transform, rotate_image, expand_quad
-from core.enhancer import enhance_document
-from core.dewarp import dewarp_page, ai_auto_unwrinkle, remap_mesh_dense, generate_unwrinkle_mesh
-from core.compressor import compress_image_to_bytes, generate_pdf_from_images
-from core.namer import suggest_document_name, clean_slug_title, get_basic_document_name, ai_ocr_suggest_document_name
+from core import pagestore as ps
+from core import renderer as rd
+from core.detector import detect_document_corners, imread_unicode
+from core.compressor import generate_pdf_from_images
+from core.namer import get_basic_document_name, ai_ocr_suggest_document_name
 
-app = FastAPI(title="DocScan Studio API", version="2.2.0")
+app = FastAPI(title="DocScan Studio API", version="3.0.0")
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# KHÔNG bật CORS. Giao diện được phục vụ cùng nguồn (same-origin) nên không cần,
+# mà mở "allow_origins=*" trên một máy chủ chạy nội bộ sẽ cho phép BẤT KỲ trang web nào
+# người dùng đang mở đọc được toàn bộ tài liệu đã quét của họ qua localhost.
 
-IMAGE_STORE = {}
 
-def format_file_size(size_bytes: int) -> str:
-    if size_bytes < 1024:
-        return f"{size_bytes} B"
-    elif size_bytes < 1024 * 1024:
-        return f"{size_bytes / 1024:.1f} KB"
-    else:
-        return f"{size_bytes / (1024 * 1024):.2f} MB"
+# ==========================================================
+# PHIÊN LÀM VIỆC & BỘ NHỚ ĐỆM ĐIỂM ẢNH
+# ==========================================================
 
-class ProcessRequest(BaseModel):
-    image_id: str
-    corners: Optional[List[List[float]]] = None
-    rotation: int = 0
-    margin_percent: float = 0.02
-    dewarp_enabled: bool = False
-    dewarp_strength: float = 0.8
-    custom_mesh: Optional[List[List[float]]] = None
-    mode: str = "natural"
-    shadow_reduction: float = 0.6
-    sharpness: float = 0.6
-    contrast: float = 0.2
-    brightness: float = 0.0
-    quality: int = 85
-    format: str = "jpeg"
-    normalize_res: bool = True
+SESSION: Dict[str, Optional[str]] = {"root": None}
 
-class PdfExportRequest(BaseModel):
-    image_ids: List[str]
-    doc_name: Optional[str] = "Tai-Lieu-Scan"
-    quality: int = 85
-    normalize_res: bool = True
+# Chặn ảnh quá khổ làm cạn RAM máy người dùng.
+MAX_UPLOAD_BYTES = 80 * 1024 * 1024     # 80 MB cho một tệp ảnh
+MAX_UPLOAD_PIXELS = 80_000_000          # ~80 megapixel sau khi giải mã
 
-class SaveDiskItem(BaseModel):
-    image_id: str
-    doc_name: Optional[str] = None
-    filename: Optional[str] = None
-    corners: Optional[List[List[float]]] = None
-    rotation: Optional[int] = 0
-    settings: Optional[dict] = None
-    history: Optional[dict] = None
+# Chỉ cho phép ghi tệp xuất ra những đường dẫn mà CHÍNH hộp thoại hệ điều hành vừa cấp.
+# Nếu nhận đường dẫn tuỳ ý từ yêu cầu HTTP thì đó là một công cụ ghi tệp bất kỳ trên máy.
+_ALLOWED_SAVE_PATHS: "OrderedDict[str, bool]" = OrderedDict()
+_MAX_ALLOWED_SAVE_PATHS = 32
 
-class SaveToDiskRequest(BaseModel):
-    root_path: str
-    relative_path: Optional[str] = ""
-    items: List[SaveDiskItem]
-    save_original: bool = True
-    save_edited: bool = True
-    save_pdf: bool = True
-    pdf_name: Optional[str] = None
-    quality: int = 85
-    normalize_res: bool = True
 
-class PageMetadata(BaseModel):
+def _remember_save_path(path: str) -> None:
+    key = os.path.normcase(os.path.abspath(path))
+    _ALLOWED_SAVE_PATHS[key] = True
+    while len(_ALLOWED_SAVE_PATHS) > _MAX_ALLOWED_SAVE_PATHS:
+        _ALLOWED_SAVE_PATHS.popitem(last=False)
+
+
+def _checked_save_path(path: Optional[str]) -> Optional[str]:
+    """Trả về đường dẫn nếu nó do hộp thoại cấp; ngược lại từ chối."""
+    if not path:
+        return None
+    key = os.path.normcase(os.path.abspath(path))
+    if key not in _ALLOWED_SAVE_PATHS:
+        raise HTTPException(
+            status_code=400,
+            detail="Đường dẫn lưu không hợp lệ. Vui lòng chọn lại nơi lưu tệp.",
+        )
+    return os.path.abspath(path)
+
+
+def _write_export(path: str, data: bytes, what: str) -> Dict[str, Any]:
+    """Ghi tệp xuất ra và báo lỗi bằng câu tiếng Việt nếu thất bại."""
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "wb") as f:
+            f.write(data)
+        os.replace(tmp, path)
+    except OSError as e:
+        print(f"[export] {path}: {e!r}")
+        raise HTTPException(
+            status_code=507 if e.errno == errno.ENOSPC else 500,
+            detail=f"Không lưu được {what}. {_friendly_write_error(e)}",
+        )
+    return {
+        "success": True,
+        "saved_to": path,
+        "folder": os.path.dirname(path),
+        "filename": os.path.basename(path),
+        "file_size": len(data),
+        "file_size_human": ps.format_file_size(len(data)),
+    }
+
+
+def active_root(explicit: Optional[str] = None) -> str:
+    root = explicit or SESSION.get("root")
+    if not root:
+        raise HTTPException(status_code=400, detail="Chưa chọn thư mục dự án trên máy tính.")
+    if not os.path.isdir(root):
+        raise HTTPException(status_code=400, detail="Thư mục dự án không còn tồn tại trên máy tính.")
+    return root
+
+
+class PixelCache:
+    """
+    Bộ nhớ đệm ảnh gốc đã giải mã, giới hạn số lượng (LRU).
+    Thay cho kho ảnh vô hạn của phiên bản cũ vốn phình to sau mỗi lần quét lại.
+    """
+
+    def __init__(self, max_items: int = 8):
+        self._items: "OrderedDict[str, np.ndarray]" = OrderedDict()
+        self._max = max_items
+        self._lock = threading.RLock()
+
+    def get(self, key: str) -> Optional[np.ndarray]:
+        with self._lock:
+            if key in self._items:
+                self._items.move_to_end(key)
+                return self._items[key]
+            return None
+
+    def put(self, key: str, img: np.ndarray) -> None:
+        with self._lock:
+            self._items[key] = img
+            self._items.move_to_end(key)
+            while len(self._items) > self._max:
+                self._items.popitem(last=False)
+
+    def drop(self, key: str) -> None:
+        with self._lock:
+            self._items.pop(key, None)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._items.clear()
+
+
+ORIGINALS = PixelCache(max_items=8)
+
+
+def load_original(root: str, rel: str, filename: str) -> np.ndarray:
+    """Nạp ảnh gốc theo yêu cầu (lazy), có đệm để thao tác liên tiếp không đọc lại đĩa."""
+    key = ps.make_page_id(root, rel, filename)
+    cached = ORIGINALS.get(key)
+    if cached is not None:
+        return cached
+    img = ps.read_original(root, rel, filename)
+    if img is None:
+        raise HTTPException(status_code=404, detail="Không tìm thấy tệp ảnh của trang này trên máy.")
+    ORIGINALS.put(key, img)
+    return img
+
+
+def invalidate(root: str, rel: str, filename: str) -> None:
+    ORIGINALS.drop(ps.make_page_id(root, rel, filename))
+
+
+def disk_version(root: str, rel: str, filename: str) -> int:
+    try:
+        return int(os.path.getmtime(ps.edited_path(root, rel, filename)))
+    except OSError:
+        return 0
+
+
+# ==========================================================
+# MÔ HÌNH DỮ LIỆU
+# ==========================================================
+
+class PageState(BaseModel):
     filename: str
     doc_name: Optional[str] = None
     corners: Optional[List[List[float]]] = None
@@ -92,838 +183,1134 @@ class PageMetadata(BaseModel):
     settings: Optional[dict] = None
     history: Optional[dict] = None
 
+
+class PageRef(BaseModel):
+    relative_path: Optional[str] = ""
+    filename: str
+    root_path: Optional[str] = None
+
+
+class ProcessRequest(BaseModel):
+    relative_path: Optional[str] = ""
+    filename: str
+    corners: Optional[List[List[float]]] = None
+    rotation: int = 0
+    settings: Optional[dict] = None
+    root_path: Optional[str] = None
+
+
+class AutoDetectRequest(BaseModel):
+    relative_path: Optional[str] = ""
+    filename: str
+    margin_percent: float = 0.0
+    root_path: Optional[str] = None
+
+
+class RenamePageRequest(BaseModel):
+    relative_path: Optional[str] = ""
+    filename: str
+    new_name: str
+    root_path: Optional[str] = None
+
+
+class MovePageRequest(BaseModel):
+    relative_path: Optional[str] = ""
+    filename: str
+    target_relative_path: Optional[str] = ""
+    root_path: Optional[str] = None
+
+
+class SaveFolderRequest(BaseModel):
+    relative_path: Optional[str] = ""
+    pages: List[PageState]
+    # Mặc định TẮT: lưu là ghi ảnh + metadata. Ghép PDF là việc xuất bản riêng,
+    # chỉ chạy khi người dùng chủ động yêu cầu. Ghép PDF phải đọc lại TOÀN BỘ ảnh
+    # trong thư mục nên chi phí tăng theo số trang dù chỉ sửa đúng một trang.
+    save_pdf: bool = False
+    pdf_name: Optional[str] = None
+    root_path: Optional[str] = None
+
+
+class SaveProjectRequest(BaseModel):
+    folders: List[SaveFolderRequest]
+    root_path: Optional[str] = None
+
+
+class CommitPageRequest(BaseModel):
+    relative_path: Optional[str] = ""
+    page: PageState
+    root_path: Optional[str] = None
+
+
 class SaveMetadataRequest(BaseModel):
-    root_path: str
     relative_path: Optional[str] = ""
-    pages: List[PageMetadata]
+    pages: List[PageState]
+    order: Optional[List[str]] = None
+    root_path: Optional[str] = None
 
-class OpenFolderRequest(BaseModel):
-    path: str
-
-class CreateFolderRequest(BaseModel):
-    root_path: str
-    relative_path: Optional[str] = ""
-    folder_name: str
-
-class RenameFolderRequest(BaseModel):
-    root_path: str
-    old_relative_path: Optional[str] = ""
-    new_folder_name: str
-
-class DeleteFolderRequest(BaseModel):
-    root_path: str
-    relative_path: str
-
-class AiSuggestRequest(BaseModel):
-    image_id: str
-    page_index: Optional[int] = 1
 
 class ScanDirectoryRequest(BaseModel):
     path: str
-    load_images: Optional[bool] = True
 
-class ApplyAsOriginalRequest(BaseModel):
-    image_id: str
+
+class FolderRequest(BaseModel):
+    relative_path: Optional[str] = ""
+    folder_name: Optional[str] = None
     root_path: Optional[str] = None
+
+
+class ExportPdfRequest(BaseModel):
     relative_path: Optional[str] = ""
+    filenames: List[str]
     doc_name: Optional[str] = None
+    save_path: Optional[str] = None
+    root_path: Optional[str] = None
 
-class AdoptOriginalRequest(BaseModel):
-    root_path: str
+
+class ExportProjectPdfRequest(BaseModel):
+    doc_name: Optional[str] = None
+    save_path: Optional[str] = None
+    root_path: Optional[str] = None
+
+
+class ExportImagesZipRequest(BaseModel):
+    relative_path: Optional[str] = ""
+    filenames: List[str]
+    zip_name: Optional[str] = None
+    save_path: Optional[str] = None
+    root_path: Optional[str] = None
+
+
+class DownloadSingleRequest(BaseModel):
     relative_path: Optional[str] = ""
     filename: str
-    image_id: str
+    format: str = "jpeg"
+    doc_name: Optional[str] = None
+    save_path: Optional[str] = None
+    root_path: Optional[str] = None
 
-class DeleteDiskFileRequest(BaseModel):
-    root_path: str
+
+class PickSavePathRequest(BaseModel):
+    relative_path: Optional[str] = ""      # thư mục mặc định trong dự án
+    suggested_name: str                    # tên tệp gợi ý (chưa có phần mở rộng)
+    extension: str = "pdf"                 # pdf / zip / jpg / png / webp
+    title: Optional[str] = None            # tiêu đề hộp thoại
+    root_path: Optional[str] = None
+
+
+class CleanupLegacyPdfRequest(BaseModel):
+    confirm: bool = False                  # False = chỉ liệt kê, True = xoá thật
+    root_path: Optional[str] = None
+
+
+class OpenFolderRequest(BaseModel):
+    relative_path: Optional[str] = ""
+    root_path: Optional[str] = None
+
+
+class AiSuggestRequest(BaseModel):
     relative_path: Optional[str] = ""
     filename: str
-    image_id: Optional[str] = None
+    page_index: Optional[int] = 1
+    root_path: Optional[str] = None
 
-class MoveToUnapprovedRequest(BaseModel):
-    root_path: str
-    relative_path: Optional[str] = ""
-    filename: str
-    image_id: str
-    unapproved_folder_name: Optional[str] = "Kho_Chua_Duyet"
 
-def image_to_base64(img_bytes: bytes, mime: str = "image/jpeg") -> str:
-    return f"data:{mime};base64,{base64.b64encode(img_bytes).decode('utf-8')}"
-
-@app.post("/api/upload")
-async def upload_image(file: UploadFile = File(...)):
+def page_payload(root: str, rel: str, filename: str) -> Dict[str, Any]:
+    """Bản ghi trang chuẩn gửi cho giao diện — luôn phản ánh đúng đĩa + metadata."""
+    entry = ps.get_page_meta(root, rel, filename)
+    full = ps.edited_path(root, rel, filename)
     try:
-        contents = await file.read()
-        file_size_bytes = len(contents)
-        nparr = np.frombuffer(contents, np.uint8)
-        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-
-        if img is None:
-            raise HTTPException(status_code=400, detail="Không thể giải mã hình ảnh tải lên.")
-
-        image_id = str(uuid.uuid4())
-        
-        # Fast, 0-cost initial name (No OCR/AI run automatically)
-        primary_name, name_suggestions = get_basic_document_name(
-            filename=file.filename,
-            page_index=len(IMAGE_STORE) + 1
-        )
-
-        IMAGE_STORE[image_id] = {
-            "original": img,
-            "filename": file.filename or "document.jpg",
-            "suggested_name": primary_name,
-            "orig_size_bytes": file_size_bytes,
-            "last_processed": None
-        }
-
-        h, w = img.shape[:2]
-        mp = (w * h) / 1_000_000.0
-        corners, detected = detect_document_corners(img, margin_percent=0.02)
-
-        # Fast thumbnail
-        preview_scale = min(1.0, 1400.0 / max(h, w))
-        preview_w, preview_h = int(w * preview_scale), int(h * preview_scale)
-        preview_img = cv2.resize(img, (preview_w, preview_h), interpolation=cv2.INTER_AREA)
-        _, preview_buf = cv2.imencode(".jpg", preview_img, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
-        preview_b64 = image_to_base64(preview_buf.tobytes())
-
-        return {
-            "image_id": image_id,
-            "filename": file.filename,
-            "suggested_name": primary_name,
-            "name_suggestions": name_suggestions,
-            "width": w,
-            "height": h,
-            "megapixels": f"{mp:.1f} MP",
-            "file_size": file_size_bytes,
-            "file_size_human": format_file_size(file_size_bytes),
-            "corners": corners.tolist(),
-            "detected": detected,
-            "preview_url": preview_b64
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/api/detect")
-async def detect_corners_endpoint(
-    image_id: str = Form(...),
-    margin_percent: float = Form(0.02)
-):
-    if image_id not in IMAGE_STORE:
-        raise HTTPException(status_code=404, detail="Không tìm thấy ảnh.")
-
-    img = IMAGE_STORE[image_id]["original"]
-    corners, detected = detect_document_corners(img, margin_percent=margin_percent)
+        size = os.path.getsize(full)
+    except OSError:
+        size = 0
+    goc = ps.find_original_path(root, rel, filename)
+    width, height = ps.read_image_dimensions(goc or full)
     return {
-        "image_id": image_id,
-        "corners": corners.tolist(),
-        "detected": detected
+        "id": ps.make_page_id(root, rel, filename),
+        "filename": filename,
+        "folderId": ps.folder_id_of(rel),
+        "relativePath": ps.normalize_rel(rel),
+        "doc_name": entry.get("doc_name") or ps.stem_of(filename),
+        "width": width,
+        "height": height,
+        "megapixels": f"{(width * height) / 1_000_000.0:.1f} MP",
+        "file_size": size,
+        "file_size_human": ps.format_file_size(size),
+        "corners": entry.get("corners"),
+        "rotation": entry.get("rotation", 0),
+        "settings": ps.merged_settings(entry.get("settings")),
+        "history": entry.get("history") or {"undo": [], "redo": []},
+        "has_raw_original": goc is not None,
+        "is_stale": ps.is_stale(entry),
+        "version": disk_version(root, rel, filename),
     }
 
-@app.post("/api/process")
-async def process_document(req: ProcessRequest):
-    if req.image_id not in IMAGE_STORE:
-        raise HTTPException(status_code=404, detail="Không tìm thấy ảnh.")
 
-    orig_entry = IMAGE_STORE[req.image_id]
-    orig = orig_entry["original"]
-    orig_bytes = orig_entry.get("orig_size_bytes", 1)
-
-    # 1. Perspective Transform with outpainting
-    if req.corners and len(req.corners) == 4:
-        pts = np.array(req.corners, dtype=np.float32)
-    else:
-        pts, _ = detect_document_corners(orig, margin_percent=req.margin_percent)
-
-    warped = four_point_transform(orig, pts)
-
-    # 2. Rotation
-    if req.rotation != 0:
-        warped = rotate_image(warped, req.rotation)
-
-    # 3. Optional Dewarping
-    if req.dewarp_enabled and req.dewarp_strength > 0.05:
-        warped, _, _ = ai_auto_unwrinkle(warped, strength=req.dewarp_strength)
-
-    # 4. Color & Crease Enhancement
-    enhanced = enhance_document(
-        warped,
-        mode=req.mode,
-        shadow_reduction=req.shadow_reduction,
-        sharpness=req.sharpness,
-        contrast=req.contrast,
-        brightness=req.brightness
-    )
-
-    IMAGE_STORE[req.image_id]["last_processed"] = enhanced
-
-    # 5. Compress & Normalize
-    data_bytes, size_bytes, (out_w, out_h) = compress_image_to_bytes(
-        enhanced,
-        format=req.format,
-        quality=req.quality,
-        normalize_res=req.normalize_res
-    )
-
-    mime_type = "image/png" if req.format.lower() == "png" else (
-        "image/webp" if req.format.lower() == "webp" else "image/jpeg"
-    )
-
-    b64_str = image_to_base64(data_bytes, mime_type)
-    saving_ratio = max(0, int((1.0 - (size_bytes / float(max(1, orig_bytes)))) * 100))
-
-    return {
-        "image_id": req.image_id,
-        "width": out_w,
-        "height": out_h,
-        "megapixels": f"{(out_w * out_h)/1_000_000.0:.1f} MP",
-        "file_size": size_bytes,
-        "file_size_human": format_file_size(size_bytes),
-        "saving_ratio": f"{saving_ratio}%",
-        "image_data": b64_str
-    }
-
-@app.post("/api/export-pdf")
-async def export_pdf(req: PdfExportRequest):
-    if not req.image_ids:
-        raise HTTPException(status_code=400, detail="Danh sách trang trống.")
-
-    images_to_export = []
-    for iid in req.image_ids:
-        if iid in IMAGE_STORE:
-            img = IMAGE_STORE[iid].get("last_processed")
-            if img is None:
-                img = IMAGE_STORE[iid]["original"]
-            images_to_export.append(img)
-
-    if not images_to_export:
-        raise HTTPException(status_code=400, detail="Không có trang nào hợp lệ để xuất PDF.")
-
-    pdf_bytes = generate_pdf_from_images(
-        images_to_export,
-        quality=req.quality,
-        normalize_res=req.normalize_res
-    )
-
-    clean_name = clean_slug_title(req.doc_name or "Tai-Lieu-Scan")
-    return Response(
-        content=pdf_bytes,
-        media_type="application/pdf",
-        headers={"Content-Disposition": f"attachment; filename={clean_name}.pdf"}
-    )
-
-@app.get("/api/download/{image_id}")
-async def download_image(
-    image_id: str, 
-    format: str = "jpeg", 
-    quality: int = 90,
-    doc_name: Optional[str] = None
-):
-    if image_id not in IMAGE_STORE:
-        raise HTTPException(status_code=404, detail="Không tìm thấy ảnh.")
-
-    entry = IMAGE_STORE[image_id]
-    img = entry.get("last_processed")
-    if img is None:
-        img = entry["original"]
-
-    data, _, _ = compress_image_to_bytes(img, format=format, quality=quality, normalize_res=True)
-    ext = "jpg" if format.lower() == "jpeg" else format.lower()
-
-    file_title = clean_slug_title(doc_name or entry.get("suggested_name") or "scan")
-
-    return Response(
-        content=data,
-        media_type=f"image/{format.lower()}",
-        headers={"Content-Disposition": f"attachment; filename={file_title}.{ext}"}
-    )
+# ==========================================================
+# QUÉT & CHỌN THƯ MỤC DỰ ÁN
+# ==========================================================
 
 @app.post("/api/pick-directory")
 async def pick_directory():
+    """Mở hộp thoại chọn thư mục gốc của hệ điều hành."""
     try:
         import tkinter as tk
         from tkinter import filedialog
-        root = tk.Tk()
-        root.withdraw()
-        root.attributes("-topmost", True)
-        selected_path = filedialog.askdirectory(title="Chọn Thư Mục Root cho Dự Án")
-        root.destroy()
-        if selected_path:
-            norm = os.path.normpath(selected_path)
-            return {"success": True, "path": norm}
+        win = tk.Tk()
+        win.withdraw()
+        win.attributes("-topmost", True)
+        selected = filedialog.askdirectory(title="Chọn thư mục dự án cho DocScan Studio")
+        win.destroy()
+        if selected:
+            return {"success": True, "path": os.path.normpath(selected)}
         return {"success": False, "path": ""}
     except Exception as e:
-        return {"success": False, "error": str(e)}
+        print(f"[pick-directory] {e}")
+        raise HTTPException(status_code=500, detail="Không mở được hộp thoại chọn thư mục trên máy tính.")
 
-@app.post("/api/save-to-disk")
-async def save_to_disk(req: SaveToDiskRequest):
-    if not req.root_path:
-        raise HTTPException(status_code=400, detail="Chưa chỉ định thư mục gốc (Root path).")
-    
-    clean_rel = req.relative_path.strip("/\\") if req.relative_path else ""
-    target_dir = os.path.normpath(os.path.join(req.root_path, clean_rel))
-    os.makedirs(target_dir, exist_ok=True)
-    
-    saved_files = []
-    images_for_pdf = []
-    
-    for idx, item in enumerate(req.items):
-        if item.image_id in IMAGE_STORE:
-            entry = IMAGE_STORE[item.image_id]
-            clean_name = clean_slug_title(item.doc_name or f"trang_{idx+1}")
-            
-            # 1. Save original raw image into _goc subfolder
-            if req.save_original:
-                orig_dir = os.path.join(target_dir, "_goc")
-                os.makedirs(orig_dir, exist_ok=True)
-                orig_img = entry["original"]
-                orig_filename = f"{clean_name}_goc.jpg"
-                orig_filepath = os.path.join(orig_dir, orig_filename)
-                cv2.imwrite(orig_filepath, orig_img, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
-                saved_files.append(f"_goc/{orig_filename}")
-            
-            # 2. Save edited & enhanced image into main folder
-            edited_img = entry.get("last_processed")
-            if edited_img is None:
-                edited_img = entry["original"]
-            
-            if req.save_edited:
-                edited_bytes, _, _ = compress_image_to_bytes(
-                    edited_img,
-                    format="jpeg",
-                    quality=req.quality,
-                    normalize_res=req.normalize_res
-                )
-                edited_filename = f"{clean_name}.jpg"
-                edited_filepath = os.path.join(target_dir, edited_filename)
-                with open(edited_filepath, "wb") as f:
-                    f.write(edited_bytes)
-                saved_files.append(edited_filename)
-            
-            images_for_pdf.append(edited_img)
-    
-    # 3. Save PDF if requested
-    if req.save_pdf and images_for_pdf:
-        pdf_title = clean_slug_title(req.pdf_name or "Tai-Lieu")
-        pdf_filename = f"{pdf_title}.pdf"
-        pdf_filepath = os.path.join(target_dir, pdf_filename)
-        pdf_bytes = generate_pdf_from_images(
-            images_for_pdf,
-            quality=req.quality,
-            normalize_res=req.normalize_res
+
+@app.post("/api/pick-save-path")
+async def pick_save_path(req: PickSavePathRequest):
+    """
+    Mở hộp thoại "Lưu tệp" của hệ điều hành để người dùng tự chọn nơi lưu.
+    Thư mục mặc định là thư mục tài liệu đang mở — nơi người dùng mong muốn nhất,
+    thay vì lặng lẽ ném tệp vào Downloads của trình duyệt rồi phải đi tìm.
+    """
+    root = active_root(req.root_path)
+    try:
+        initial_dir = ps.folder_dir(root, req.relative_path)
+    except ValueError:
+        initial_dir = root
+    if not os.path.isdir(initial_dir):
+        initial_dir = root
+
+    ext = (req.extension or "pdf").lower().lstrip(".")
+    labels = {
+        "pdf": ("Tệp PDF", "*.pdf"),
+        "zip": ("Tệp nén ZIP", "*.zip"),
+        "jpg": ("Ảnh JPG", "*.jpg"),
+        "png": ("Ảnh PNG", "*.png"),
+        "webp": ("Ảnh WebP", "*.webp"),
+    }
+    label, pattern = labels.get(ext, (f"Tệp {ext.upper()}", f"*.{ext}"))
+    suggested = f"{ps.sanitize_component(req.suggested_name) or 'Tai-Lieu'}.{ext}"
+
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+        win = tk.Tk()
+        win.withdraw()
+        win.attributes("-topmost", True)
+        chosen = filedialog.asksaveasfilename(
+            title=req.title or f"Chọn nơi lưu {label}",
+            initialdir=initial_dir,
+            initialfile=suggested,
+            defaultextension=f".{ext}",
+            filetypes=[(label, pattern), ("Tất cả tệp", "*.*")],
         )
-        with open(pdf_filepath, "wb") as f:
-            f.write(pdf_bytes)
-        saved_files.append(pdf_filename)
-        
-    # 4. Save metadata .docscan_meta.json
-    try:
-        update_folder_metadata(target_dir, [item.dict() for item in req.items])
-    except Exception as me:
-        print(f"Error updating metadata in save_to_disk: {me}")
-
-    return {
-        "success": True,
-        "target_dir": target_dir,
-        "saved_files": saved_files,
-        "count": len(saved_files)
-    }
-
-@app.post("/api/open-folder")
-async def open_folder_in_explorer(req: OpenFolderRequest):
-    if os.path.exists(req.path):
-        os.startfile(os.path.normpath(req.path))
-        return {"success": True}
-    raise HTTPException(status_code=404, detail="Thư mục không tồn tại trên máy.")
-
-@app.post("/api/ai-suggest-name")
-async def api_ai_suggest_name(req: AiSuggestRequest):
-    if req.image_id not in IMAGE_STORE:
-        raise HTTPException(status_code=404, detail="Không tìm thấy tài liệu.")
-    
-    entry = IMAGE_STORE[req.image_id]
-    img = entry.get("last_processed")
-    if img is None:
-        img = entry["original"]
-        
-    primary_name, suggestions = ai_ocr_suggest_document_name(
-        image=img,
-        filename=entry.get("filename"),
-        page_index=req.page_index or 1
-    )
-    entry["suggested_name"] = primary_name
-    return {
-        "success": True,
-        "primary_name": primary_name,
-        "suggestions": suggestions
-    }
-
-def update_folder_metadata(folder_path: str, pages_data: list):
-    try:
-        meta_path = os.path.join(folder_path, ".docscan_meta.json")
-        existing = {}
-        if os.path.exists(meta_path):
-            try:
-                with open(meta_path, "r", encoding="utf-8") as f:
-                    existing = json.load(f)
-            except Exception:
-                existing = {}
-        
-        pages_map = existing.get("pages", {})
-        for p in pages_data:
-            key = p.get("filename") or p.get("doc_name")
-            if key:
-                pages_map[key] = {
-                    "doc_name": p.get("doc_name"),
-                    "filename": p.get("filename") or key,
-                    "corners": p.get("corners"),
-                    "rotation": p.get("rotation", 0),
-                    "settings": p.get("settings", {}),
-                    "history": p.get("history", {})
-                }
-        
-        meta_obj = {
-            "version": "1.0",
-            "updated_at": datetime.datetime.now().isoformat(),
-            "pages": pages_map
-        }
-        with open(meta_path, "w", encoding="utf-8") as f:
-            json.dump(meta_obj, f, ensure_ascii=False, indent=2)
+        win.destroy()
     except Exception as e:
-        print(f"Error saving metadata in {folder_path}: {e}")
+        print(f"[pick-save-path] {e}")
+        raise HTTPException(status_code=500, detail="Không mở được hộp thoại chọn nơi lưu tệp.")
 
-@app.post("/api/create-folder")
-async def api_create_folder(req: CreateFolderRequest):
-    if not req.root_path or not os.path.exists(req.root_path):
-        raise HTTPException(status_code=400, detail="Thư mục gốc không tồn tại.")
-    
-    clean_name = req.folder_name.strip()
-    if not clean_name:
-        raise HTTPException(status_code=400, detail="Tên thư mục không được để trống.")
-        
-    for c in r'<>:"/\|?*':
-        clean_name = clean_name.replace(c, '_')
-        
-    parent_rel = (req.relative_path or "").replace("/", "\\").strip("\\")
-    parent_dir = os.path.normpath(os.path.join(req.root_path, parent_rel)) if parent_rel else req.root_path
-    
-    target_dir = os.path.join(parent_dir, clean_name)
-    try:
-        os.makedirs(target_dir, exist_ok=True)
-        rel = os.path.relpath(target_dir, req.root_path)
-        fid = 'folder_' + rel.replace('\\', '_').replace('/', '_')
-        return {
-            "success": True,
-            "folder_id": fid,
-            "folder_name": clean_name,
-            "relative_path": rel,
-            "target_dir": target_dir
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Không thể tạo thư mục trên máy tính: {str(e)}")
+    if not chosen:
+        return {"success": False, "path": ""}
 
-@app.post("/api/rename-folder")
-async def api_rename_folder(req: RenameFolderRequest):
-    if not req.root_path or not os.path.exists(req.root_path):
-        raise HTTPException(status_code=400, detail="Thư mục gốc không tồn tại.")
-    
-    clean_name = req.new_folder_name.strip()
-    if not clean_name:
-        raise HTTPException(status_code=400, detail="Tên thư mục không được để trống.")
-    for c in r'<>:"/\|?*':
-        clean_name = clean_name.replace(c, '_')
-        
-    old_rel = (req.old_relative_path or "").replace("/", "\\").strip("\\")
-    if not old_rel:
-        raise HTTPException(status_code=400, detail="Không thể đổi tên thư mục gốc.")
-        
-    old_dir = os.path.normpath(os.path.join(req.root_path, old_rel))
-    if not os.path.exists(old_dir):
-        raise HTTPException(status_code=404, detail="Thư mục cũ không tồn tại.")
-        
-    parent_dir = os.path.dirname(old_dir)
-    new_dir = os.path.join(parent_dir, clean_name)
-    
-    try:
-        os.rename(old_dir, new_dir)
-        rel = os.path.relpath(new_dir, req.root_path)
-        fid = 'folder_' + rel.replace('\\', '_').replace('/', '_')
-        return {
-            "success": True,
-            "folder_id": fid,
-            "folder_name": clean_name,
-            "relative_path": rel
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Không thể đổi tên thư mục: {str(e)}")
+    path = os.path.abspath(os.path.normpath(chosen))
+    if not path.lower().endswith(f".{ext}"):
+        path = f"{path}.{ext}"
+    _remember_save_path(path)
+    return {"success": True, "path": path, "folder": os.path.dirname(path),
+            "filename": os.path.basename(path)}
 
-@app.post("/api/delete-folder")
-async def api_delete_folder(req: DeleteFolderRequest):
-    if not req.root_path or not os.path.exists(req.root_path):
-        raise HTTPException(status_code=400, detail="Thư mục gốc không tồn tại.")
-    
-    rel = (req.relative_path or "").replace("/", "\\").strip("\\")
-    if not rel:
-        raise HTTPException(status_code=400, detail="Không thể xóa thư mục gốc.")
-        
-    target_dir = os.path.normpath(os.path.join(req.root_path, rel))
-    if os.path.exists(target_dir):
-        try:
-            import shutil
-            shutil.rmtree(target_dir)
-            return {"success": True}
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Không thể xóa thư mục: {str(e)}")
-    return {"success": True}
-
-@app.post("/api/save-metadata")
-async def save_metadata(req: SaveMetadataRequest):
-    if not req.root_path or not os.path.exists(req.root_path):
-        raise HTTPException(status_code=400, detail="Thư mục gốc không tồn tại.")
-    
-    clean_rel = (req.relative_path or "").replace("/", "\\").strip("\\")
-    target_dir = os.path.normpath(os.path.join(req.root_path, clean_rel)) if clean_rel else req.root_path
-    os.makedirs(target_dir, exist_ok=True)
-    
-    update_folder_metadata(target_dir, [p.dict() for p in req.pages])
-    return {"success": True}
-
-@app.post("/api/adopt-as-original")
-async def api_adopt_as_original(req: AdoptOriginalRequest):
-    if not req.root_path or not os.path.exists(req.root_path):
-        raise HTTPException(status_code=400, detail="Thư mục gốc không tồn tại.")
-    
-    clean_rel = (req.relative_path or "").replace("/", "\\").strip("\\")
-    target_dir = os.path.normpath(os.path.join(req.root_path, clean_rel)) if clean_rel else req.root_path
-    
-    img_path = os.path.join(target_dir, req.filename)
-    if not os.path.exists(img_path):
-        raise HTTPException(status_code=404, detail="Không tìm thấy file ảnh.")
-    
-    stem = os.path.splitext(req.filename)[0]
-    goc_dir = os.path.join(target_dir, "_goc")
-    os.makedirs(goc_dir, exist_ok=True)
-    goc_path = os.path.join(goc_dir, f"{stem}_goc.jpg")
-    
-    # Read image and save into _goc
-    img = cv2.imread(img_path)
-    if img is None:
-        raise HTTPException(status_code=400, detail="Không thể đọc file ảnh.")
-    
-    cv2.imwrite(goc_path, img)
-    
-    # Update in-memory IMAGE_STORE
-    if req.image_id in IMAGE_STORE:
-        IMAGE_STORE[req.image_id]["original"] = img
-        
-    return {
-        "success": True,
-        "filename": req.filename,
-        "goc_path": goc_path,
-        "has_raw_original": True
-    }
-
-@app.post("/api/delete-disk-file")
-async def api_delete_disk_file(req: DeleteDiskFileRequest):
-    if not req.root_path or not os.path.exists(req.root_path):
-        raise HTTPException(status_code=400, detail="Thư mục gốc không tồn tại.")
-    
-    clean_rel = (req.relative_path or "").replace("/", "\\").strip("\\")
-    target_dir = os.path.normpath(os.path.join(req.root_path, clean_rel)) if clean_rel else req.root_path
-    
-    stem = os.path.splitext(req.filename)[0]
-    img_path = os.path.join(target_dir, req.filename)
-    goc_path = os.path.join(target_dir, "_goc", f"{stem}_goc.jpg")
-    
-    deleted_any = False
-    if os.path.exists(img_path):
-        try:
-            os.remove(img_path)
-            deleted_any = True
-        except Exception as e:
-            print(f"Error removing {img_path}: {e}")
-            
-    if os.path.exists(goc_path):
-        try:
-            os.remove(goc_path)
-            deleted_any = True
-        except Exception as e:
-            print(f"Error removing {goc_path}: {e}")
-            
-    if req.image_id and req.image_id in IMAGE_STORE:
-        IMAGE_STORE.pop(req.image_id, None)
-        
-    # Clean up from metadata
-    meta_path = os.path.join(target_dir, ".docscan_meta.json")
-    if os.path.exists(meta_path):
-        try:
-            with open(meta_path, "r", encoding="utf-8") as f:
-                meta = json.load(f)
-            pages = meta.get("pages", {})
-            pages.pop(req.filename, None)
-            pages.pop(stem, None)
-            meta["pages"] = pages
-            with open(meta_path, "w", encoding="utf-8") as f:
-                json.dump(meta, f, ensure_ascii=False, indent=2)
-        except Exception:
-            pass
-            
-    return {"success": True, "deleted": deleted_any}
-
-@app.post("/api/move-to-unapproved")
-async def api_move_to_unapproved(req: MoveToUnapprovedRequest):
-    if not req.root_path or not os.path.exists(req.root_path):
-        raise HTTPException(status_code=400, detail="Thư mục gốc không tồn tại.")
-    
-    clean_rel = (req.relative_path or "").replace("/", "\\").strip("\\")
-    source_dir = os.path.normpath(os.path.join(req.root_path, clean_rel)) if clean_rel else req.root_path
-    source_file = os.path.join(source_dir, req.filename)
-    
-    if not os.path.exists(source_file):
-        raise HTTPException(status_code=404, detail="Không tìm thấy file ảnh nguồn.")
-        
-    folder_dir_name = req.unapproved_folder_name or "Kho_Chua_Duyet"
-    target_dir = os.path.normpath(os.path.join(req.root_path, folder_dir_name))
-    os.makedirs(target_dir, exist_ok=True)
-    
-    target_file = os.path.join(target_dir, req.filename)
-    if os.path.abspath(source_file) != os.path.abspath(target_file):
-        if os.path.exists(target_file):
-            stem, ext = os.path.splitext(req.filename)
-            target_file = os.path.join(target_dir, f"{stem}_{int(time.time())}{ext}")
-        import shutil
-        shutil.move(source_file, target_file)
-        
-    new_filename = os.path.basename(target_file)
-    target_fid = 'folder_' + folder_dir_name.replace('\\', '_').replace('/', '_')
-    
-    # Also clean up from old folder's metadata if present
-    meta_path = os.path.join(source_dir, ".docscan_meta.json")
-    if os.path.exists(meta_path):
-        try:
-            with open(meta_path, "r", encoding="utf-8") as f:
-                meta = json.load(f)
-            pages = meta.get("pages", {})
-            pages.pop(req.filename, None)
-            meta["pages"] = pages
-            with open(meta_path, "w", encoding="utf-8") as f:
-                json.dump(meta, f, ensure_ascii=False, indent=2)
-        except Exception:
-            pass
-            
-    return {
-        "success": True,
-        "folder_id": target_fid,
-        "folder_name": "Kho ảnh chưa duyệt",
-        "relative_path": folder_dir_name,
-        "filename": new_filename
-    }
 
 @app.post("/api/scan-directory")
-async def scan_directory(req: ScanDirectoryRequest):
+def scan_directory(req: ScanDirectoryRequest):
+    """
+    Quét cây thư mục và trả về danh sách trang ở dạng NHẸ (không kèm điểm ảnh).
+    Giao diện tải ảnh xem trước theo yêu cầu qua /api/image nên mở dự án lớn vẫn tức thì.
+    """
     if not req.path:
         raise HTTPException(status_code=400, detail="Chưa chỉ định đường dẫn thư mục.")
-    
-    root_path = os.path.normpath(req.path)
-    if not os.path.exists(root_path):
+
+    root = os.path.abspath(os.path.normpath(req.path))
+    if not os.path.isdir(root):
         try:
-            os.makedirs(root_path, exist_ok=True)
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Không thể truy cập thư mục: {str(e)}")
+            os.makedirs(root, exist_ok=True)
+        except OSError as e:
+            print(f"[scan-directory] {e}")
+            raise HTTPException(status_code=400, detail="Không thể tạo hoặc truy cập thư mục này trên máy tính.")
 
-    root_name = os.path.basename(root_path) or root_path
-    IGNORE_DIRS = {'__pycache__', '.git', '.gemini', 'node_modules', 'venv', '.venv', '.idea', '.vscode', 'tmp', 'temp', '_goc', '.goc'}
-    
-    scanned_folders = []
-    loaded_pages = []
+    SESSION["root"] = root
+    ORIGINALS.clear()
 
-    for current_root, dirs, files in os.walk(root_path):
-        dirs[:] = [d for d in sorted(dirs) if d not in IGNORE_DIRS and not d.startswith('.')]
-        
-        rel = os.path.relpath(current_root, root_path)
-        if rel == '.':
-            rel = ''
-            
-        fid = 'folder_root' if rel == '' else 'folder_' + rel.replace('\\', '_').replace('/', '_')
-        
-        parent_rel = os.path.dirname(rel)
-        if parent_rel == '.':
-            parent_rel = ''
-        parent_id = None if rel == '' else ('folder_root' if parent_rel == '' else 'folder_' + parent_rel.replace('\\', '_').replace('/', '_'))
-        
-        raw_folder_name = os.path.basename(current_root) if rel != '' else root_name
-        is_unapproved = (rel == 'Kho_Chua_Duyet' or raw_folder_name == 'Kho_Chua_Duyet')
-        folder_name = "Kho ảnh chưa duyệt" if is_unapproved else raw_folder_name
-        img_filenames = [f for f in sorted(files) if f.lower().endswith(('.jpg', '.jpeg', '.png', '.webp', '.bmp'))]
-        
-        # Check if folder has persistent metadata
-        meta_path = os.path.join(current_root, ".docscan_meta.json")
-        meta_data = {}
-        if os.path.exists(meta_path):
-            try:
-                with open(meta_path, "r", encoding="utf-8") as mf:
-                    meta_data = json.load(mf).get("pages", {})
-            except Exception:
-                meta_data = {}
-
-        folder_image_ids = []
-        if req.load_images:
-            for fname in img_filenames:
-                full_img_path = os.path.join(current_root, fname)
-                try:
-                    img_id = str(uuid.uuid4())
-                    stem = os.path.splitext(fname)[0]
-                    
-                    # Look up persistent metadata
-                    page_meta = meta_data.get(fname) or meta_data.get(stem) or meta_data.get(f"{stem}.jpg") or {}
-                    
-                    # Check if there is a raw original in _goc subfolder
-                    orig_subfolder_path = os.path.join(current_root, "_goc", f"{stem}_goc.jpg")
-                    
-                    if os.path.exists(orig_subfolder_path):
-                        raw_orig_img = cv2.imread(orig_subfolder_path)
-                        processed_img = cv2.imread(full_img_path)
-                    else:
-                        raw_orig_img = cv2.imread(full_img_path)
-                        processed_img = None
-
-                    if raw_orig_img is not None:
-                        h, w = raw_orig_img.shape[:2]
-                        mp = (w * h) / 1_000_000.0
-                        fsize = os.path.getsize(full_img_path)
-                        
-                        # Restore corners from metadata or auto-detect
-                        if page_meta.get("corners") and len(page_meta["corners"]) == 4:
-                            corners = np.array(page_meta["corners"], dtype=np.float32)
-                            detected = True
-                        else:
-                            corners, detected = detect_document_corners(raw_orig_img, margin_percent=0.02)
-                        
-                        preview_scale = min(1.0, 1400.0 / max(h, w))
-                        preview_w, preview_h = int(w * preview_scale), int(h * preview_scale)
-                        preview_img = cv2.resize(raw_orig_img, (preview_w, preview_h), interpolation=cv2.INTER_AREA)
-                        _, preview_buf = cv2.imencode(".jpg", preview_img, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
-                        preview_b64 = image_to_base64(preview_buf.tobytes())
-                        
-                        # Processed preview if available
-                        proc_b64 = None
-                        if processed_img is not None:
-                            _, proc_buf = cv2.imencode(".jpg", processed_img, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
-                            proc_b64 = image_to_base64(proc_buf.tobytes())
-
-                        primary_name, name_suggestions = get_basic_document_name(filename=fname, page_index=len(folder_image_ids) + 1)
-                        doc_name = page_meta.get("doc_name") or stem or primary_name
-                        
-                        IMAGE_STORE[img_id] = {
-                            "original": raw_orig_img,
-                            "filename": fname,
-                            "suggested_name": doc_name,
-                            "orig_size_bytes": fsize,
-                            "last_processed": processed_img
-                        }
-                        
-                        folder_image_ids.append(img_id)
-                        loaded_pages.append({
-                            "id": img_id,
-                            "filename": fname,
-                            "suggested_name": doc_name,
-                            "name_suggestions": name_suggestions,
-                            "width": w,
-                            "height": h,
-                            "megapixels": f"{mp:.1f} MP",
-                            "file_size": fsize,
-                            "file_size_human": format_file_size(fsize),
-                            "corners": corners.tolist(),
-                            "detected": detected,
-                            "preview_url": preview_b64,
-                            "processed_url": proc_b64,
-                            "folderId": fid,
-                            "rotation": page_meta.get("rotation", 0),
-                            "settings": page_meta.get("settings"),
-                            "history": page_meta.get("history"),
-                            "has_raw_original": os.path.exists(orig_subfolder_path)
-                        })
-                except Exception as ex:
-                    print(f"Error loading {full_img_path}: {ex}")
-
-        scanned_folders.append({
-            "id": fid,
-            "name": folder_name,
-            "parentId": parent_id,
-            "relativePath": rel,
-            "imageIds": folder_image_ids,
-            "isExpanded": True
-        })
+    try:
+        folders, pages = ps.scan_tree(root)
+    except OSError as e:
+        print(f"[scan-directory] {e}")
+        raise HTTPException(status_code=500, detail="Không đọc được nội dung thư mục. Vui lòng kiểm tra quyền truy cập ổ đĩa.")
 
     return {
         "success": True,
-        "root_path": root_path,
-        "root_name": root_name,
-        "folders": scanned_folders,
-        "pages": loaded_pages,
-        "total_folders": len(scanned_folders),
-        "total_images": len(loaded_pages)
+        "root_path": root,
+        "root_name": os.path.basename(root) or root,
+        "folders": folders,
+        "pages": pages,
+        "total_folders": len(folders),
+        "total_images": len(pages),
     }
+
+
+@app.post("/api/open-folder")
+def open_folder(req: OpenFolderRequest):
+    root = active_root(req.root_path)
+    try:
+        target = ps.folder_dir(root, req.relative_path)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    if not os.path.isdir(target):
+        raise HTTPException(status_code=404, detail="Thư mục không tồn tại trên máy.")
+    os.startfile(target)
+    return {"success": True}
+
+
+# ==========================================================
+# PHỤC VỤ ẢNH THEO YÊU CẦU
+# ==========================================================
+
+@app.get("/api/image")
+def get_image(
+    file: str = Query(...),
+    rel: str = Query(""),
+    kind: str = Query("edited"),
+    v: Optional[str] = Query(None),
+):
+    """
+    Trả về tệp ảnh của một trang.
+      kind=original -> ảnh gốc trong _goc/
+      kind=edited   -> ảnh đang sửa
+      kind=thumb    -> ảnh nhỏ cho danh sách trang
+    Tham số `v` chỉ dùng để phá bộ đệm trình duyệt khi tệp thay đổi.
+    """
+    root = active_root()
+    try:
+        if kind in ("original", "thumb_original"):
+            path = ps.find_original_path(root, rel, file) or ps.edited_path(root, rel, file)
+        else:
+            path = ps.edited_path(root, rel, file)
+            if not os.path.exists(path):
+                path = ps.find_original_path(root, rel, file) or path
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="Không tìm thấy tệp ảnh trên máy.")
+
+    headers = {"Cache-Control": "private, max-age=31536000" if v else "no-cache"}
+
+    if kind.startswith("thumb"):
+        img = imread_unicode(path)
+        if img is None:
+            raise HTTPException(status_code=400, detail="Không đọc được tệp ảnh.")
+        return Response(content=rd.make_thumbnail(img), media_type="image/jpeg", headers=headers)
+
+    if kind == "original":
+        img = imread_unicode(path)
+        if img is None:
+            raise HTTPException(status_code=400, detail="Không đọc được tệp ảnh.")
+        view, _ = rd.scale_to_max(img, rd.ORIGINAL_VIEW_MAX_DIM)
+        return Response(content=rd.encode_preview(view, quality=90), media_type="image/jpeg", headers=headers)
+
+    with open(path, "rb") as f:
+        data = f.read()
+    ext = os.path.splitext(path)[1].lower()
+    mime = {".png": "image/png", ".webp": "image/webp", ".bmp": "image/bmp"}.get(ext, "image/jpeg")
+    return Response(content=data, media_type=mime, headers=headers)
+
+
+# ==========================================================
+# NHẬP ẢNH — GHI NGAY ĐỦ BỘ BA XUỐNG ĐĨA
+# ==========================================================
+
+@app.post("/api/import")
+async def import_image(
+    file: UploadFile = File(...),
+    relative_path: str = Form(""),
+    root_path: Optional[str] = Form(None),
+):
+    """
+    Nhập một ảnh vào thư mục đang mở và lưu ngay:
+        _goc/<stem>_goc.jpg  +  <stem>.jpg  +  .docscan_meta.json
+    Nhờ vậy dữ liệu an toàn kể cả khi tắt ứng dụng đột ngột.
+    """
+    root = active_root(root_path)
+    rel = ps.normalize_rel(relative_path)
+
+    contents = await file.read()
+    if len(contents) > MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Ảnh quá lớn ({ps.format_file_size(len(contents))}). "
+                   f"Giới hạn là {ps.format_file_size(MAX_UPLOAD_BYTES)} cho mỗi tệp.",
+        )
+
+    # Phần còn lại nặng CPU -> đẩy sang luồng riêng để không đóng băng các yêu cầu khác.
+    return await run_in_threadpool(_import_decoded, root, rel, file.filename, contents)
+
+
+def _import_decoded(root: str, rel: str, source_name: Optional[str], contents: bytes) -> Dict[str, Any]:
+    img = cv2.imdecode(np.frombuffer(contents, np.uint8), cv2.IMREAD_COLOR)
+    if img is None:
+        raise HTTPException(status_code=400, detail="Tệp không phải là ảnh hợp lệ hoặc đã hỏng.")
+    if img.shape[0] * img.shape[1] > MAX_UPLOAD_PIXELS:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Ảnh có độ phân giải quá lớn ({img.shape[1]} × {img.shape[0]} px). "
+                   "Vui lòng giảm kích thước trước khi thêm vào.",
+        )
+
+    base_name, name_suggestions = get_basic_document_name(
+        filename=source_name, page_index=len(ps.list_page_files(ps.folder_dir(root, rel))) + 1
+    )
+    source_stem = ps.stem_of(source_name or "") or base_name
+    stem = ps.unique_stem(root, rel, source_stem)
+    filename = ps.edited_filename(stem)
+
+    ps.write_original(root, rel, filename, img)
+
+    corners, detected = detect_document_corners(img, margin_percent=0.0)
+    settings = ps.default_settings()
+    rendered = rd.render_page(img, corners.tolist(), 0, settings)
+    data, _size, _dim = rd.encode_final(rendered, settings)
+    ps.write_edited_bytes(root, rel, filename, data)
+
+    ps.patch_page_meta(root, rel, filename, {
+        "doc_name": stem,
+        "corners": corners.tolist(),
+        "rotation": 0,
+        "settings": settings,
+        "history": {"undo": [], "redo": []},
+        "detected": bool(detected),
+        "committed_fingerprint": ps.state_fingerprint(corners.tolist(), 0, settings),
+    })
+
+    invalidate(root, rel, filename)
+    payload = page_payload(root, rel, filename)
+    payload["name_suggestions"] = name_suggestions
+    return payload
+
+
+# ==========================================================
+# XỬ LÝ & KẾT XUẤT
+# ==========================================================
+
+@app.post("/api/process")
+def process_preview(req: ProcessRequest):
+    """
+    Dựng ảnh XEM TRƯỚC ở độ phân giải rút gọn để thao tác kéo trượt phản hồi tức thì.
+    Trả thẳng byte JPEG (không base64) — nhẹ hơn ~33% và trình duyệt giải mã nhanh hơn.
+    Số liệu kích thước/dung lượng ước tính nằm ở phần đầu phản hồi (headers).
+    """
+    root = active_root(req.root_path)
+    rel = ps.normalize_rel(req.relative_path)
+    settings = ps.merged_settings(req.settings)
+
+    original = load_original(root, rel, req.filename)
+    preview = rd.render_page(original, req.corners, req.rotation, settings, max_dim=rd.PREVIEW_MAX_DIM)
+    data = rd.encode_preview(preview, quality=88)
+
+    # Ước tính kích thước bản kết xuất đầy đủ theo tỉ lệ thu nhỏ đã áp dụng.
+    oh, ow = original.shape[:2]
+    ph, pw = preview.shape[:2]
+    scale_back = max(1.0, max(oh, ow) / float(rd.PREVIEW_MAX_DIM))
+    est_w, est_h = int(pw * scale_back), int(ph * scale_back)
+
+    return Response(
+        content=data,
+        media_type="image/jpeg",
+        headers={
+            "Cache-Control": "no-store",
+            "X-Out-Width": str(est_w),
+            "X-Out-Height": str(est_h),
+            "X-Preview-Width": str(pw),
+            "X-Preview-Height": str(ph),
+        },
+    )
+
+
+@app.post("/api/auto-detect")
+def auto_detect(req: AutoDetectRequest):
+    """Nhận diện lại 4 góc mép giấy trên ảnh gốc."""
+    root = active_root(req.root_path)
+    rel = ps.normalize_rel(req.relative_path)
+    original = load_original(root, rel, req.filename)
+    corners, detected = detect_document_corners(original, margin_percent=req.margin_percent)
+    return {"success": True, "corners": corners.tolist(), "detected": bool(detected)}
+
+
+def _load_edited_images(root: str, rel: str, filenames: List[str]) -> List[np.ndarray]:
+    images = []
+    for name in filenames:
+        path = ps.edited_path(root, rel, name)
+        if not os.path.exists(path):
+            path = ps.find_original_path(root, rel, name) or path
+        img = imread_unicode(path)
+        if img is not None:
+            images.append(img)
+    return images
+
+
+def commit_page(root: str, rel: str, state: PageState) -> Dict[str, Any]:
+    """
+    Kết xuất đầy đủ độ phân giải từ tình trạng hiện tại, ghi đè ảnh đang sửa
+    và cập nhật metadata. Ảnh trên đĩa vì thế luôn khớp với thứ đang hiển thị.
+    """
+    filename = state.filename
+    stored = ps.get_page_meta(root, rel, filename)
+    settings = ps.merged_settings(state.settings if state.settings is not None else stored.get("settings"))
+    corners = state.corners if state.corners is not None else stored.get("corners")
+    rotation = state.rotation if state.rotation is not None else stored.get("rotation", 0)
+
+    original = load_original(root, rel, filename)
+    rendered = rd.render_page(original, corners, rotation, settings)
+    data, size, (out_w, out_h) = rd.encode_final(rendered, settings)
+    ps.write_edited_bytes(root, rel, filename, data)
+
+    ps.patch_page_meta(root, rel, filename, {
+        "doc_name": state.doc_name,
+        "corners": corners,
+        "rotation": rotation,
+        "settings": settings,
+        "history": state.history,
+        "committed_fingerprint": ps.state_fingerprint(corners, rotation, settings),
+    })
+
+    return {
+        "filename": filename,
+        "width": out_w,
+        "height": out_h,
+        "file_size": size,
+        "file_size_human": ps.format_file_size(size),
+        "version": disk_version(root, rel, filename),
+    }
+
+
+@app.post("/api/commit-page")
+def api_commit_page(req: CommitPageRequest):
+    """Kết xuất đầy đủ 1 trang và ghi đè tệp ảnh đang sửa trên đĩa."""
+    root = active_root(req.root_path)
+    rel = ps.normalize_rel(req.relative_path)
+    result = commit_page(root, rel, req.page)
+    return {"success": True, **result}
+
+
+def _raise_if_nothing_saved(failed: List[Dict[str, str]], saved: int) -> None:
+    """Không ghi được trang nào mà lại báo thành công là kịch bản mất dữ liệu thầm lặng."""
+    if failed and saved == 0:
+        reason = failed[0].get("reason") or "Không ghi được tệp xuống ổ đĩa."
+        raise HTTPException(
+            status_code=507 if "đầy" in reason else 500,
+            detail=f"Không lưu được trang nào. {reason}",
+        )
+
+
+@app.post("/api/save-folder")
+def save_folder(req: SaveFolderRequest):
+    """Lưu toàn bộ một thư mục: ảnh đang sửa + metadata + tệp PDF tổng hợp."""
+    root = active_root(req.root_path)
+    rel = ps.normalize_rel(req.relative_path)
+    result = _save_one_folder(root, rel, req)
+    _raise_if_nothing_saved(result["failed_pages"], result["saved_pages"])
+    return {"success": True, **result}
+
+
+def _friendly_write_error(exc: Exception) -> str:
+    """Đổi lỗi hệ thống thành câu tiếng Việt nói đúng việc người dùng cần làm."""
+    if isinstance(exc, OSError):
+        if exc.errno == errno.ENOSPC:
+            return "Ổ đĩa đã đầy, không còn chỗ để ghi tệp."
+        if exc.errno in (errno.EACCES, errno.EPERM):
+            return "Không có quyền ghi vào thư mục này."
+        if exc.errno == errno.EBUSY:
+            return "Tệp đang được mở ở ứng dụng khác."
+    return "Không ghi được tệp xuống ổ đĩa."
+
+
+def _save_one_folder(root: str, rel: str, req: SaveFolderRequest) -> Dict[str, Any]:
+    saved: List[str] = []
+    failed: List[Dict[str, str]] = []
+
+    for state in req.pages:
+        try:
+            # Không giữ lại ảnh đã kết xuất: lưu một thư mục lớn sẽ ngốn hết bộ nhớ.
+            # Tệp PDF bên dưới đọc lại từ đĩa theo từng trang.
+            commit_page(root, rel, state)
+            saved.append(state.filename)
+        except HTTPException:
+            raise
+        except Exception as e:
+            # Lỗi ghi đĩa TUYỆT ĐỐI không được nuốt: nếu báo thành công, giao diện sẽ
+            # xoá cờ "chưa lưu" và người dùng mất trắng công chỉnh sửa mà không hay biết.
+            print(f"[save-folder] {rel}/{state.filename}: {e!r}")
+            failed.append({"filename": state.filename, "reason": _friendly_write_error(e)})
+
+    pdf_saved = False
+    if req.save_pdf and saved:
+        folder = ps.folder_dir(root, rel)
+        title = ps.sanitize_component(req.pdf_name or os.path.basename(folder) or "Tai-Lieu")
+        try:
+            # PDF phải gồm TOÀN BỘ trang của thư mục theo đúng thứ tự đã lưu.
+            # Nếu chỉ ghép các trang vừa kết xuất thì một lần tự động lưu 1 trang
+            # sẽ thu tệp PDF nhiều trang xuống còn đúng trang đó.
+            names = ps.order_page_files(
+                ps.list_page_files(folder),
+                ps.read_meta(root, rel).get("order") or [],
+            )
+            all_images = _load_edited_images(root, rel, names)
+            if all_images:
+                pdf_bytes = generate_pdf_from_images(all_images, quality=85, normalize_res=True)
+                with open(os.path.join(folder, f"{title}.pdf"), "wb") as f:
+                    f.write(pdf_bytes)
+                pdf_saved = True
+        except Exception as e:
+            print(f"[save-folder pdf] {rel}: {e}")
+
+    ps.prune_meta_to_existing(root, rel)
+    return {
+        "relative_path": rel,
+        "saved_pages": len(saved),
+        "saved_filenames": saved,
+        "failed_pages": failed,
+        "pdf_saved": pdf_saved,
+        "target_dir": ps.folder_dir(root, rel),
+    }
+
+
+@app.post("/api/save-project")
+def save_project(req: SaveProjectRequest):
+    """Lưu 1 lần toàn bộ các nhánh thư mục của dự án."""
+    root = active_root(req.root_path)
+    folders_saved = 0
+    pages_saved = 0
+    pdfs = 0
+
+    saved_filenames: List[str] = []
+    failed_pages: List[Dict[str, str]] = []
+
+    for folder_req in req.folders:
+        if not folder_req.pages:
+            continue
+        rel = ps.normalize_rel(folder_req.relative_path)
+        outcome = _save_one_folder(root, rel, folder_req)
+        saved_filenames.extend(outcome["saved_filenames"])
+        failed_pages.extend(outcome["failed_pages"])
+        if outcome["saved_pages"]:
+            folders_saved += 1
+            pages_saved += outcome["saved_pages"]
+            if outcome["pdf_saved"]:
+                pdfs += 1
+
+    _raise_if_nothing_saved(failed_pages, pages_saved)
+    return {
+        "success": True,
+        "root_path": root,
+        "folders_saved": folders_saved,
+        "pages_saved": pages_saved,
+        "pdfs_saved": pdfs,
+        "saved_filenames": saved_filenames,
+        "failed_pages": failed_pages,
+    }
+
+
+@app.post("/api/save-metadata")
+def save_metadata(req: SaveMetadataRequest):
+    """
+    Lưu nhanh tình trạng chỉnh sửa (góc, xoay, bộ lọc, undo/redo) mà không kết xuất lại ảnh.
+    Cập nhật hợp nhất theo từng trường nên không bao giờ xóa mất dữ liệu đã có.
+    """
+    root = active_root(req.root_path)
+    rel = ps.normalize_rel(req.relative_path)
+    for page in req.pages:
+        ps.patch_page_meta(root, rel, page.filename, {
+            "doc_name": page.doc_name,
+            "corners": page.corners,
+            "rotation": page.rotation,
+            "settings": ps.merged_settings(page.settings) if page.settings else None,
+            "history": page.history,
+        })
+    if req.order is not None:
+        ps.set_folder_order(root, rel, req.order)
+    return {"success": True, "count": len(req.pages)}
+
+
+# ==========================================================
+# VÒNG ĐỜI TRANG: ĐỔI TÊN, GỐC MỚI, DI CHUYỂN, XÓA
+# ==========================================================
+
+@app.post("/api/rename-page")
+def api_rename_page(req: RenamePageRequest):
+    """Đổi tên NGUYÊN BỘ BA (ảnh sửa + ảnh gốc + metadata) — không tạo bản sao thừa."""
+    root = active_root(req.root_path)
+    rel = ps.normalize_rel(req.relative_path)
+    new_stem = ps.sanitize_component(req.new_name)
+    if not new_stem:
+        raise HTTPException(status_code=400, detail="Tên tài liệu không được để trống.")
+
+    try:
+        outcome = ps.rename_page(root, rel, req.filename, new_stem)
+    except OSError as e:
+        print(f"[rename-page] {e}")
+        raise HTTPException(status_code=500, detail="Không đổi được tên tệp. Có thể tệp đang mở ở ứng dụng khác.")
+
+    invalidate(root, rel, req.filename)
+    return {"success": True, **page_payload(root, rel, outcome["filename"])}
+
 
 @app.post("/api/apply-as-original")
-async def apply_as_original(req: ApplyAsOriginalRequest):
-    if req.image_id not in IMAGE_STORE:
-        raise HTTPException(status_code=404, detail="Không tìm thấy tài liệu.")
-    
-    entry = IMAGE_STORE[req.image_id]
-    processed = entry.get("last_processed")
-    if processed is None:
-        raise HTTPException(status_code=400, detail="Tài liệu chưa qua xử lý làm nét.")
-    
-    # Overwrite original in memory with the processed image
-    entry["original"] = processed.copy()
-    entry["last_processed"] = None
-    
-    h, w = processed.shape[:2]
-    mp = (w * h) / 1_000_000.0
-    
-    # Reset full-frame corners for the new original
-    corners = np.array([
-        [0.0, 0.0],
-        [float(w), 0.0],
-        [float(w), float(h)],
-        [0.0, float(h)]
-    ], dtype=np.float32)
-    
-    # Generate new preview base64
-    preview_scale = min(1.0, 1400.0 / max(h, w))
-    preview_w, preview_h = int(w * preview_scale), int(h * preview_scale)
-    preview_img = cv2.resize(processed, (preview_w, preview_h), interpolation=cv2.INTER_AREA)
-    _, preview_buf = cv2.imencode(".jpg", preview_img, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
-    preview_b64 = image_to_base64(preview_buf.tobytes())
-    
-    # If root_path provided, overwrite on disk in _goc
-    if req.root_path and os.path.exists(req.root_path):
-        try:
-            rel = (req.relative_path or "").replace("/", "\\").strip("\\")
-            target_dir = os.path.join(req.root_path, rel) if rel else req.root_path
-            orig_dir = os.path.join(target_dir, "_goc")
-            os.makedirs(orig_dir, exist_ok=True)
-            clean_name = clean_slug_title(req.doc_name or "Tai-Lieu")
-            orig_filepath = os.path.join(orig_dir, f"{clean_name}_goc.jpg")
-            cv2.imwrite(orig_filepath, processed, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
-        except Exception as e:
-            print(f"Error updating original on disk: {e}")
-            
+def apply_as_original(req: PageRef):
+    """
+    Nâng bản đang sửa lên thành ảnh gốc mới (người dùng bấm xác nhận rõ ràng).
+    Ghi đè _goc/, đặt lại 4 góc về trọn khung và xóa lịch sử vì đây là mốc gốc mới.
+    """
+    root = active_root(req.root_path)
+    rel = ps.normalize_rel(req.relative_path)
+    filename = req.filename
+
+    stored = ps.get_page_meta(root, rel, filename)
+    settings = ps.merged_settings(stored.get("settings"))
+    original = load_original(root, rel, filename)
+    rendered = rd.render_page(original, stored.get("corners"), stored.get("rotation", 0), settings)
+
+    ps.write_original(root, rel, filename, rendered)
+    invalidate(root, rel, filename)
+
+    h, w = rendered.shape[:2]
+    full_frame = [[0.0, 0.0], [float(w), 0.0], [float(w), float(h)], [0.0, float(h)]]
+    reset_settings = ps.default_settings()
+    reset_settings["mode"] = settings.get("mode", "natural")
+
+    data, _size, _dim = rd.encode_final(
+        rd.render_page(rendered, full_frame, 0, reset_settings), reset_settings
+    )
+    ps.write_edited_bytes(root, rel, filename, data)
+    ps.patch_page_meta(root, rel, filename, {
+        "corners": full_frame,
+        "rotation": 0,
+        "settings": reset_settings,
+        "history": {"undo": [], "redo": []},
+        "committed_fingerprint": ps.state_fingerprint(full_frame, 0, reset_settings),
+    })
+
+    return {"success": True, **page_payload(root, rel, filename)}
+
+
+@app.post("/api/adopt-as-original")
+def adopt_as_original(req: PageRef):
+    """Hợp thức hóa một ảnh lẻ: tạo bản gốc trong _goc/ và khởi tạo metadata."""
+    root = active_root(req.root_path)
+    rel = ps.normalize_rel(req.relative_path)
+    filename = req.filename
+
+    path = ps.edited_path(root, rel, filename)
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="Không tìm thấy tệp ảnh trên máy.")
+
+    img = imread_unicode(path)
+    if img is None:
+        raise HTTPException(status_code=400, detail="Không đọc được tệp ảnh này.")
+
+    ps.write_original(root, rel, filename, img)
+    invalidate(root, rel, filename)
+
+    # Ảnh lẻ được giữ nguyên khung ban đầu: bản gốc vừa tạo chính là ảnh đang hiển thị,
+    # nên 4 góc mặc định bao trọn khung để không tự ý cắt mất phần nào của người dùng.
+    h, w = img.shape[:2]
+    corners = [[0.0, 0.0], [float(w), 0.0], [float(w), float(h)], [0.0, float(h)]]
+    settings = ps.default_settings()
+    ps.patch_page_meta(root, rel, filename, {
+        "doc_name": ps.stem_of(filename),
+        "corners": corners,
+        "rotation": 0,
+        "settings": settings,
+        "history": {"undo": [], "redo": []},
+        "committed_fingerprint": ps.state_fingerprint(corners, 0, settings),
+    })
+    return {"success": True, **page_payload(root, rel, filename)}
+
+
+@app.post("/api/move-page")
+def api_move_page(req: MovePageRequest):
+    """Di chuyển trang sang thư mục khác, mang theo cả ảnh gốc và metadata."""
+    root = active_root(req.root_path)
+    src = ps.normalize_rel(req.relative_path)
+    dst = ps.normalize_rel(req.target_relative_path)
+    try:
+        outcome = ps.move_page(root, src, req.filename, dst)
+    except OSError as e:
+        print(f"[move-page] {e}")
+        raise HTTPException(status_code=500, detail="Không di chuyển được tệp. Có thể tệp đang được mở ở ứng dụng khác.")
+
+    invalidate(root, src, req.filename)
+    return {"success": True, "target_relative_path": dst, **page_payload(root, dst, outcome["filename"])}
+
+
+@app.post("/api/move-to-unapproved")
+def move_to_unapproved(req: PageRef):
+    """Chuyển ảnh vào Kho ảnh chưa duyệt (tự tạo thư mục nếu chưa có)."""
+    root = active_root(req.root_path)
+    src = ps.normalize_rel(req.relative_path)
+    os.makedirs(ps.folder_dir(root, ps.UNAPPROVED_DIR), exist_ok=True)
+    outcome = ps.move_page(root, src, req.filename, ps.UNAPPROVED_DIR)
+    invalidate(root, src, req.filename)
     return {
         "success": True,
-        "image_id": req.image_id,
-        "width": w,
-        "height": h,
-        "megapixels": f"{mp:.1f} MP",
-        "corners": corners.tolist(),
-        "preview_url": preview_b64
+        "folder_id": ps.folder_id_of(ps.UNAPPROVED_DIR),
+        "folder_name": ps.UNAPPROVED_LABEL,
+        "target_relative_path": ps.UNAPPROVED_DIR,
+        **page_payload(root, ps.UNAPPROVED_DIR, outcome["filename"]),
     }
+
+
+@app.post("/api/delete-page")
+def delete_page(req: PageRef):
+    """Xóa vĩnh viễn cả ảnh sửa, ảnh gốc và mục metadata của trang."""
+    root = active_root(req.root_path)
+    rel = ps.normalize_rel(req.relative_path)
+    try:
+        deleted = ps.delete_page_files(root, rel, req.filename)
+    except OSError as e:
+        print(f"[delete-page] {e}")
+        raise HTTPException(status_code=500, detail="Không xóa được tệp. Có thể tệp đang được mở ở ứng dụng khác.")
+    invalidate(root, rel, req.filename)
+    return {"success": True, "deleted": deleted}
+
+
+# ==========================================================
+# THAO TÁC THƯ MỤC VẬT LÝ
+# ==========================================================
+
+@app.post("/api/create-folder")
+def create_folder(req: FolderRequest):
+    root = active_root(req.root_path)
+    name = ps.sanitize_component(req.folder_name or "")
+    if not name:
+        raise HTTPException(status_code=400, detail="Tên thư mục không được để trống.")
+    try:
+        parent = ps.folder_dir(root, req.relative_path)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    target = os.path.join(parent, name)
+    if os.path.isdir(target):
+        raise HTTPException(status_code=400, detail=f"Thư mục '{name}' đã tồn tại.")
+    try:
+        os.makedirs(target, exist_ok=True)
+    except OSError as e:
+        print(f"[create-folder] {e}")
+        raise HTTPException(status_code=500, detail="Không tạo được thư mục. Vui lòng kiểm tra quyền truy cập ổ đĩa.")
+
+    rel = os.path.relpath(target, root)
+    return {
+        "success": True,
+        "folder_id": ps.folder_id_of(rel),
+        "folder_name": name,
+        "relative_path": ps.normalize_rel(rel),
+        "parent_id": ps.folder_id_of(req.relative_path),
+    }
+
+
+@app.post("/api/rename-folder")
+def rename_folder(req: FolderRequest):
+    root = active_root(req.root_path)
+    rel = ps.normalize_rel(req.relative_path)
+    if not rel:
+        raise HTTPException(status_code=400, detail="Không thể đổi tên thư mục gốc của dự án.")
+    name = ps.sanitize_component(req.folder_name or "")
+    if not name:
+        raise HTTPException(status_code=400, detail="Tên thư mục không được để trống.")
+
+    old_dir = ps.folder_dir(root, rel)
+    if not os.path.isdir(old_dir):
+        raise HTTPException(status_code=404, detail="Thư mục cần đổi tên không còn tồn tại.")
+
+    new_dir = os.path.join(os.path.dirname(old_dir), name)
+    if os.path.exists(new_dir):
+        raise HTTPException(status_code=400, detail=f"Thư mục '{name}' đã tồn tại.")
+    try:
+        os.rename(old_dir, new_dir)
+    except OSError as e:
+        print(f"[rename-folder] {e}")
+        raise HTTPException(status_code=500, detail="Không đổi được tên thư mục. Có thể thư mục đang mở ở ứng dụng khác.")
+
+    ORIGINALS.clear()
+    new_rel = os.path.relpath(new_dir, root)
+    return {
+        "success": True,
+        "folder_id": ps.folder_id_of(new_rel),
+        "folder_name": name,
+        "relative_path": ps.normalize_rel(new_rel),
+    }
+
+
+@app.post("/api/delete-folder")
+def delete_folder(req: FolderRequest):
+    import shutil
+    root = active_root(req.root_path)
+    rel = ps.normalize_rel(req.relative_path)
+    if not rel:
+        raise HTTPException(status_code=400, detail="Không thể xóa thư mục gốc của dự án.")
+    target = ps.folder_dir(root, rel)
+    if os.path.isdir(target):
+        try:
+            shutil.rmtree(target)
+        except OSError as e:
+            print(f"[delete-folder] {e}")
+            raise HTTPException(status_code=500, detail="Không xóa được thư mục. Có thể thư mục đang mở ở ứng dụng khác.")
+    ORIGINALS.clear()
+    return {"success": True}
+
+
+# ==========================================================
+# XUẤT PDF & TẢI VỀ
+# ==========================================================
+
+@app.post("/api/export-pdf")
+def export_pdf(req: ExportPdfRequest):
+    """Ghép các trang đã xử lý của một thư mục thành PDF và tải về."""
+    root = active_root(req.root_path)
+    rel = ps.normalize_rel(req.relative_path)
+    images = _load_edited_images(root, rel, req.filenames)
+    if not images:
+        raise HTTPException(status_code=400, detail="Thư mục này chưa có trang nào để xuất PDF.")
+
+    pdf_bytes = generate_pdf_from_images(images, quality=85, normalize_res=True)
+    title = ps.sanitize_component(req.doc_name or os.path.basename(ps.folder_dir(root, rel)) or "Tai-Lieu-Scan")
+
+    target = _checked_save_path(req.save_path)
+    if target:
+        return {**_write_export(target, pdf_bytes, "tệp PDF"), "pages": len(images)}
+
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{title}.pdf"'},
+    )
+
+
+@app.post("/api/export-project-pdf")
+def export_project_pdf(req: ExportProjectPdfRequest):
+    """Ghép toàn bộ trang của mọi thư mục trong dự án thành một tệp PDF."""
+    root = active_root(req.root_path)
+    folders, _pages = ps.scan_tree(root)
+    images: List[np.ndarray] = []
+    for folder in folders:
+        rel = folder["relativePath"]
+        names = ps.order_page_files(
+            ps.list_page_files(ps.folder_dir(root, rel)),
+            ps.read_meta(root, rel).get("order") or [],
+        )
+        images.extend(_load_edited_images(root, rel, names))
+
+    if not images:
+        raise HTTPException(status_code=400, detail="Dự án chưa có trang nào để xuất PDF.")
+
+    pdf_bytes = generate_pdf_from_images(images, quality=85, normalize_res=True)
+    title = ps.sanitize_component(req.doc_name or os.path.basename(root) or "Tai-Lieu-Scan")
+
+    target = _checked_save_path(req.save_path)
+    if target:
+        return {**_write_export(target, pdf_bytes, "tệp PDF"), "pages": len(images)}
+
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{title}.pdf"'},
+    )
+
+
+@app.post("/api/export-images-zip")
+def export_images_zip(req: ExportImagesZipRequest):
+    """Đóng gói các ảnh đã xử lý thành tệp ZIP và tải về máy."""
+    root = active_root(req.root_path)
+    rel = ps.normalize_rel(req.relative_path)
+    fdir = ps.folder_dir(root, rel)
+
+    import zipfile
+    import io
+
+    zip_buffer = io.BytesIO()
+    count = 0
+    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+        for idx, fname in enumerate(req.filenames, start=1):
+            edited_f = ps.edited_path(root, rel, fname)
+            meta = ps.get_page_meta(root, rel, fname) or {}
+            doc_name = meta.get("doc_name") or ps.stem_of(fname)
+            safe_name = f"{idx:02d}_{ps.sanitize_component(doc_name)}.jpg"
+
+            if os.path.exists(edited_f):
+                with open(edited_f, "rb") as fp:
+                    zf.writestr(safe_name, fp.read())
+                count += 1
+            else:
+                goc_path = ps.find_original_path(root, rel, fname)
+                if goc_path and os.path.exists(goc_path):
+                    orig = imread_unicode(goc_path)
+                    if orig is not None:
+                        rendered = rd.render_page(
+                            orig, meta.get("corners"), meta.get("rotation", 0),
+                            ps.merged_settings(meta.get("settings")),
+                        )
+                        raw_bytes, _, _ = rd.encode_final(rendered, meta.get("settings") or {})
+                        zf.writestr(safe_name, raw_bytes)
+                        count += 1
+
+    zip_bytes = zip_buffer.getvalue()
+    if count == 0:
+        raise HTTPException(status_code=400, detail="Không có ảnh nào để tải về.")
+
+    title = ps.sanitize_component(req.zip_name or os.path.basename(fdir) or "Bo-Anh-Scan")
+
+    target = _checked_save_path(req.save_path)
+    if target:
+        return {**_write_export(target, zip_bytes, "tệp ZIP"), "images": count}
+
+    return Response(
+        content=zip_bytes,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{title}.zip"'},
+    )
+
+
+@app.post("/api/download-single")
+def download_single(req: DownloadSingleRequest):
+    """Lưu một trang đã xử lý ra JPG / PNG / WebP vào nơi người dùng chọn."""
+    root = active_root(req.root_path)
+    rel = ps.normalize_rel(req.relative_path)
+    path = ps.edited_path(root, rel, req.filename)
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="Trang này chưa được lưu trên máy.")
+
+    img = imread_unicode(path)
+    if img is None:
+        raise HTTPException(status_code=400, detail="Không đọc được tệp ảnh.")
+
+    fmt = (req.format or "jpeg").lower()
+    from core.compressor import compress_image_to_bytes
+    data, _size, _dim = compress_image_to_bytes(img, format=fmt, quality=92, normalize_res=False)
+    ext = "jpg" if fmt in ("jpg", "jpeg") else fmt
+    title = ps.sanitize_component(req.doc_name or ps.stem_of(req.filename))
+
+    target = _checked_save_path(req.save_path)
+    if target:
+        return _write_export(target, data, f"ảnh {ext.upper()}")
+
+    return Response(
+        content=data,
+        media_type=f"image/{'jpeg' if ext == 'jpg' else ext}",
+        headers={"Content-Disposition": f'attachment; filename="{title}.{ext}"'},
+    )
+
+
+@app.post("/api/legacy-pdfs")
+def legacy_pdfs(req: CleanupLegacyPdfRequest):
+    """
+    Liệt kê (và tuỳ chọn xoá) các tệp PDF do bản trước TỰ SINH mỗi lần lưu.
+    Từ nay PDF chỉ được tạo khi người dùng chủ động bấm xuất, nên những tệp này
+    không còn được cập nhật và nội dung sẽ lệch dần so với ảnh trong thư mục.
+
+    Phạm vi rất hẹp — chỉ những tệp trùng đúng khuôn tên mà bản cũ đặt ra:
+        <tên thư mục>.pdf   |   Kho ảnh chưa duyệt.pdf   |   Tai-Lieu.pdf
+    Tệp PDF do người dùng tự đặt tên khác sẽ KHÔNG bao giờ bị chạm tới.
+    """
+    root = active_root(req.root_path)
+    folders, _pages = ps.scan_tree(root)
+
+    found: List[Dict[str, Any]] = []
+    for folder in folders:
+        rel = folder["relativePath"]
+        fdir = ps.folder_dir(root, rel)
+        dir_name = os.path.basename(fdir) or os.path.basename(root)
+        candidates = {
+            f"{ps.sanitize_component(dir_name)}.pdf",
+            f"{ps.sanitize_component(folder['name'])}.pdf",
+            "Tai-Lieu.pdf",
+        }
+        for name in sorted(candidates):
+            path = os.path.join(fdir, name)
+            if not os.path.isfile(path):
+                continue
+            try:
+                size = os.path.getsize(path)
+            except OSError:
+                continue
+            found.append({
+                "relative_path": rel,
+                "folder_name": folder["name"],
+                "filename": name,
+                "file_size": size,
+                "file_size_human": ps.format_file_size(size),
+                "path": path,
+            })
+
+    if not req.confirm:
+        return {"success": True, "deleted": 0, "files": found, "total": len(found)}
+
+    deleted, failed = 0, []
+    for item in found:
+        try:
+            os.remove(item["path"])
+            deleted += 1
+        except OSError as e:
+            print(f"[legacy-pdfs] {item['path']}: {e!r}")
+            failed.append({"filename": item["filename"], "reason": _friendly_write_error(e)})
+
+    return {"success": True, "deleted": deleted, "failed": failed,
+            "files": found, "total": len(found)}
+
+
+# ==========================================================
+# GỢI Ý TÊN BẰNG AI (chỉ chạy khi người dùng bấm)
+# ==========================================================
+
+@app.post("/api/ai-suggest-name")
+def ai_suggest_name(req: AiSuggestRequest):
+    root = active_root(req.root_path)
+    rel = ps.normalize_rel(req.relative_path)
+    path = ps.edited_path(root, rel, req.filename)
+    img = imread_unicode(path) if os.path.exists(path) else load_original(root, rel, req.filename)
+    if img is None:
+        raise HTTPException(status_code=404, detail="Không tìm thấy ảnh của trang này.")
+
+    primary, suggestions = ai_ocr_suggest_document_name(
+        image=img, filename=req.filename, page_index=req.page_index or 1
+    )
+    return {"success": True, "primary_name": primary, "suggestions": suggestions}
+
+
+# ==========================================================
+# GIAO DIỆN TĨNH
+# ==========================================================
+
+@app.middleware("http")
+async def revalidate_ui_assets(request, call_next):
+    """
+    Bắt trình duyệt kiểm tra lại HTML/CSS/JS ở mỗi lần tải (rất rẻ vì chạy nội bộ).
+    Nếu không, sau khi cập nhật ứng dụng người dùng sẽ vẫn thấy giao diện cũ và
+    tưởng bản cập nhật không có tác dụng. Ảnh trong /api/image vẫn giữ bộ đệm dài hạn.
+    """
+    response = await call_next(request)
+    path = request.url.path
+    if not path.startswith("/api/") and (
+        path in ("", "/") or path.endswith((".html", ".css", ".js"))
+    ):
+        response.headers["Cache-Control"] = "no-cache, must-revalidate"
+    return response
+
 
 static_dir = os.path.join(os.path.dirname(__file__), "static")
 os.makedirs(static_dir, exist_ok=True)
 app.mount("/", StaticFiles(directory=static_dir, html=True), name="static")
+
 
 if __name__ == "__main__":
     import uvicorn

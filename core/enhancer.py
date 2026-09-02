@@ -1,15 +1,16 @@
 import cv2
 import numpy as np
-from typing import Tuple, Optional
+
 
 
 def remove_crease_shadows_and_folds(
     image: np.ndarray, 
-    strength: float = 0.7
+    strength: float = 0.6
 ) -> np.ndarray:
     """
-    Eliminates shadows caused by folds and creases across the paper surface.
+    Eliminates shadows caused by folds and uneven lighting across the paper surface.
     Works strictly on Luminance (L channel in LAB) so all ink colors, stamps, and signatures are preserved.
+    Uses large-scale smooth Gaussian illumination modeling to prevent halo or smear artifacts around text and table lines.
     """
     if strength <= 0.01:
         return image.copy()
@@ -19,21 +20,13 @@ def remove_crease_shadows_and_folds(
 
     h, w = image.shape[:2]
     
-    # Scale 1: Broad illumination gradient
-    k1 = max(31, int(min(h, w) * 0.08)) | 1
-    bg_broad = cv2.GaussianBlur(l_chan, (k1, k1), 0)
-
-    # Scale 2: Narrow crease shadow valleys
-    k2 = max(15, int(min(h, w) * 0.03)) | 1
-    dilated = cv2.dilate(l_chan, cv2.getStructuringElement(cv2.MORPH_RECT, (k2, k2)))
-    bg_crease = cv2.GaussianBlur(dilated, (k2, k2), 0)
-
-    # Combined background estimate
-    bg_combined = np.maximum(bg_broad, bg_crease).astype(np.float32) + 1.0
+    # Large smooth illumination gradient without local text distortions
+    k = max(51, int(min(h, w) * 0.12)) | 1
+    bg = cv2.GaussianBlur(l_chan, (k, k), 0).astype(np.float32) + 1.0
 
     # Illumination division normalization
     l_float = l_chan.astype(np.float32)
-    normalized_l = (l_float / bg_combined) * 255.0
+    normalized_l = (l_float / bg) * 255.0
     normalized_l = np.clip(normalized_l, 0, 255).astype(np.uint8)
 
     # Blend with original luminance based on strength

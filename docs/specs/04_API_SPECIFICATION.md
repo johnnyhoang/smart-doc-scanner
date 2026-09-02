@@ -1,150 +1,206 @@
-# 🔌 04. Đặc Tả Giao Tiếp API Backend (API Specification Spec)
+﻿# 🔌 04. Đặc Tả Giao Tiếp API Backend (API Specification Spec)
 
 ## 🎯 Mục Đích
-Tài liệu này đặc tả toàn diện danh sách tất cả các điểm cuối (REST Endpoints), dữ liệu gửi đi (Request Payloads), dữ liệu phản hồi (Response Payloads), mã trạng thái HTTP và quy ước xử lý lỗi của máy chủ FastAPI `server.py`.
+Đặc tả toàn bộ điểm cuối REST của `server.py`, dữ liệu gửi/nhận và quy ước xử lý lỗi.
 
 ---
 
-## 📋 Danh Mục Các Điểm Cuối (API Endpoints Overview)
+## 📐 Quy Ước Chung
 
-| Phương thức | Đường dẫn API | Mô tả chức năng |
+### Định danh trang
+Mọi endpoint thao tác trên trang đều nhận cặp **`relative_path` + `filename`** — chính là danh tính
+của đối tượng tài liệu trên đĩa. Không còn `image_id` tạm thời kiểu UUID như phiên bản cũ.
+
+Trường `id` trong dữ liệu trả về là mã tất định sinh từ `(đường dẫn, tên tệp)`, chỉ dùng để giao diện
+đánh dấu phần tử; nó **ổn định giữa các lần quét lại**.
+
+### Thư mục dự án
+`POST /api/scan-directory` ghi nhớ thư mục dự án cho phiên làm việc. Các endpoint sau đó không cần
+gửi lại đường dẫn tuyệt đối (có thể ghi đè bằng `root_path` khi cần).
+Mọi đường dẫn đều được kiểm tra **không được thoát ra ngoài thư mục dự án**.
+
+### Xử lý lỗi
+Lỗi trả về `HTTPException` với `detail` là **câu tiếng Việt dễ hiểu, không lộ chi tiết kỹ thuật**.
+Chi tiết kỹ thuật chỉ ghi ra console máy chủ.
+
+```json
+{ "detail": "Không đổi được tên tệp. Có thể tệp đang mở ở ứng dụng khác." }
+```
+
+| Mã | Ý nghĩa |
+| :--- | :--- |
+| `400` | Dữ liệu vào không hợp lệ / chưa chọn thư mục dự án |
+| `404` | Không tìm thấy tệp hoặc thư mục |
+| `500` | Lỗi ghi đĩa, quyền truy cập, tệp đang bị khóa |
+
+### Bản ghi trang (Page Payload)
+Dạng dữ liệu chuẩn mà các endpoint trả về cho một trang:
+
+```json
+{
+  "id": "a1b2c3d4e5f607182930",
+  "filename": "Hợp Đồng Thuê Nhà.jpg",
+  "folderId": "folder_Hop_Dong_2026",
+  "relativePath": "Hop_Dong_2026",
+  "doc_name": "Hợp Đồng Thuê Nhà",
+  "width": 1600, "height": 1200,
+  "megapixels": "1.9 MP",
+  "file_size": 205100,
+  "file_size_human": "200.3 KB",
+  "corners": [[45,38],[1820,42],[1810,2450],[50,2440]],
+  "rotation": 0,
+  "settings": { "mode": "natural", "sharpness": 0.6, "...": "..." },
+  "history": { "undo": [], "redo": [] },
+  "has_raw_original": true,
+  "version": 1756612800
+}
+```
+
+`version` là thời điểm sửa tệp, dùng làm tham số phá bộ đệm ảnh của trình duyệt.
+
+---
+
+## 📋 Danh Mục Điểm Cuối
+
+### Dự án & thư mục
+
+| Phương thức | Đường dẫn | Chức năng |
 | :--- | :--- | :--- |
-| `POST` | `/api/upload` | Tải ảnh lên bộ nhớ RAM, tự động nhận diện 4 góc và sinh tên gợi ý. |
-| `POST` | `/api/process` | Nắn góc, làm phẳng (dewarp), cân bằng sáng và áp dụng bộ lọc màu. |
-| `POST` | `/api/auto-detect` | Nhận diện lại 4 góc mép giấy với tỉ lệ mở rộng viền tùy chọn. |
-| `POST` | `/api/save-to-disk` | Lưu ảnh đã xử lý, ảnh gốc `_goc/` và file PDF vào thư mục máy tính. |
-| `POST` | `/api/save-metadata` | Lưu tọa độ, góc xoay, bộ lọc và lịch sử Undo/Redo vào `.docscan_meta.json`. |
-| `POST` | `/api/scan-directory` | Quét cây thư mục đĩa cứng và nạp toàn bộ ảnh cùng metadata. |
-| `POST` | `/api/create-folder` | Tạo thư mục vật lý tức thì trên ổ đĩa (`os.makedirs`). |
-| `POST` | `/api/rename-folder` | Đổi tên thư mục vật lý trên ổ đĩa (`os.rename`). |
-| `POST` | `/api/delete-folder` | Xóa thư mục vật lý và các nhánh con trên ổ đĩa (`shutil.rmtree`). |
-| `POST` | `/api/apply-as-original` | Thay thế ảnh gốc `_goc/` bằng ảnh đã chỉnh sửa hiện tại. |
-| `POST` | `/api/adopt-as-original` | Tạo bản sao lưu ảnh gốc vào `_goc/` cho ảnh lẻ có sẵn trong thư mục. |
-| `POST` | `/api/delete-disk-file` | Xóa tệp ảnh đơn lẻ khỏi ổ đĩa máy tính. |
-| `POST` | `/api/move-to-unapproved` | Chuyển file ảnh vào thư mục `Kho_Chua_Duyet` (tự tạo nếu chưa có). |
-| `POST` | `/api/export-pdf` | Ghép nhiều ảnh thành tệp PDF chuẩn in ấn và tải về trình duyệt. |
-| `POST` | `/api/download-single` | Tải về 1 trang ảnh đã xử lý ở định dạng JPG, PNG hoặc WebP. |
-| `POST` | `/api/ai-suggest-name` | Gọi Gemini AI nhận diện văn bản OCR để gợi ý tên tài liệu chuẩn. |
+| `POST` | `/api/pick-directory` | Mở hộp thoại chọn thư mục của hệ điều hành. |
+| `POST` | `/api/scan-directory` | Quét cây thư mục, tự động gộp kho chưa duyệt trùng, trả dữ liệu **nhẹ** (không kèm điểm ảnh). |
+| `POST` | `/api/open-folder` | Mở thư mục trong File Explorer. |
+| `POST` | `/api/create-folder` | Tạo thư mục thật trên ổ đĩa. |
+| `POST` | `/api/rename-folder` | Đổi tên thư mục thật. |
+| `POST` | `/api/delete-folder` | Xóa thư mục và toàn bộ nhánh con. |
+
+### Ảnh & xử lý
+
+| Phương thức | Đường dẫn | Chức năng |
+| :--- | :--- | :--- |
+| `GET` | `/api/image` | Trả tệp ảnh (`kind` = `original` / `edited` / `thumb` / `thumb_original`). |
+| `POST` | `/api/import` | Nhập ảnh mới, **ghi ngay đủ bộ ba** xuống đĩa. |
+| `POST` | `/api/process` | Dựng ảnh **xem trước** rút gọn (1600px), trả thẳng byte JPEG. |
+| `POST` | `/api/auto-detect` | Nhận diện lại 4 góc mép giấy (`margin_percent = 0.0` chuẩn xác). |
+
+### Lưu trữ
+
+| Phương thức | Đường dẫn | Chức năng |
+| :--- | :--- | :--- |
+| `POST` | `/api/commit-page` | Kết xuất đầy đủ 1 trang và ghi đè ảnh đang sửa. |
+| `POST` | `/api/save-folder` | Lưu 1 thư mục: ảnh + metadata + PDF. |
+| `POST` | `/api/save-project` | Lưu toàn bộ mọi nhánh thư mục có thay đổi chưa lưu. |
+| `POST` | `/api/save-metadata` | Lưu nhanh tình trạng & thứ tự trang (không dựng lại ảnh). |
+
+### Vòng đời trang
+
+| Phương thức | Đường dẫn | Chức năng |
+| :--- | :--- | :--- |
+| `POST` | `/api/rename-page` | Đổi tên **cả ảnh gốc + ảnh sửa + metadata + vị trí thứ tự**. |
+| `POST` | `/api/move-page` | Chuyển trang sang thư mục khác, mang theo cả bộ ba. |
+| `POST` | `/api/move-to-unapproved` | Chuyển vào `Kho_Chua_Duyet`. |
+| `POST` | `/api/apply-as-original` | Lưu ảnh sửa thành ảnh gốc mới (`_goc/`). |
+| `POST` | `/api/adopt-as-original` | Tạo bản gốc cho ảnh lẻ chưa có `_goc/`. |
+| `POST` | `/api/delete-page` | Xóa vĩnh viễn cả bộ ba. |
+
+### Xuất bản
+
+| Phương thức | Đường dẫn | Chức năng |
+| :--- | :--- | :--- |
+| `POST` | `/api/export-pdf` | Xuất PDF của một thư mục (hoặc danh sách trang được chọn). |
+| `POST` | `/api/export-images-zip` | Đóng gói và tải danh sách ảnh đã chọn dạng ZIP. |
+| `POST` | `/api/export-project-pdf` | Xuất PDF gộp toàn bộ dự án. |
+| `GET` | `/api/download-single` | Tải một trang dạng JPG / PNG / WebP. |
+| `POST` | `/api/ai-suggest-name` | Gợi ý tên tài liệu bằng OCR/AI — **chỉ chạy khi người dùng bấm**. |
 
 ---
 
 ## 🛠️ Chi Tiết Các Điểm Cuối Nổi Bật
 
-### 1. `POST /api/save-to-disk`
-- **Request Body:**
+### 1. `POST /api/scan-directory`
+
+```json
+{ "path": "D:\\Tài Liệu Scan" }
+```
+
+**Phản hồi 200:**
 ```json
 {
-  "root_path": "C:\\DocScan_Projects",
-  "relative_path": "Hop_Dong_2026",
-  "items": [
-    {
-      "image_id": "uuid-string",
-      "filename": "Trang_01.jpg",
-      "doc_name": "Hop_Dong_Trang_01",
-      "corners": [[0,0], [1000,0], [1000,1500], [0,1500]],
-      "rotation": 0,
-      "settings": { "mode": "natural", "sharpness": 0.6 },
-      "history": { "undo": [], "redo": [] }
-    }
+  "success": true,
+  "root_path": "D:\\Tài Liệu Scan",
+  "root_name": "Tài Liệu Scan",
+  "folders": [
+    { "id": "folder_root", "name": "Tài Liệu Scan", "parentId": null,
+      "relativePath": "", "imageIds": [], "isUnapproved": false }
   ],
-  "save_original": true,
-  "save_edited": true,
-  "save_pdf": true,
-  "pdf_name": "Hop_Dong_2026",
-  "quality": 85,
-  "normalize_res": true
-}
-```
-- **Response (200 OK):**
-```json
-{
-  "success": true,
-  "target_dir": "C:\\DocScan_Projects\\Hop_Dong_2026",
-  "count": 2,
-  "pdf_saved": true
+  "pages": [ "<bản ghi trang>" ],
+  "total_folders": 3,
+  "total_images": 42
 }
 ```
 
 ---
 
-### 2. `POST /api/adopt-as-original`
-- **Mục đích:** Hợp thức hóa ảnh lẻ thành cặp ảnh có bản gốc `_goc/`.
-- **Request Body:**
+### 2. `GET /api/image`
+
+| Tham số | Bắt buộc | Ý nghĩa |
+| :--- | :--- | :--- |
+| `file` | ✅ | Tên tệp của trang |
+| `rel` | | Đường dẫn thư mục tương đối |
+| `kind` | | `edited` (mặc định) / `original` / `thumb` / `thumb_original` |
+| `v` | | Số hiệu phiên bản để phá bộ đệm trình duyệt |
+
+---
+
+### 3. `POST /api/process` — Xem trước nhanh
+
 ```json
 {
-  "root_path": "C:\\DocScan_Projects",
   "relative_path": "Hop_Dong_2026",
-  "filename": "anh_chup.jpg",
-  "image_id": "uuid-string"
-}
-```
-- **Response (200 OK):**
-```json
-{
-  "success": true,
-  "filename": "anh_chup.jpg",
-  "goc_path": "C:\\DocScan_Projects\\Hop_Dong_2026\\_goc\\anh_chup_goc.jpg",
-  "has_raw_original": true
-}
-```
-
----
-
-### 3. `POST /api/move-to-unapproved`
-- **Mục đích:** Chuyển file ảnh vào kho chứa ảnh chưa duyệt tự do.
-- **Request Body:**
-```json
-{
-  "root_path": "C:\\DocScan_Projects",
-  "relative_path": "Hop_Dong_2026",
-  "filename": "anh_chup.jpg",
-  "image_id": "uuid-string",
-  "unapproved_folder_name": "Kho_Chua_Duyet"
-}
-```
-- **Response (200 OK):**
-```json
-{
-  "success": true,
-  "folder_id": "folder_Kho_Chua_Duyet",
-  "folder_name": "Kho ảnh chưa duyệt",
-  "relative_path": "Kho_Chua_Duyet",
-  "filename": "anh_chup.jpg"
-}
-```
-
----
-
-### 4. `POST /api/process`
-- **Request Body:**
-```json
-{
-  "image_id": "uuid-string",
-  "corners": [[45.0, 38.0], [1820.0, 42.0], [1810.0, 2450.0], [50.0, 2440.0]],
+  "filename": "Hợp Đồng Thuê Nhà.jpg",
+  "corners": [[45,38],[1820,42],[1810,2450],[50,2440]],
   "rotation": 0,
-  "settings": {
-    "mode": "natural",
-    "shadow_reduction": 0.6,
-    "sharpness": 0.6,
-    "contrast": 0.2,
-    "brightness": 0.0,
-    "margin_percent": 0.02,
-    "dewarp_enabled": false,
-    "dewarp_strength": 0.8,
-    "quality": 85,
-    "normalize_res": true
-  }
+  "settings": { "mode": "natural", "sharpness": 0.6, "...": "..." }
 }
 ```
-- **Response (200 OK):**
+
+**Phản hồi 200:** thân là **byte JPEG thô** (không phải base64), kèm header:
+- `X-Out-Width` / `X-Out-Height`: Kích thước ước tính của bản kết xuất đầy đủ.
+- `X-Preview-Width` / `X-Preview-Height`: Kích thước thật của ảnh xem trước.
+
+---
+
+### 4. `POST /api/export-images-zip` — Tải ZIP ảnh theo danh sách chọn
+
 ```json
 {
-  "success": true,
-  "processed_url": "data:image/jpeg;base64,...",
-  "width": 1780,
-  "height": 2410,
-  "out_dim": "1780 x 2410 px",
-  "out_size_human": "1.2 MB",
-  "saving_ratio": "-45%"
+  "relative_path": "Hop_Dong_2026",
+  "filenames": ["Trang_1.jpg", "Trang_2.jpg"],
+  "zip_name": "Hop_Dong_2026_2_anh"
 }
 ```
+
+**Phản hồi 200:** byte tệp `.zip` đính kèm header tải về (`Content-Disposition: attachment`).
+
+---
+
+### 5. `POST /api/export-pdf` — Xuất PDF theo danh sách chọn
+
+```json
+{
+  "relative_path": "Hop_Dong_2026",
+  "filenames": ["Trang_1.jpg", "Trang_2.jpg"],
+  "doc_name": "Hop_Dong_2026_2_trang"
+}
+```
+
+**Phản hồi 200:** byte tệp `.pdf` đính kèm header tải về.
+
+---
+
+### 6. `POST /api/apply-as-original` — Lưu ảnh sửa thành ảnh gốc
+
+```json
+{ "relative_path": "Hop_Dong_2026", "filename": "Hợp Đồng Thuê Nhà.jpg" }
+```
+
+Ghi đè `_goc/`, đặt lại 4 góc về trọn khung, xóa lịch sử hoàn tác (mốc gốc mới), dựng lại ảnh đang sửa, trả về bản ghi trang mới.

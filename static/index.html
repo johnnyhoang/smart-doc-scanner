@@ -28,10 +28,10 @@
             <div class="doc-name-wrapper" id="docNameWrapper" style="display: none;">
                 <div class="doc-name-input-box">
                     <i class="fa-regular fa-file-lines text-muted"></i>
-                    <input type="text" id="txtDocName" placeholder="Đặt tên tài liệu..." title="Nhấp để đổi tên tài liệu tải về">
+                    <input type="text" id="txtDocName" placeholder="Đặt tên tài liệu..." title="Gõ tên mới rồi nhấn Enter — ảnh gốc, ảnh đã sửa và metadata được đổi tên cùng lúc">
                     <div class="name-suggest-dropdown">
-                        <button class="btn-suggest-magic" id="btnMagicSuggest" title="Gợi ý tên AI thông minh">
-                            <i class="fa-solid fa-wand-magic-sparkles"></i>
+                        <button class="btn-suggest-magic" id="btnMagicSuggest" title="AI đọc nội dung để tự động gợi ý tên chuẩn hóa">
+                            <i class="fa-solid fa-wand-magic-sparkles"></i> <span>AI gợi ý tên</span>
                         </button>
                         <div class="suggest-menu" id="suggestMenu">
                             <!-- Suggested names rendered here -->
@@ -52,38 +52,15 @@
 
                 <div class="divider-v"></div>
 
-                <label class="btn btn-secondary upload-btn">
-                    <i class="fa-solid fa-cloud-arrow-up"></i> Thêm tài liệu
-                    <input type="file" id="fileInput" accept="image/*" multiple hidden>
-                </label>
-                <div class="dropdown">
-                    <button id="btnSaveToDiskMenu" class="btn btn-success" disabled>
-                        <i class="fa-solid fa-floppy-disk"></i> Lưu vào máy <i class="fa-solid fa-chevron-down ml-1"></i>
-                    </button>
-                    <div class="dropdown-menu" id="saveDiskDropdown">
-                        <a href="#" id="menuSaveFolderDisk"><i class="fa-solid fa-folder-open"></i> Lưu Thư mục này (Ảnh nét + PDF + Ảnh gốc)</a>
-                        <a href="#" id="menuSaveProjectDisk"><i class="fa-solid fa-layer-group"></i> Lưu Toàn bộ Thư mục gốc vào máy</a>
-                    </div>
-                </div>
-                <div class="dropdown">
-                    <button id="btnExportPdf" class="btn btn-primary" disabled>
-                        <i class="fa-solid fa-file-pdf"></i> Xuất PDF <i class="fa-solid fa-chevron-down ml-1"></i>
-                    </button>
-                    <div class="dropdown-menu" id="exportDropdown">
-                        <a href="#" id="menuExportActiveFolder"><i class="fa-solid fa-folder-open"></i> Xuất PDF Thư mục này</a>
-                        <a href="#" id="menuExportAllProject"><i class="fa-solid fa-layer-group"></i> Xuất PDF Toàn bộ Thư mục gốc</a>
-                    </div>
-                </div>
-                <div class="dropdown">
-                    <button id="btnDownloadCurrent" class="btn btn-secondary" disabled>
-                        <i class="fa-solid fa-download"></i> Tải ảnh <i class="fa-solid fa-chevron-down ml-1"></i>
-                    </button>
-                    <div class="dropdown-menu" id="downloadDropdown">
-                        <a href="#" data-format="jpeg"><i class="fa-regular fa-file-image"></i> Tải dạng JPG tối ưu</a>
-                        <a href="#" data-format="png"><i class="fa-regular fa-file-image"></i> Tải dạng PNG sắc nét</a>
-                        <a href="#" data-format="webp"><i class="fa-regular fa-file-image"></i> Tải dạng WebP siêu nhẹ</a>
-                    </div>
-                </div>
+                <button id="btnSaveToDisk" class="btn btn-success" disabled title="Lưu các trang đã chỉnh sửa vào máy tính">
+                    <i class="fa-solid fa-floppy-disk"></i> Lưu thay đổi
+                </button>
+                <button id="btnExportPdf" class="btn btn-primary" disabled title="Lưu trang đang mở thành tệp PDF — bạn chọn nơi lưu, mặc định là thư mục tài liệu">
+                    <i class="fa-solid fa-file-pdf"></i> Lưu PDF
+                </button>
+                <button id="btnDownloadCurrent" class="btn btn-secondary" disabled title="Lưu ảnh đã làm nét của trang đang mở — bạn chọn nơi lưu, mặc định là thư mục tài liệu">
+                    <i class="fa-solid fa-download"></i> Lưu ảnh
+                </button>
             </div>
         </header>
 
@@ -140,9 +117,12 @@
 
                     <!-- Folder Quick Actions Bar -->
                     <div class="folder-action-bar">
+                        <button class="btn btn-secondary btn-xs" id="btnToggleSelectAll" title="Chọn tất cả / Bỏ chọn tất cả ảnh trong thư mục" disabled>
+                            <i class="fa-regular fa-square-check"></i> <span id="lblToggleSelectAll">Chọn tất cả</span>
+                        </button>
                         <div class="dropdown">
-                            <button class="btn btn-secondary btn-xs" id="btnSortMenu" title="Sắp xếp thứ tự ảnh trong thư mục">
-                                <i class="fa-solid fa-arrow-down-a-z"></i> Sắp xếp <i class="fa-solid fa-chevron-down ml-1"></i>
+                            <button class="btn btn-secondary btn-xs" id="btnSortMenu" title="Sắp xếp thứ tự ảnh trong thư mục" disabled>
+                                <i class="fa-solid fa-arrow-down-a-z"></i> <span class="hide-sm">Sắp xếp</span> <i class="fa-solid fa-chevron-down ml-1"></i>
                             </button>
                             <div class="dropdown-menu dropdown-menu-left" id="sortDropdown">
                                 <a href="#" data-sort="az"><i class="fa-solid fa-arrow-down-a-z"></i> Tên A &rarr; Z</a>
@@ -150,12 +130,24 @@
                                 <a href="#" data-sort="reverse"><i class="fa-solid fa-arrows-up-down"></i> Đảo ngược thứ tự</a>
                             </div>
                         </div>
-                        <button class="btn btn-success btn-xs" id="btnSaveFolderToDisk" title="Lưu cả ảnh gốc, ảnh chỉnh sửa và PDF vào thư mục máy">
-                            <i class="fa-solid fa-floppy-disk"></i> Lưu vào máy
+                        <button class="btn btn-primary btn-xs" id="btnExportFolderPdf" title="Lưu các trang đã chọn thành một tệp PDF — bạn chọn nơi lưu" disabled>
+                            <i class="fa-solid fa-file-pdf"></i> <span id="lblExportPdf">Lưu PDF</span>
                         </button>
-                        <button class="btn btn-primary btn-xs" id="btnExportFolderPdf" title="Xuất PDF cho riêng thư mục này">
-                            <i class="fa-solid fa-file-pdf"></i> PDF
+                        <button class="btn btn-secondary btn-xs" id="btnDownloadFolderZip" title="Tải các ảnh đã chọn dưới dạng tệp ZIP" disabled>
+                            <i class="fa-solid fa-file-zipper"></i> <span id="lblDownloadZip">Lưu ảnh</span>
                         </button>
+                    </div>
+
+                    <!-- Multi-selection Action Bar -->
+                    <div class="selection-action-bar" id="selectionActionBar" style="display: none;">
+                        <div class="selection-info">
+                            <span class="selection-count" id="selectionCount"><i class="fa-solid fa-check-double text-accent"></i> Đã chọn: 0</span>
+                        </div>
+                        <div class="selection-btns">
+                            <button class="btn-link-xs" id="btnSelectAllPages">Chọn tất cả</button>
+                            <span class="text-muted">·</span>
+                            <button class="btn-link-xs" id="btnDeselectAllPages">Bỏ chọn</button>
+                        </div>
                     </div>
 
                     <!-- Draggable Page Thumbnails List -->
@@ -164,6 +156,7 @@
                     </div>
 
                     <div class="sidebar-footer">
+                        <input type="file" id="fileInput" accept="image/*" multiple hidden>
                         <label class="add-page-box" for="fileInput">
                             <i class="fa-solid fa-cloud-arrow-up"></i>
                             <span>Thêm ảnh (hoặc Ctrl+V dán)</span>
@@ -202,32 +195,14 @@
 
                 <!-- Active Editor Stage -->
                 <div class="editor-stage" id="editorStage" style="display: none;">
-                    <!-- On-demand AI Suggestion Banner (Only runs if user explicitly chooses) -->
-                    <div class="ai-suggest-banner" id="aiSuggestBanner" style="display: none;">
-                        <div class="ai-banner-left">
-                            <i class="fa-solid fa-wand-magic-sparkles text-accent"></i>
-                            <span><strong>Gợi ý AI:</strong> Bạn có muốn AI đọc nội dung văn bản để tự đặt tên chuẩn hóa không?</span>
-                        </div>
-                        <div class="ai-banner-actions">
-                            <button class="btn btn-primary btn-xs" id="btnRunAiSuggest"><i class="fa-solid fa-bolt"></i> Đọc AI</button>
-                            <button class="btn btn-secondary btn-xs" id="btnDismissAiSuggest" title="Bỏ qua không dùng AI"><i class="fa-solid fa-xmark"></i> Bỏ qua</button>
-                        </div>
-                    </div>
-
-                    <!-- Unified Apple-Style Stage Top Bar -->
+                    <!-- Stage Top Bar: 2 Chế Độ Rõ Ràng (Chỉnh sửa / So sánh) -->
                     <div class="stage-top-bar">
-                        <!-- Apple-Style Segmented View Switch & Hold-to-Compare -->
-                        <div class="apple-view-switch-box">
-                            <div class="apple-view-switch">
-                                <button class="seg-btn active" id="btnShowEdited" title="Xem ảnh đã xử lý làm nét">
-                                    <i class="fa-solid fa-wand-magic-sparkles text-accent"></i> Đã chỉnh sửa
-                                </button>
-                                <button class="seg-btn" id="btnShowOriginal" title="Xem ảnh gốc ban đầu & chỉnh 4 góc">
-                                    <i class="fa-regular fa-image"></i> Ảnh gốc
-                                </button>
-                            </div>
-                            <button class="btn-hold-compare" id="btnHoldCompare" title="Nhấn giữ chuột hoặc nhấn giữ phím Space để xem nhanh ảnh gốc">
-                                <i class="fa-solid fa-eye"></i> Giữ xem gốc
+                        <div class="view-mode-switch" role="group" aria-label="Chế độ làm việc">
+                            <button class="view-mode-btn" id="btnModeEdit" data-view="edit" title="Chế độ Chỉnh sửa — căn chỉnh 4 góc mép giấy, xoay và căn lề">
+                                <i class="fa-solid fa-crop-simple"></i> Chỉnh sửa
+                            </button>
+                            <button class="view-mode-btn active" id="btnModeCompare" data-view="compare" title="Chế độ So sánh — kéo thanh trượt để so sánh Trước / Sau">
+                                <i class="fa-solid fa-code-compare"></i> So sánh
                             </button>
                         </div>
 
@@ -258,26 +233,26 @@
 
                         <!-- Canvas Floating Controls -->
                         <div class="floating-toolbar">
-                            <button class="tool-btn active" id="btnToggleCropHandles" title="Bật/Tắt hiển thị 4 góc cắt mép giấy">
-                                <i class="fa-solid fa-crop-simple"></i> Căn 4 góc
-                            </button>
-                            <button class="tool-btn" id="btnAutoDetect" title="Tự động nhận diện lại mép giấy">
-                                <i class="fa-solid fa-expand"></i> Tự nhận góc
-                            </button>
-                            <button class="tool-btn" id="btnExpandMargin" title="Mở rộng lề 2% và tự động đắp viền giấy">
-                                <i class="fa-solid fa-maximize"></i> Mở lề 2%
-                            </button>
-                            <button class="tool-btn" id="btnResetCorners" title="Bao trọn toàn bộ bức ảnh">
-                                <i class="fa-solid fa-border-all"></i> Trọn ảnh
-                            </button>
-                            <button class="tool-btn" id="btnResetToRawOriginal" title="Khôi phục toàn bộ cài đặt & góc cắt về ảnh chụp ban đầu">
+                            <button class="tool-btn" id="btnResetToRawOriginal" title="Khôi phục toàn bộ cài đặt & góc cắt về ảnh chụp ban đầu" disabled>
                                 <i class="fa-solid fa-clock-rotate-left text-warning"></i> Về ảnh gốc
                             </button>
+                            <button class="tool-btn" id="btnResetCorners" title="Bao trọn toàn bộ bức ảnh" disabled>
+                                <i class="fa-solid fa-border-all"></i> Trọn ảnh
+                            </button>
+                            <button class="tool-btn" id="btnAutoDetect" title="Tự động nhận diện chính xác 4 góc mép giấy" disabled>
+                                <i class="fa-solid fa-expand"></i> Tự nhận góc
+                            </button>
+                            <button class="tool-btn" id="btnExpandMargin" title="Mở rộng lề 2% ra phía ngoài" disabled>
+                                <i class="fa-solid fa-maximize"></i> Mở lề 2%
+                            </button>
+                            <button class="tool-btn" id="btnShrinkMargin" title="Thu hẹp lề 2% vào phía trong" disabled>
+                                <i class="fa-solid fa-minimize"></i> Thu lề 2%
+                            </button>
                             <div class="divider-v"></div>
-                            <button class="tool-btn" id="btnRotateLeft" title="Xoay trái 90°">
+                            <button class="tool-btn" id="btnRotateLeft" title="Xoay trái 90°" disabled>
                                 <i class="fa-solid fa-arrow-rotate-left"></i> Xoay trái
                             </button>
-                            <button class="tool-btn" id="btnRotateRight" title="Xoay phải 90°">
+                            <button class="tool-btn" id="btnRotateRight" title="Xoay phải 90°" disabled>
                                 <i class="fa-solid fa-arrow-rotate-right"></i> Xoay phải
                             </button>
                         </div>
@@ -288,9 +263,12 @@
                         <div class="status-left">
                             <i class="fa-solid fa-circle-check text-success" id="statusIcon"></i>
                             <span id="resultInfoText">Đã làm rõ nét chữ & cân bằng ánh sáng</span>
-                            <button class="btn btn-secondary btn-xs ml-2" id="btnApplyAsOriginal" title="Đặt ảnh đã xử lý hiện tại thay thế làm ảnh gốc mới để tiếp tục căn chỉnh">
-                                <i class="fa-solid fa-clone text-accent"></i> Lưu làm ảnh gốc mới
-                            </button>
+                            <span class="processing-pill" id="processingPill" style="display: none;">
+                                <span class="mini-spinner"></span> Đang dựng ảnh…
+                            </span>
+                            <span class="save-state-pill" id="saveStatePill" title="Tình trạng lưu xuống ổ đĩa">
+                                <i class="fa-solid fa-hard-drive"></i> Đã lưu
+                            </span>
                         </div>
                         <div class="status-metrics" id="statusMetrics">
                             <div class="metric-item" title="Kích thước và dung lượng ảnh gốc">
@@ -315,7 +293,7 @@
                     <h3 class="section-title"><i class="fa-solid fa-circle-info text-accent"></i> Thông số & Tên tài liệu</h3>
                     <div class="meta-grid">
                         <div class="meta-row">
-                            <span class="meta-k">Tên xuất file:</span>
+                            <span class="meta-k">Tên tệp:</span>
                             <span class="meta-v text-accent" id="cardFileName">--</span>
                         </div>
                         <div class="meta-row">
@@ -326,98 +304,68 @@
                             <span class="meta-k">Dung lượng gốc:</span>
                             <span class="meta-v" id="cardOrigSize">-- MB</span>
                         </div>
-                        <div class="meta-row">
-                            <span class="meta-k">Độ phân giải:</span>
-                            <span class="meta-v" id="cardMegapixels">-- MP</span>
-                        </div>
                         <div class="meta-divider"></div>
                         <div class="meta-row">
-                            <span class="meta-k">Dung lượng nén:</span>
+                            <span class="meta-k">Bản xuất ra:</span>
                             <span class="meta-v text-success" id="cardOutSize">-- KB</span>
                         </div>
                         <div class="meta-row">
-                            <span class="meta-k">Tỷ lệ tối ưu:</span>
-                            <span class="meta-v text-accent" id="cardSavingRatio">--%</span>
+                            <span class="meta-k">Tối ưu dung lượng:</span>
+                            <span class="meta-v text-success" id="cardSavingsPct">--</span>
+                        </div>
+                        <div class="meta-row">
+                            <span class="meta-k">Bản gốc lưu trữ:</span>
+                            <span class="meta-v text-accent" id="cardOriginalState">--</span>
                         </div>
                     </div>
                     <button class="btn btn-secondary btn-sm btn-block mt-2" id="btnPanelApplyAsOriginal" title="Đặt kết quả đã xử lý hiện tại thay thế làm ảnh gốc mới để tiếp tục chỉnh sửa">
-                        <i class="fa-solid fa-clone text-accent"></i> Lưu làm ảnh gốc mới
+                        <i class="fa-solid fa-clone text-accent"></i> Lưu ảnh sửa thành ảnh gốc
                     </button>
                 </div>
 
                 <!-- Color Enhancement & Restoration Modes -->
                 <div class="panel-section">
-                    <h3 class="section-title"><i class="fa-solid fa-sliders"></i> Chế độ xử lý & Phục hồi tài liệu</h3>
+                    <h3 class="section-title"><i class="fa-solid fa-sliders"></i> Bộ lọc & Chế độ màu</h3>
                     <div class="filter-modes-grid">
-                        <button class="mode-card active" data-mode="natural">
+                        <button class="mode-card active" data-mode="natural" title="Màu tự nhiên - Giữ 100% màu sắc và nét chữ">
                             <div class="mode-icon"><i class="fa-solid fa-leaf"></i></div>
-                            <div class="mode-info">
-                                <strong>Tự nhiên (Mặc định)</strong>
-                                <small>Giữ 100% màu gốc, nét chữ sắc sảo</small>
-                            </div>
+                            <span class="mode-title">Tự nhiên</span>
                         </button>
-                        <button class="mode-card" data-mode="magic_color">
+                        <button class="mode-card" data-mode="magic_color" title="Màu ma thuật - Nền trắng sáng, mực tươi">
                             <div class="mode-icon"><i class="fa-solid fa-wand-magic-sparkles"></i></div>
-                            <div class="mode-info">
-                                <strong>Màu Ma Thuật (Magic Color)</strong>
-                                <small>Tẩy trắng nền giấy, tươi sáng màu mực</small>
-                            </div>
+                            <span class="mode-title">Ma thuật</span>
                         </button>
-                        <button class="mode-card" data-mode="high_contrast_stamp">
-                            <div class="mode-icon"><i class="fa-solid fa-stamp"></i></div>
-                            <div class="mode-info">
-                                <strong>Làm nổi Dấu Đỏ & Chữ Ký</strong>
-                                <small>Tăng rực dấu mộc đỏ, chữ ký xanh</small>
-                            </div>
-                        </button>
-                        <button class="mode-card" data-mode="restore_yellowed">
-                            <div class="mode-icon"><i class="fa-solid fa-hourglass-half"></i></div>
-                            <div class="mode-info">
-                                <strong>Tẩy Ố Giấy Cũ / Lưu Trữ</strong>
-                                <small>Khử ố vàng giấy báo cũ, làm đậm chữ</small>
-                            </div>
-                        </button>
-                        <button class="mode-card" data-mode="remove_bleedthrough">
-                            <div class="mode-icon"><i class="fa-solid fa-ghost"></i></div>
-                            <div class="mode-info">
-                                <strong>Khử Thấu Quang (Chữ In Lưng)</strong>
-                                <small>Xóa chữ hằn từ mặt sau giấy mỏng</small>
-                            </div>
-                        </button>
-                        <button class="mode-card" data-mode="super_sharp_mono">
-                            <div class="mode-icon"><i class="fa-solid fa-receipt"></i></div>
-                            <div class="mode-info">
-                                <strong>Siêu Sắc Nét Hóa Đơn Nhiệt</strong>
-                                <small>Phục hồi hóa đơn mờ, giấy than</small>
-                            </div>
-                        </button>
-                        <button class="mode-card" data-mode="clean_bg">
+                        <button class="mode-card" data-mode="clean_bg" title="Nền sạch sáng - Làm trắng nền giấy">
                             <div class="mode-icon"><i class="fa-solid fa-file-circle-check"></i></div>
-                            <div class="mode-info">
-                                <strong>Nền sạch sáng</strong>
-                                <small>Làm sáng trắng nền giấy, giữ màu mực</small>
-                            </div>
+                            <span class="mode-title">Nền sạch</span>
                         </button>
-                        <button class="mode-card" data-mode="sharp_text">
+                        <button class="mode-card" data-mode="sharp_text" title="Rõ nét chữ mờ - Tăng tương phản nét chữ">
                             <div class="mode-icon"><i class="fa-solid fa-pen-nib"></i></div>
-                            <div class="mode-info">
-                                <strong>Rõ nét chữ mờ</strong>
-                                <small>Tăng tương phản nét chữ, chữ bút chì</small>
-                            </div>
+                            <span class="mode-title">Rõ nét chữ</span>
                         </button>
-                        <button class="mode-card" data-mode="bw_scan">
+                        <button class="mode-card" data-mode="bw_scan" title="Trắng đen Scan - Chuẩn in văn phòng">
                             <div class="mode-icon"><i class="fa-solid fa-print"></i></div>
-                            <div class="mode-info">
-                                <strong>Trắng đen Scan</strong>
-                                <small>Đơn sắc chuẩn văn phòng, in tiết kiệm</small>
-                            </div>
+                            <span class="mode-title">Trắng đen</span>
                         </button>
-                        <button class="mode-card" data-mode="original">
+                        <button class="mode-card" data-mode="high_contrast_stamp" title="Làm nổi bật con dấu đỏ và chữ ký">
+                            <div class="mode-icon"><i class="fa-solid fa-stamp"></i></div>
+                            <span class="mode-title">Dấu & Chữ ký</span>
+                        </button>
+                        <button class="mode-card" data-mode="restore_yellowed" title="Tẩy ố vàng giấy cũ, tài liệu lưu trữ">
+                            <div class="mode-icon"><i class="fa-solid fa-hourglass-half"></i></div>
+                            <span class="mode-title">Tẩy ố giấy</span>
+                        </button>
+                        <button class="mode-card" data-mode="remove_bleedthrough" title="Khử thấu quang - Xóa nét mực mặt sau">
+                            <div class="mode-icon"><i class="fa-solid fa-ghost"></i></div>
+                            <span class="mode-title">Khử thấu quang</span>
+                        </button>
+                        <button class="mode-card" data-mode="super_sharp_mono" title="Siêu sắc nét cho hóa đơn nhiệt, giấy than">
+                            <div class="mode-icon"><i class="fa-solid fa-receipt"></i></div>
+                            <span class="mode-title">Hóa đơn</span>
+                        </button>
+                        <button class="mode-card" data-mode="original" title="Ảnh gốc cắt phẳng - Giữ nguyên màu chụp">
                             <div class="mode-icon"><i class="fa-solid fa-image"></i></div>
-                            <div class="mode-info">
-                                <strong>Ảnh gốc cắt phẳng</strong>
-                                <small>Chỉ nắn thẳng, không đổi màu</small>
-                            </div>
+                            <span class="mode-title">Ảnh gốc</span>
                         </button>
                     </div>
                 </div>
@@ -622,6 +570,41 @@
                     <button class="btn btn-primary" id="btnOrphanAdopt" title="Tạo bản sao vào thư mục _goc và sẵn sàng chỉnh sửa">
                         <i class="fa-solid fa-wand-magic-sparkles"></i> Sửa ảnh & Tạo bản gốc (Yes)
                     </button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Modal 4: Xác nhận thao tác (Custom Confirm Dialog) -->
+        <div class="modal-backdrop" id="confirmModal" style="display: none;">
+            <div class="modal-card" style="max-width: 440px;">
+                <div class="modal-header">
+                    <h3 id="confirmModalTitle"><i class="fa-solid fa-circle-question text-accent"></i> Xác nhận thao tác</h3>
+                    <button class="modal-close-btn" id="btnCancelConfirmModal"><i class="fa-solid fa-xmark"></i></button>
+                </div>
+                <div class="modal-body">
+                    <p class="modal-desc" id="confirmModalMessage" style="font-size: 13.5px; line-height: 1.6; color: var(--text-main); margin: 0;"></p>
+                </div>
+                <div class="modal-footer" style="display: flex; justify-content: flex-end; gap: 8px;">
+                    <button class="btn btn-secondary" id="btnConfirmCancel">Hủy</button>
+                    <button class="btn btn-danger" id="btnConfirmOk">Đồng ý</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Modal 5: Cảnh báo chưa lưu khi đổi trang / thư mục -->
+        <div class="modal-backdrop" id="unsavedModal" style="display: none;">
+            <div class="modal-card" style="max-width: 480px;">
+                <div class="modal-header">
+                    <h3 id="unsavedModalTitle"><i class="fa-solid fa-triangle-exclamation text-warning"></i> Lưu thay đổi trang hiện tại?</h3>
+                    <button class="modal-close-btn" id="btnCloseUnsavedModal"><i class="fa-solid fa-xmark"></i></button>
+                </div>
+                <div class="modal-body">
+                    <p class="modal-desc" id="unsavedModalMessage" style="font-size: 13.5px; line-height: 1.6; color: var(--text-main); margin: 0;"></p>
+                </div>
+                <div class="modal-footer" style="display: flex; justify-content: flex-end; gap: 8px; flex-wrap: wrap;">
+                    <button class="btn btn-secondary" id="btnUnsavedCancel">Hủy bỏ</button>
+                    <button class="btn btn-secondary" id="btnUnsavedDiscard" style="color: #ef4444; border-color: rgba(239, 68, 68, 0.3);">Không lưu</button>
+                    <button class="btn btn-primary" id="btnUnsavedSave"><i class="fa-solid fa-floppy-disk"></i> Lưu thay đổi</button>
                 </div>
             </div>
         </div>

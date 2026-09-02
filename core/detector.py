@@ -1,6 +1,42 @@
+import os
 import cv2
 import numpy as np
-from typing import List, Tuple, Optional
+from typing import Tuple, Optional
+
+
+def imread_unicode(path: str, flags: int = cv2.IMREAD_COLOR) -> Optional[np.ndarray]:
+    """
+    Unicode-safe image reader for Windows supporting paths with Vietnamese accents and special chars.
+    """
+    try:
+        if not os.path.exists(path):
+            return None
+        with open(path, "rb") as f:
+            bytes_data = bytearray(f.read())
+        nparr = np.asarray(bytes_data, dtype=np.uint8)
+        return cv2.imdecode(nparr, flags)
+    except Exception as e:
+        print(f"[Warning] Failed to read image with unicode path {path}: {e}")
+        return None
+
+
+def imwrite_unicode(path: str, img: np.ndarray, params: Optional[list] = None) -> bool:
+    """
+    Unicode-safe image writer for Windows supporting paths with Vietnamese accents and special chars.
+    """
+    try:
+        ext = os.path.splitext(path)[1]
+        if not ext:
+            ext = ".jpg"
+        success, encoded_img = cv2.imencode(ext, img, params or [])
+        if success:
+            with open(path, "wb") as f:
+                encoded_img.tofile(f)
+            return True
+        return False
+    except Exception as e:
+        print(f"[Warning] Failed to write image with unicode path {path}: {e}")
+        return False
 
 
 def order_points(pts: np.ndarray) -> np.ndarray:
@@ -83,9 +119,9 @@ def find_quad_contour(binary_img: np.ndarray, min_area: float) -> Optional[np.nd
     return None
 
 
-def detect_document_corners(image: np.ndarray, margin_percent: float = 0.02) -> Tuple[np.ndarray, bool]:
+def detect_document_corners(image: np.ndarray, margin_percent: float = 0.0) -> Tuple[np.ndarray, bool]:
     """
-    Multi-pass automatic document corner detection with proportional margin expansion.
+    Multi-pass automatic document corner detection.
     Returns (corners, detected_flag).
     corners: 4x2 float32 array in original image coordinates.
     """

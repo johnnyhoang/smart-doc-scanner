@@ -16,11 +16,11 @@
 
 | STT | Tài liệu chi tiết | Nội dung chính |
 | :--- | :--- | :--- |
-| **01** | [**01. Lưu Trữ & Hệ Thống Tệp Tin**](file:///d:/Hoa%20Hoang/Apps/refine_docs/docs/specs/01_STORAGE_AND_FILE_SYSTEM.md) | Cấu trúc đĩa vật lý, thư mục `_goc/`, metadata `.docscan_meta.json`, `Kho_Chua_Duyet`, Auto-save 60s, xử lý ảnh lẻ (Orphan Images). |
-| **02** | [**02. Pipeline Xử Lý Ảnh Thuật Toán**](file:///d:/Hoa%20Hoang/Apps/refine_docs/docs/specs/02_IMAGE_PROCESSING_PIPELINE.md) | Nhận diện 4 góc, Perspective Transform, Margin Expansion, Làm phẳng Dewarp, 5+ bộ lọc màu, làm nét chữ, nén & xuất PDF. |
-| **03** | [**03. Giao Diện & Trải Nghiệm Người Dùng (UI/UX)**](file:///d:/Hoa%20Hoang/Apps/refine_docs/docs/specs/03_UI_UX_AND_INTERACTION.md) | Viewport đơn kiểu Apple, Hold-to-Compare (Phím Space), Kính lúp Loupe 2.5x, Kéo chỉnh 4 góc, Cây thư mục điều chỉnh kích thước, Undo/Redo. |
-| **04** | [**04. Đặc Tả Giao Tiếp API (Backend API Spec)**](file:///d:/Hoa%20Hoang/Apps/refine_docs/docs/specs/04_API_SPECIFICATION.md) | Toàn bộ REST APIs của FastAPI: schemas dữ liệu, request/response models, mã trạng thái HTTP, xử lý lỗi. |
-| **05** | [**05. Đặt Tên Tài Liệu & Gợi Ý AI On-Demand**](file:///d:/Hoa%20Hoang/Apps/refine_docs/docs/specs/05_NAMING_AND_AI_SUGGESTIONS.md) | Thuật toán sinh slug tên chuẩn, tích hợp Gemini AI nhận diện ngữ cảnh, chính sách tiết kiệm token (chỉ chạy khi user bấm). |
+| **01** | [**01. Lưu Trữ & Hệ Thống Tệp Tin**](file:///d:/Hoa%20Hoang/Apps/refine_docs/docs/specs/01_STORAGE_AND_FILE_SYSTEM.md) | **Bất biến đối tượng tài liệu (bộ ba gốc/sửa/metadata)**, cấu trúc đĩa, `_goc/`, ghi metadata hợp nhất, thứ tự trang, quét nhẹ, 3 mức lưu, ảnh lẻ, `Kho_Chua_Duyet`. |
+| **02** | [**02. Pipeline Xử Lý Ảnh Thuật Toán**](file:///d:/Hoa%20Hoang/Apps/refine_docs/docs/specs/02_IMAGE_PROCESSING_PIPELINE.md) | **Hai mức kết xuất (xem trước 1600px / đầy đủ)**, nhận diện 4 góc, Perspective Transform, mở viền, Dewarp, 10 bộ lọc màu, nén & xuất PDF. |
+| **03** | [**03. Giao Diện & Trải Nghiệm Người Dùng (UI/UX)**](file:///d:/Hoa%20Hoang/Apps/refine_docs/docs/specs/03_UI_UX_AND_INTERACTION.md) | **4 nguyên tắc trải nghiệm**, bộ chuyển 3 chế độ xem, so sánh trước/sau trung thực, kính lúp 2.5x, kéo 4 góc, chỉ báo đã lưu, Undo/Redo, bố cục co giãn. |
+| **04** | [**04. Đặc Tả Giao Tiếp API (Backend API Spec)**](file:///d:/Hoa%20Hoang/Apps/refine_docs/docs/specs/04_API_SPECIFICATION.md) | Toàn bộ REST API: định danh trang theo `(thư mục, tên tệp)`, bản ghi trang chuẩn, request/response, mã HTTP, quy ước lỗi tiếng Việt. |
+| **05** | [**05. Đặt Tên Tài Liệu & Gợi Ý AI On-Demand**](file:///d:/Hoa%20Hoang/Apps/refine_docs/docs/specs/05_NAMING_AND_AI_SUGGESTIONS.md) | Tên hiển thị = tên tệp trên đĩa, **giữ nguyên dấu tiếng Việt**, chống trùng tên, gợi ý tên bằng OCR chỉ chạy khi người dùng bấm. |
 | **06** | [**06. Hướng Dẫn Đồng Bộ & Bảo Trì Code - Specs**](file:///d:/Hoa%20Hoang/Apps/refine_docs/docs/specs/06_DEVELOPER_AND_AI_SYNC_GUIDELINES.md) | Quy trình chuẩn khi commit, checklist kiểm tra tính toàn vẹn, nguyên tắc viết code sạch và chống lệch specs. |
 
 ---
@@ -30,40 +30,49 @@
 ```mermaid
 graph TD
     User["👤 Người dùng (Trình duyệt Web)"]
-    
+
     subgraph Frontend ["Desktop Web UI (HTML5 + CSS3 + Vanilla ES6 JS)"]
-        UI_Tree["Cây thư mục & Dự án"]
-        UI_Viewer["Unified Apple-Style Stage<br>(Canvas + Loupe + Space Hold)"]
-        UI_Inspector["Thanh tinh chỉnh & Bộ lọc màu"]
-        UI_Modals["Hộp thoại (Folder, Move, Orphan, AI)"]
-        UI_History["Quản lý Undo / Redo (30 bước)"]
+        UI_Tree["Cây thư mục 1:1 với ổ đĩa"]
+        UI_Viewer["Unified Stage<br>(Canvas + 3 chế độ xem + Loupe)"]
+        UI_Inspector["Bộ lọc màu & thanh tinh chỉnh"]
+        UI_History["Undo / Redo 30 bước"]
+        UI_SaveState["Chỉ báo Đã lưu / Chưa lưu"]
     end
-    
+
     subgraph Backend ["FastAPI Server (Python 3.10+)"]
-        API_Router["REST API Endpoints (server.py)"]
-        Store["In-Memory Store (IMAGE_STORE)"]
-        
-        subgraph CoreModules ["Core Processing Modules (OpenCV + NumPy + PyMuPDF)"]
-            M_Detect["detector.py (4 góc, xoay, mở rộng viền)"]
-            M_Dewarp["dewarp.py (Làm phẳng trang cong & nhăn)"]
-            M_Enhance["enhancer.py (Cân bằng sáng, lọc màu, nét chữ)"]
-            M_Compress["compressor.py (Nén ảnh, xuất PDF chuẩn in)"]
-            M_Namer["namer.py (Quy tắc đặt tên + Gemini AI)"]
+        API["REST API (server.py)"]
+        Cache["PixelCache (LRU 8 ảnh gốc)"]
+
+        subgraph Model ["Tầng Mô Hình Dữ Liệu"]
+            M_Store["pagestore.py<br>NGUỒN SỰ THẬT DUY NHẤT<br>đường dẫn · metadata · vòng đời trang"]
+            M_Render["renderer.py<br>render_page() — hàm thuần<br>2 mức: xem trước / đầy đủ"]
+        end
+
+        subgraph CoreModules ["Thuật Toán Xử Lý Ảnh (OpenCV + NumPy + PyMuPDF)"]
+            M_Detect["detector.py (4 góc, xoay, mở viền)"]
+            M_Dewarp["dewarp.py (làm phẳng trang cong)"]
+            M_Enhance["enhancer.py (cân bằng sáng, lọc màu, nét chữ)"]
+            M_Compress["compressor.py (300 DPI, nén, xuất PDF)"]
+            M_Namer["namer.py (OCR gợi ý tên)"]
         end
     end
-    
-    subgraph DiskStorage ["Lưu Trữ Vật Lý (Local Hard Drive)"]
-        RootFolder["Thư mục Root được chọn"]
-        SubFolders["Thư mục con (Chứa file ảnh đã chỉnh & file PDF)"]
-        GocFolder["Thư mục _goc/ (Bảo toàn 100% ảnh gốc)"]
-        MetaFile[".docscan_meta.json (Lưu góc cắt, filters, Undo/Redo)"]
-        KhoChuaDuyet["Kho_Chua_Duyet/ (Kho chứa ảnh lẻ tự do)"]
+
+    subgraph Disk ["Ổ Cứng — Đối Tượng Tài Liệu"]
+        Goc["_goc/&lt;tên&gt;_goc.jpg<br>ẢNH GỐC (bất biến)"]
+        Edited["&lt;tên&gt;.jpg<br>ẢNH ĐANG SỬA"]
+        Meta[".docscan_meta.json<br>TÌNH TRẠNG HIỆN TẠI"]
+        Pdf["&lt;Tên thư mục&gt;.pdf"]
     end
-    
+
     User <--> Frontend
-    Frontend <-->|"HTTP REST JSON & Base64"| Backend
-    Backend <--> CoreModules
-    Backend <-->|"Đọc / Ghi trực tiếp ổ đĩa"| DiskStorage
+    Frontend <-->|"REST JSON + byte ảnh trực tiếp"| API
+    API --> Cache
+    API --> M_Store
+    API --> M_Render
+    M_Render --> CoreModules
+    M_Store <-->|"Đọc / ghi trọn bộ ba"| Disk
+    Goc -.->|"render_page()"| Edited
+    Meta -.->|"render_page()"| Edited
 ```
 
 ---
@@ -72,41 +81,93 @@ graph TD
 
 ```
 refine_docs/
-├── core/                           # Thư viện thuật toán lõi xử lý ảnh
+├── core/                           # Thư viện lõi
 │   ├── __init__.py
-│   ├── detector.py                 # Nhận diện 4 góc mép giấy & perspective warp
-│   ├── dewarp.py                   # Thuật toán làm phẳng cong võng & nếp gấp
-│   ├── enhancer.py                 # Bộ lọc nâng cao: cân bằng sáng LAB, làm nét chữ
+│   ├── pagestore.py                # ★ NGUỒN SỰ THẬT: đối tượng tài liệu, đường dẫn, metadata
+│   ├── renderer.py                 # ★ Bộ dựng ảnh xác định (xem trước / đầy đủ)
+│   ├── detector.py                 # Nhận diện 4 góc & perspective warp
+│   ├── dewarp.py                   # Làm phẳng trang cong võng
+│   ├── enhancer.py                 # Bộ lọc màu, cân bằng sáng, làm nét chữ
 │   ├── compressor.py               # Chuẩn hóa 300 DPI, nén JPEG, ghép PDF
-│   └── namer.py                    # Sinh tên tài liệu cơ bản & gọi Gemini AI
-├── docs/                           # Thư mục tài liệu & đặc tả kỹ thuật
-│   └── specs/                      # Bộ đặc tả chi tiết 1:1 với code
-│       ├── CORE_SPECS.md           # Entrypoint đặc tả trung tâm (Tài liệu này)
-│       ├── 01_STORAGE_AND_FILE_SYSTEM.md
-│       ├── 02_IMAGE_PROCESSING_PIPELINE.md
-│       ├── 03_UI_UX_AND_INTERACTION.md
-│       ├── 04_API_SPECIFICATION.md
-│       ├── 05_NAMING_AND_AI_SUGGESTIONS.md
-│       └── 06_DEVELOPER_AND_AI_SYNC_GUIDELINES.md
-├── static/                         # Giao diện người dùng Desktop Web
-│   ├── css/
-│   │   └── style.css               # Apple-dark theme, flexbox/grid, modal, canvas controls
-│   ├── js/
-│   │   └── app.js                  # Frontend Controller: State, Event Listeners, Canvas rendering
-│   └── index.html                  # Cấu trúc HTML giao diện ứng dụng
-├── main.py                         # Điểm chạy ứng dụng Desktop (khởi động server + tự mở browser)
-├── server.py                       # FastAPI backend server & API routing
-├── requirements.txt                # Danh sách thư viện Python phụ thuộc
-├── run.bat                         # Shortcut nhấp đúp chạy ứng dụng trên Windows
-└── README.md                       # Giới thiệu tổng quan nhanh
+│   └── namer.py                    # Sinh tên cơ bản & gợi ý tên bằng OCR
+├── docs/specs/                     # Bộ đặc tả chi tiết 1:1 với code
+│   ├── CORE_SPECS.md               # Tài liệu này
+│   ├── 01_STORAGE_AND_FILE_SYSTEM.md
+│   ├── 02_IMAGE_PROCESSING_PIPELINE.md
+│   ├── 03_UI_UX_AND_INTERACTION.md
+│   ├── 04_API_SPECIFICATION.md
+│   ├── 05_NAMING_AND_AI_SUGGESTIONS.md
+│   └── 06_DEVELOPER_AND_AI_SYNC_GUIDELINES.md
+├── static/
+│   ├── css/style.css               # Apple-dark theme, bố cục co giãn
+│   ├── js/app.js                   # Frontend Controller
+│   └── index.html
+├── main.py                         # Chạy ứng dụng (khởi động server + mở trình duyệt)
+├── server.py                       # FastAPI backend & định tuyến API
+├── requirements.txt
+├── run.bat
+└── README.md
 ```
 
 ---
 
 ## ⚙️ Các Bất Biến Kỹ Thuật Bắt Buộc (System Invariants)
 
-1. **Bảo toàn ảnh gốc tuyệt đối:** Ảnh gốc không bao giờ bị ghi đè ngầm, luôn được cất giữ an toàn trong thư mục con `_goc/` hoặc được nâng cấp thành ảnh gốc mới khi người dùng bấm nút xác nhận rõ ràng (`Lưu làm ảnh gốc mới`).
-2. **Khả năng làm việc Offline hoàn toàn:** Ứng dụng chạy offline 100% với OpenCV và NumPy. Tính năng AI đặt tên qua Gemini là **tùy chọn (on-demand)** và chỉ kích hoạt khi người dùng chủ động bấm yêu cầu.
-3. **Persistent State across Restarts:** Tọa độ 4 góc, góc xoay, các thanh trượt bộ lọc và lịch sử Undo/Redo của từng trang được lưu vào `.docscan_meta.json`. Khi mở lại app, người dùng có thể tiếp tục `Ctrl + Z` hoàn tác như chưa từng tắt app.
-4. **Auto-Save 60 giây an toàn:** Khi có chỉnh sửa mà người dùng quên bấm lưu, hệ thống tự động lưu sau 60 giây không thao tác.
-5. **Tạo thư mục thực tức thì:** Thao tác tạo/đổi tên/xóa thư mục trên giao diện luôn gọi API tạo/sửa/xóa trực tiếp trên ổ cứng máy tính ngay lập tức.
+1. **Đối tượng tài liệu là bộ ba không tách rời.** Mỗi trang luôn gồm đủ ảnh gốc `_goc/<tên>_goc.jpg`,
+   ảnh đang sửa `<tên>.jpg` và mục metadata trong `.docscan_meta.json`. Mọi thao tác vòng đời
+   (nhập, đổi tên, di chuyển, xóa) tác động **đồng thời lên cả ba**, không bao giờ để lệch.
+   → Toàn bộ quy tắc nằm ở `core/pagestore.py`; không code nào khác được tự ghép đường dẫn hay ghi tệp.
+
+2. **Bảo toàn ảnh gốc tuyệt đối.** Ảnh gốc không bao giờ bị ghi đè ngầm; chỉ thay thế khi người dùng
+   bấm xác nhận rõ ràng (`Lưu ảnh sửa thành ảnh gốc`).
+
+3. **Ảnh đang sửa là hàm thuần của metadata:** `render(ảnh_gốc, corners, rotation, settings)`.
+   Khi lưu, hệ thống dựng lại từ metadata rồi mới ghi đè — tệp trên đĩa luôn khớp thứ metadata mô tả.
+
+4. **Ghi metadata hợp nhất theo từng trường & tra cứu an toàn.** Trường vắng mặt hoặc `null` giữ nguyên
+   giá trị cũ. Tra cứu metadata `find_meta_entry()` an toàn không phân biệt hoa thường trên Windows.
+
+5. **Bắt đầu từ thư mục nào cũng như nhau.** Ảnh vừa nhập được ghi đủ bộ ba xuống đĩa ngay lập tức;
+   không tồn tại "trang chỉ nằm trong RAM". Đóng app đột ngột không mất dữ liệu.
+
+6. **Quét nhẹ, tải ảnh theo yêu cầu.** `scan-directory` không nạp điểm ảnh và không trả base64;
+   ảnh đi qua `GET /api/image` để trình duyệt tự đệm. Bộ nhớ máy chủ giới hạn bằng LRU 8 ảnh.
+
+7. **Offline 100% & AI On-Demand.** Toàn bộ xử lý chạy cục bộ bằng OpenCV/NumPy. Gợi ý tên bằng AI/OCR là **tùy chọn**
+   duy nhất tại ô nhập tên và chỉ chạy khi người dùng chủ động bấm `[ ✨ AI gợi ý tên ]`.
+
+8. **Trạng thái bền vững qua các phiên.** 4 góc, góc xoay, bộ lọc, thứ tự trang và ngăn xếp Undo/Redo
+   được lưu vào `.docscan_meta.json`. Mở lại app vẫn `Ctrl + Z` hoàn tác được như chưa từng tắt.
+
+9. **Lưu thay đổi chính xác:** Nút `[ 💾 Lưu thay đổi ]` chỉ sáng khi có trang chỉnh sửa dở (`dirtyPages > 0`),
+   tự động mờ khi dữ liệu an toàn.
+
+10. **Thao tác thư mục tức thì & chặn thoát an toàn.** Tự động gộp Kho ảnh chưa duyệt trùng lặp,
+    chặn mọi đường dẫn thoát ra ngoài thư mục dự án.
+
+11. **Không lộ thông tin kỹ thuật ra giao diện.** 100% dùng hộp thoại xác nhận tùy biến (Custom Modal),
+    không UUID, không mã lỗi tiếng Anh, không stack trace — chỉ tên tệp rõ ràng và câu tiếng Việt dễ hiểu.
+
+12. **Ghi đĩa thất bại phải báo lỗi.** Không thao tác lưu nào được trả "thành công" khi chưa ghi được
+    byte nào. Giao diện chỉ xoá cờ "chưa lưu" cho đúng những trang máy chủ xác nhận đã ghi
+    (`saved_filenames`); trang ghi hỏng giữ nguyên cờ để người dùng thử lại.
+
+13. **Không ảnh nào được biến mất khỏi giao diện.** Mọi trang trả về phải thuộc một thư mục có trong
+    cây. Thư mục trùng lặp được gộp thật và chỉ xoá khi đã rỗng; gộp hỏng thì hiển thị cả hai
+    kèm cảnh báo, tuyệt đối không giấu bớt dữ liệu người dùng.
+
+14. **Việc nặng không chạy trên event loop.** Endpoint nặng CPU khai báo `def` thường để FastAPI đẩy
+    sang threadpool. Nếu để `async def`, một lần lưu sẽ đóng băng mọi thao tác khác của người dùng.
+
+15. **Không bật CORS.** Giao diện cùng nguồn nên không cần; mở `allow_origins=["*"]` trên máy chủ
+    nội bộ là để lộ toàn bộ tài liệu đã quét cho bất kỳ website nào người dùng đang mở.
+
+16. **Có giới hạn tài nguyên đầu vào.** Ảnh nhập vào bị chặn theo dung lượng (80 MB) và độ phân giải
+    (80 MP) để một tệp bất thường không làm cạn RAM và treo ứng dụng.
+
+17. **PDF và ảnh xuất ra là việc của người dùng.** Lưu = ghi ảnh + metadata, không bao giờ tự
+    ghép PDF. Mọi lệnh xuất đều hỏi nơi lưu trước (mặc định là thư mục tài liệu đang mở), và chỉ
+    ghi vào đường dẫn do chính hộp thoại hệ điều hành cấp.
+
+18. **Chỉ lưu thứ đã thay đổi.** `[ 💾 Lưu thay đổi ]` chỉ gửi các trang trong `dirtyPages`; kết xuất
+    lại toàn bộ dự án hàng trăm trang sẽ treo máy hàng phút mà không đổi gì.

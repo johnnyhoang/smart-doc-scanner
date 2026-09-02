@@ -1,7 +1,6 @@
 import os
 import re
 import datetime
-import cv2
 import numpy as np
 from unidecode import unidecode
 from typing import List, Tuple, Optional

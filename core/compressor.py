@@ -3,18 +3,18 @@ import cv2
 import numpy as np
 from PIL import Image
 import fitz  # PyMuPDF
-from typing import List, Tuple, Optional
+from typing import List, Tuple
 
 
 def normalize_resolution_for_print(
     image: np.ndarray,
-    target_long_edge: int = 2400,
+    target_long_edge: int = 3200,
     min_long_edge: int = 1600
 ) -> np.ndarray:
     """
     Normalizes document resolution:
-    - If image is ultra-high resolution (> 2400px): scales down to 2400px (~300 DPI for A4) to drastically cut file size while preserving 100% print readability.
-    - If image is low resolution (< 1600px): upscales with bicubic/Lanczos interpolation and applies edge enhancement to improve print clarity.
+    - If image is ultra-high resolution (> 3200px): scales down with INTER_AREA to optimize memory without loss of print detail.
+    - If image is lower resolution (< 1600px): upscales with INTER_LANCZOS4 for crisp text strokes without smudging.
     """
     h, w = image.shape[:2]
     long_edge = max(h, w)
@@ -23,21 +23,13 @@ def normalize_resolution_for_print(
         scale = target_long_edge / float(long_edge)
         new_w = int(w * scale)
         new_h = int(h * scale)
-        # INTER_AREA is best for shrinking without moire or aliasing
         return cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
     elif long_edge < min_long_edge:
         scale = min_long_edge / float(long_edge)
         new_w = int(w * scale)
         new_h = int(h * scale)
-        # Upscale with INTER_CUBIC and subtle unsharp
-        upscaled = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_CUBIC)
-        
-        # Denoise & sharpen low-res artifacts
-        denoised = cv2.fastNlMeansDenoisingColored(upscaled, None, 3, 3, 7, 21)
-        blur = cv2.GaussianBlur(denoised, (0, 0), 1.0)
-        sharp = cv2.addWeighted(denoised, 1.4, blur, -0.4, 0)
-        return sharp
+        return cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
 
     return image
 
@@ -109,7 +101,6 @@ def generate_pdf_from_images(
         )
 
         # Standard A4 size in points: 595.28 x 841.89
-        # Fit image to standard A4 rect preserving aspect ratio
         a4_w, a4_h = 595.28, 841.89
         
         # Determine page orientation based on image aspect ratio
@@ -118,11 +109,26 @@ def generate_pdf_from_images(
         else:
             page_w, page_h = a4_w, a4_h  # Portrait A4
 
+        # Calculate centered rect preserving true aspect ratio
+        img_aspect = float(w) / float(max(1, h))
+        page_aspect = page_w / page_h
+
+        if img_aspect > page_aspect:
+            fit_w = page_w
+            fit_h = page_w / img_aspect
+            offset_x = 0.0
+            offset_y = (page_h - fit_h) / 2.0
+        else:
+            fit_h = page_h
+            fit_w = page_h * img_aspect
+            offset_x = (page_w - fit_w) / 2.0
+            offset_y = 0.0
+
         page = pdf_doc.new_page(width=page_w, height=page_h)
-        rect = fitz.Rect(0, 0, page_w, page_h)
+        rect = fitz.Rect(offset_x, offset_y, offset_x + fit_w, offset_y + fit_h)
         
-        # Insert compressed image
-        page.insert_image(rect, stream=img_bytes)
+        # Insert compressed image preserving aspect ratio
+        page.insert_image(rect, stream=img_bytes, keep_proportion=True)
 
     pdf_bytes = pdf_doc.write(deflate=True, garbage=3)
     pdf_doc.close()

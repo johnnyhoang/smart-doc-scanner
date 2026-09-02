@@ -149,21 +149,25 @@ body {
 }
 
 .btn-suggest-magic {
-    background: transparent;
-    border: none;
+    background: rgba(56, 189, 248, 0.12);
+    border: 1px solid rgba(56, 189, 248, 0.28);
     color: var(--accent);
     cursor: pointer;
-    font-size: 13px;
-    padding: 4px 6px;
+    font-size: 11.5px;
+    font-weight: 600;
+    padding: 3px 8px;
     border-radius: 4px;
-    transition: background 0.15s, transform 0.15s;
-    display: flex;
+    transition: all 0.15s ease;
+    display: inline-flex;
     align-items: center;
+    gap: 5px;
+    white-space: nowrap;
 }
 
 .btn-suggest-magic:hover {
-    background: rgba(56, 189, 248, 0.15);
-    transform: scale(1.1);
+    background: rgba(56, 189, 248, 0.22);
+    border-color: rgba(56, 189, 248, 0.45);
+    transform: translateY(-1px);
 }
 
 .name-suggest-dropdown {
@@ -200,9 +204,30 @@ body {
     transition: background 0.15s;
 }
 
-.suggest-item:hover {
-    background: var(--bg-hover);
-    color: var(--accent);
+.suggest-header {
+    padding: 8px 12px 6px;
+    font-size: 11px;
+    font-weight: 700;
+    color: var(--text-muted);
+    background: rgba(0, 0, 0, 0.2);
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.suggest-empty {
+    padding: 12px;
+    font-size: 12px;
+    color: var(--text-muted);
+    text-align: center;
+    line-height: 1.5;
+}
+
+.suggest-footer {
+    padding: 6px 10px;
+    background: rgba(0, 0, 0, 0.25);
+    border-top: 1px solid var(--border);
 }
 
 .header-actions {
@@ -715,11 +740,60 @@ body {
     display: flex;
     align-items: center;
     justify-content: space-between;
-    padding: 6px 10px;
+    padding: 6px 8px;
     background: rgba(15, 23, 42, 0.6);
     border-bottom: 1px solid var(--border);
-    gap: 6px;
+    gap: 4px;
     flex-shrink: 0;
+    flex-wrap: wrap;
+}
+
+.folder-action-bar .btn-xs {
+    flex: 1 1 auto;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 4px;
+    padding: 4px 6px;
+    font-size: 11px;
+    white-space: nowrap;
+}
+
+.selection-action-bar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 5px 10px;
+    background: rgba(56, 189, 248, 0.12);
+    border-bottom: 1px solid rgba(56, 189, 248, 0.3);
+    font-size: 11px;
+    flex-shrink: 0;
+}
+
+.selection-info {
+    font-weight: 600;
+    color: var(--accent);
+}
+
+.selection-btns {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.btn-link-xs {
+    background: none;
+    border: none;
+    color: var(--text-muted);
+    font-size: 11px;
+    cursor: pointer;
+    padding: 0;
+    text-decoration: underline;
+    transition: color 0.15s;
+}
+
+.btn-link-xs:hover {
+    color: #fff;
 }
 
 .btn-xs {
@@ -731,6 +805,26 @@ body {
 .dropdown-menu-left {
     left: 0;
     right: auto;
+}
+
+/* Checkbox on Thumbnail Card */
+.thumb-checkbox-wrap {
+    display: inline-flex;
+    align-items: center;
+    cursor: pointer;
+    margin-right: 2px;
+}
+
+.thumb-checkbox {
+    width: 15px;
+    height: 15px;
+    accent-color: var(--accent);
+    cursor: pointer;
+}
+
+.page-thumb-card.selected {
+    border-color: var(--accent) !important;
+    background-color: rgba(56, 189, 248, 0.12) !important;
 }
 
 /* Draggable & Reorderable Page List */
@@ -1477,6 +1571,14 @@ body {
     flex-shrink: 0;
     padding: 14px;
     gap: 14px;
+    transition: opacity 0.2s ease;
+}
+
+.control-panel.disabled {
+    opacity: 0.35;
+    pointer-events: none;
+    user-select: none;
+    filter: grayscale(0.5);
 }
 
 .panel-section {
@@ -1540,62 +1642,63 @@ body {
 
 /* Filter Preset Grid */
 .filter-modes-grid {
-    display: flex;
-    flex-direction: column;
-    gap: 7px;
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 6px;
 }
 
 .mode-card {
     background: #0f172a;
-    border: 1.5px solid var(--border);
+    border: 1px solid var(--border);
     border-radius: var(--radius-sm);
-    padding: 8px 10px;
+    padding: 6px 8px;
     display: flex;
     align-items: center;
-    gap: 10px;
+    gap: 7px;
     cursor: pointer;
     text-align: left;
-    transition: all 0.2s ease;
+    transition: all 0.15s ease;
     color: var(--text-main);
+    user-select: none;
 }
 
 .mode-card:hover {
     background: var(--bg-hover);
-    border-color: #475569;
+    border-color: var(--accent);
 }
 
 .mode-card.active {
     border-color: var(--accent);
-    background: rgba(56, 189, 248, 0.1);
+    background: rgba(56, 189, 248, 0.16);
+    box-shadow: 0 0 8px rgba(56, 189, 248, 0.25);
+}
+
+.mode-card.active .mode-icon {
+    background: var(--accent);
+    color: #0b1120;
 }
 
 .mode-icon {
-    width: 32px;
-    height: 32px;
+    width: 24px;
+    height: 24px;
     background: var(--bg-card);
-    border-radius: 6px;
+    border-radius: 5px;
     display: flex;
     align-items: center;
     justify-content: center;
-    font-size: 15px;
+    font-size: 12px;
     color: var(--accent);
     flex-shrink: 0;
+    transition: all 0.15s;
 }
 
-.mode-info {
-    display: flex;
-    flex-direction: column;
-    line-height: 1.3;
-}
-
-.mode-info strong {
-    font-size: 12.5px;
-    color: #fff;
-}
-
-.mode-info small {
-    font-size: 10.5px;
-    color: var(--text-muted);
+.mode-title {
+    font-size: 11.5px;
+    font-weight: 600;
+    color: #f1f5f9;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
 }
 
 /* Sliders & Switches */
@@ -2125,4 +2228,260 @@ input:checked + .slider.round:before {
 @keyframes fadeIn {
     from { opacity: 0; transform: scale(0.96); }
     to { opacity: 1; transform: scale(1); }
+}
+
+.stage-view-title {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 13px;
+    color: #f1f5f9;
+}
+
+.stage-view-subtext {
+    font-size: 11.5px;
+    color: var(--text-muted);
+    font-weight: normal;
+}
+
+/* ==========================================================
+   REFACTOR v3 — Bộ chuyển chế độ xem, chỉ báo trạng thái & trạng thái rỗng
+   ========================================================== */
+
+/* Bộ chuyển 3 chế độ xem (Segmented Control kiểu Apple) */
+.view-mode-switch {
+    display: flex;
+    align-items: center;
+    gap: 2px;
+    background: var(--bg-main);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 3px;
+}
+
+.view-mode-btn {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    background: transparent;
+    border: none;
+    color: var(--text-muted);
+    font-size: 12.5px;
+    font-weight: 600;
+    padding: 6px 12px;
+    border-radius: 7px;
+    cursor: pointer;
+    white-space: nowrap;
+    transition: background 0.15s ease, color 0.15s ease;
+}
+
+.view-mode-btn:hover {
+    color: var(--text-main);
+    background: var(--bg-hover);
+}
+
+.view-mode-btn.active {
+    background: var(--accent);
+    color: #0b1120;
+    box-shadow: 0 2px 8px var(--accent-glow);
+}
+
+.view-mode-btn.hold-btn {
+    margin-left: 4px;
+    border-left: 1px solid var(--border);
+    border-radius: 0 7px 7px 0;
+}
+
+.view-mode-btn.hold-btn.active {
+    background: var(--warning);
+    color: #0b1120;
+    box-shadow: none;
+}
+
+/* Chỉ báo đang dựng ảnh — thay cho lớp phủ chặn toàn màn hình */
+.processing-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    margin-left: 10px;
+    padding: 3px 10px;
+    border-radius: 999px;
+    font-size: 11.5px;
+    font-weight: 600;
+    color: var(--accent);
+    background: rgba(56, 189, 248, 0.12);
+    border: 1px solid rgba(56, 189, 248, 0.3);
+}
+
+.mini-spinner {
+    width: 11px;
+    height: 11px;
+    border: 2px solid rgba(56, 189, 248, 0.25);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: mini-spin 0.7s linear infinite;
+}
+
+@keyframes mini-spin {
+    to { transform: rotate(360deg); }
+}
+
+/* Chỉ báo đã lưu / chưa lưu xuống ổ đĩa */
+.save-state-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    margin-left: 10px;
+    padding: 3px 10px;
+    border-radius: 999px;
+    font-size: 11.5px;
+    font-weight: 600;
+    border: 1px solid transparent;
+}
+
+.save-state-pill.saved {
+    color: var(--success);
+    background: rgba(16, 185, 129, 0.12);
+    border-color: rgba(16, 185, 129, 0.3);
+}
+
+.save-state-pill.unsaved {
+    color: var(--warning);
+    background: rgba(245, 158, 11, 0.12);
+    border-color: rgba(245, 158, 11, 0.35);
+}
+
+/* Trang có thay đổi chưa ghi xuống đĩa */
+.page-thumb-card.unsaved::after {
+    content: "";
+    position: absolute;
+    top: 6px;
+    right: 6px;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--warning);
+    box-shadow: 0 0 0 2px var(--bg-card);
+}
+
+/* Trang chưa có ảnh gốc trong _goc/ */
+.badge-orphan {
+    color: var(--warning);
+    font-size: 11px;
+}
+
+/* Trạng thái rỗng thân thiện */
+.tree-empty-msg,
+.empty-folder-msg {
+    text-align: center;
+    color: var(--text-muted);
+    padding: 22px 12px;
+    font-size: 12px;
+    line-height: 1.7;
+}
+
+.empty-folder-msg i {
+    display: block;
+    font-size: 24px;
+    margin-bottom: 8px;
+    opacity: 0.6;
+}
+
+.suggest-empty {
+    padding: 10px 12px;
+    font-size: 12px;
+    color: var(--text-muted);
+    line-height: 1.6;
+}
+
+/* Trình chọn thư mục đích */
+.picker-item.disabled {
+    opacity: 0.5;
+    cursor: default;
+}
+
+.picker-item.disabled:hover {
+    background: transparent;
+    color: var(--text-main);
+}
+
+.picker-current-tag {
+    font-size: 10.5px;
+    color: var(--text-muted);
+    font-style: italic;
+    white-space: nowrap;
+}
+
+/* Toast báo lỗi dùng viền cảnh báo để phân biệt rõ với báo thành công */
+.toast.is-error {
+    border-color: var(--warning);
+}
+
+/* Thanh trạng thái: chữ mô tả co lại được, khối số liệu không bị bóp méo */
+.status-left {
+    min-width: 0;
+    flex: 1 1 auto;
+    white-space: normal;
+}
+
+#resultInfoText {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    min-width: 0;
+}
+
+.status-metrics {
+    flex: 0 0 auto;
+    white-space: nowrap;
+}
+
+.processing-pill,
+.save-state-pill {
+    flex-shrink: 0;
+}
+
+/* ==========================================================
+   Co giãn theo bề ngang màn hình
+   Ứng dụng dành cho màn hình rộng, nhưng trên laptop hẹp vẫn phải
+   dùng được: ưu tiên giữ khung xem ảnh, thu gọn hai bên thay vì bóp nát.
+   ========================================================== */
+
+.workspace-stage {
+    min-width: 0;
+}
+
+.stage-top-bar {
+    flex-wrap: wrap;
+    gap: 8px;
+}
+
+.top-header {
+    gap: 10px;
+}
+
+.doc-name-wrapper {
+    min-width: 0;
+}
+
+/* Laptop hẹp: thu gọn hai cột hai bên */
+@media (max-width: 1400px) {
+    .sidebar { width: 260px; }
+    .control-panel { width: 280px; }
+    .view-mode-btn { padding: 6px 9px; font-size: 12px; }
+}
+
+/* Rất hẹp: bỏ khối thương hiệu và thu nhỏ chữ nút để không vỡ hàng */
+@media (max-width: 1150px) {
+    .sidebar { width: 230px; }
+    .control-panel { width: 250px; }
+    .brand-text { display: none; }
+    .header-actions .btn { padding: 7px 10px; font-size: 12px; }
+    .view-mode-btn { padding: 6px 8px; font-size: 11.5px; gap: 4px; }
+    .status-metrics .metric-label { display: none; }
+}
+
+/* Ẩn hẳn bảng tinh chỉnh khi không còn đủ chỗ cho khung xem ảnh */
+@media (max-width: 950px) {
+    .control-panel { display: none; }
 }
