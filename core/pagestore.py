@@ -384,6 +384,7 @@ def patch_page_meta(root: str, rel: Optional[str], filename: str, patch: Dict[st
         current.setdefault("doc_name", stem)
         current.setdefault("settings", default_settings())
         current.setdefault("rotation", 0)
+        current.setdefault("annotations", [])
         current.setdefault("history", {"undo": [], "redo": []})
         current["updated_at"] = datetime.datetime.now().isoformat()
 
@@ -601,16 +602,18 @@ def is_stale(entry: Dict[str, Any]) -> bool:
     if not committed:
         return False
     current = state_fingerprint(
-        entry.get("corners"), entry.get("rotation", 0), merged_settings(entry.get("settings"))
+        entry.get("corners"), entry.get("rotation", 0), merged_settings(entry.get("settings")),
+        entry.get("annotations")
     )
     return current != committed
 
 
-def state_fingerprint(corners, rotation, settings) -> str:
+def state_fingerprint(corners, rotation, settings, annotations=None) -> str:
     payload = {
         "c": [[round(float(x), 2), round(float(y), 2)] for x, y in (corners or [])],
         "r": int(rotation or 0),
         "s": {k: settings.get(k) for k in sorted(settings or {})},
+        "a": annotations or [],
     }
     blob = json.dumps(payload, sort_keys=True, ensure_ascii=False)
     return hashlib.sha1(blob.encode("utf-8")).hexdigest()[:16]
@@ -739,6 +742,7 @@ def scan_tree(root: str) -> Tuple[List[dict], List[dict]]:
                 "corners": entry.get("corners"),
                 "rotation": entry.get("rotation", 0),
                 "settings": merged_settings(entry.get("settings")),
+                "annotations": entry.get("annotations") or [],
                 "history": entry.get("history") or {"undo": [], "redo": []},
                 "has_raw_original": goc is not None,
                 "is_stale": is_stale(entry),

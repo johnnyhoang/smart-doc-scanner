@@ -181,6 +181,7 @@ class PageState(BaseModel):
     corners: Optional[List[List[float]]] = None
     rotation: Optional[int] = 0
     settings: Optional[dict] = None
+    annotations: Optional[List[dict]] = None
     history: Optional[dict] = None
 
 
@@ -196,6 +197,7 @@ class ProcessRequest(BaseModel):
     corners: Optional[List[List[float]]] = None
     rotation: int = 0
     settings: Optional[dict] = None
+    annotations: Optional[List[dict]] = None
     root_path: Optional[str] = None
 
 
@@ -615,8 +617,13 @@ def process_preview(req: ProcessRequest):
     rel = ps.normalize_rel(req.relative_path)
     settings = ps.merged_settings(req.settings)
 
+    annotations = req.annotations
+    if annotations is None:
+        stored = ps.get_page_meta(root, rel, req.filename)
+        annotations = stored.get("annotations")
+
     original = load_original(root, rel, req.filename)
-    preview = rd.render_page(original, req.corners, req.rotation, settings, max_dim=rd.PREVIEW_MAX_DIM)
+    preview = rd.render_page(original, req.corners, req.rotation, settings, max_dim=rd.PREVIEW_MAX_DIM, annotations=annotations)
     data = rd.encode_preview(preview, quality=88)
 
     # Ước tính kích thước bản kết xuất đầy đủ theo tỉ lệ thu nhỏ đã áp dụng.
@@ -670,9 +677,10 @@ def commit_page(root: str, rel: str, state: PageState) -> Dict[str, Any]:
     settings = ps.merged_settings(state.settings if state.settings is not None else stored.get("settings"))
     corners = state.corners if state.corners is not None else stored.get("corners")
     rotation = state.rotation if state.rotation is not None else stored.get("rotation", 0)
+    annotations = state.annotations if state.annotations is not None else stored.get("annotations")
 
     original = load_original(root, rel, filename)
-    rendered = rd.render_page(original, corners, rotation, settings)
+    rendered = rd.render_page(original, corners, rotation, settings, annotations=annotations)
     data, size, (out_w, out_h) = rd.encode_final(rendered, settings)
     ps.write_edited_bytes(root, rel, filename, data)
 
@@ -681,8 +689,9 @@ def commit_page(root: str, rel: str, state: PageState) -> Dict[str, Any]:
         "corners": corners,
         "rotation": rotation,
         "settings": settings,
+        "annotations": annotations or [],
         "history": state.history,
-        "committed_fingerprint": ps.state_fingerprint(corners, rotation, settings),
+        "committed_fingerprint": ps.state_fingerprint(corners, rotation, settings, annotations),
     })
 
     return {
@@ -836,6 +845,7 @@ def save_metadata(req: SaveMetadataRequest):
             "corners": page.corners,
             "rotation": page.rotation,
             "settings": ps.merged_settings(page.settings) if page.settings else None,
+            "annotations": page.annotations,
             "history": page.history,
         })
     if req.order is not None:

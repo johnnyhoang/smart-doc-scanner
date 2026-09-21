@@ -195,14 +195,17 @@
 
                 <!-- Active Editor Stage -->
                 <div class="editor-stage" id="editorStage" style="display: none;">
-                    <!-- Stage Top Bar: 2 Chế Độ Rõ Ràng (Chỉnh sửa / So sánh) -->
+                    <!-- Stage Top Bar: 3 Tabs (1. Khung & Góc, 2. Lọc & Màu sắc, 3. Chú thích & Biên tập) -->
                     <div class="stage-top-bar">
-                        <div class="view-mode-switch" role="group" aria-label="Chế độ làm việc">
-                            <button class="view-mode-btn" id="btnModeEdit" data-view="edit" title="Chế độ Chỉnh sửa — căn chỉnh 4 góc mép giấy, xoay và căn lề">
-                                <i class="fa-solid fa-crop-simple"></i> Chỉnh sửa
+                        <div class="workflow-tabs-switch" role="tablist" aria-label="Quy trình 3 bước xử lý tài liệu">
+                            <button class="workflow-tab-btn" id="btnTabCrop" data-tab="crop" title="Bước 1: Cắt & Nắn khung — 4 góc mép giấy, xoay, mở lề, làm phẳng trang">
+                                <i class="fa-solid fa-crop-simple"></i> <span>1. Khung & Góc</span>
                             </button>
-                            <button class="view-mode-btn active" id="btnModeCompare" data-view="compare" title="Chế độ So sánh — kéo thanh trượt để so sánh Trước / Sau">
-                                <i class="fa-solid fa-code-compare"></i> So sánh
+                            <button class="workflow-tab-btn active" id="btnTabColor" data-tab="color" title="Bước 2: Lọc & Chỉnh màu — Bộ lọc ma thuật, trắng đen scan, khử bóng, làm nét">
+                                <i class="fa-solid fa-sliders"></i> <span>2. Lọc & Màu sắc</span>
+                            </button>
+                            <button class="workflow-tab-btn" id="btnTabAnnotate" data-tab="annotate" title="Bước 3: Chú thích & Biên tập — Vẽ hình, mũi tên, vệt dạ quang, chữ, bóng thoại, làm mờ, cắt dán">
+                                <i class="fa-solid fa-pen-ruler"></i> <span>3. Chú thích & Biên tập</span>
                             </button>
                         </div>
 
@@ -216,11 +219,162 @@
                         </div>
                     </div>
 
+                    <!-- Snagit-Style Annotation Toolbar (Chỉ hiện khi ở Tab 3: Chú thích & Biên tập) -->
+                    <div class="annotation-bar-container" id="annotationBarContainer" style="display: none;">
+                        <!-- Row 1: Compact Tool Icons & Actions -->
+                        <div class="annotation-tools-row">
+                            <!-- Select & Cut/Paste -->
+                            <div class="ann-tool-group">
+                                <button class="ann-tool-btn active" id="btnToolSelect" data-tool="select" title="Chọn & Di chuyển đối tượng (V)">
+                                    <i class="fa-solid fa-arrow-pointer"></i>
+                                </button>
+                                <button class="ann-tool-btn" id="btnToolCutPaste" data-tool="cut_paste" title="Cắt / Sao chép vùng chọn (M)">
+                                    <i class="fa-solid fa-scissors"></i>
+                                </button>
+                            </div>
+
+                            <div class="ann-tool-divider"></div>
+
+                            <!-- Drawing & Annotation Tools -->
+                            <div class="ann-tool-group">
+                                <button class="ann-tool-btn" id="btnToolArrow" data-tool="arrow" title="Mũi tên (A)">
+                                    <i class="fa-solid fa-arrow-right-long"></i>
+                                </button>
+                                <button class="ann-tool-btn" id="btnToolRect" data-tool="rect" title="Hình chữ nhật (R)">
+                                    <i class="fa-regular fa-square"></i>
+                                </button>
+                                <button class="ann-tool-btn" id="btnToolEllipse" data-tool="ellipse" title="Hình tròn / Elip (O)">
+                                    <i class="fa-regular fa-circle"></i>
+                                </button>
+                                <button class="ann-tool-btn" id="btnToolLine" data-tool="line" title="Đường thẳng (L)">
+                                    <i class="fa-solid fa-minus"></i>
+                                </button>
+                                <button class="ann-tool-btn" id="btnToolHighlighter" data-tool="highlighter" title="Bút dạ quang làm nổi bật (H)">
+                                    <i class="fa-solid fa-highlighter text-warning"></i>
+                                </button>
+                                <button class="ann-tool-btn" id="btnToolText" data-tool="text" title="Hộp văn bản (T)">
+                                    <i class="fa-solid fa-font"></i>
+                                </button>
+                                <button class="ann-tool-btn" id="btnToolCallout" data-tool="callout" title="Bóng thoại Callout (C)">
+                                    <i class="fa-regular fa-comment-dots"></i>
+                                </button>
+                                <button class="ann-tool-btn" id="btnToolStep" data-tool="step" title="Đánh số thứ tự 1, 2, 3... (S)">
+                                    <i class="fa-solid fa-circle-1"></i>
+                                </button>
+                            </div>
+
+                            <div class="ann-tool-divider"></div>
+
+                            <!-- Privacy & Erase Tools -->
+                            <div class="ann-tool-group">
+                                <button class="ann-tool-btn" id="btnToolBlur" data-tool="blur" title="Che mờ bảo mật (B)">
+                                    <i class="fa-solid fa-shield-halved text-accent"></i>
+                                </button>
+                                <button class="ann-tool-btn" id="btnToolWhiteout" data-tool="whiteout" title="Tẩy trắng / Xóa (E)">
+                                    <i class="fa-solid fa-eraser"></i>
+                                </button>
+                            </div>
+
+                            <div class="ann-tool-divider"></div>
+
+                            <!-- Actions: Delete, Duplicate, Clear -->
+                            <div class="ann-actions-group">
+                                <button class="ann-action-btn text-danger" id="btnDeleteSelectedAnn" title="Xóa đối tượng đang chọn (Phím Delete)" disabled>
+                                    <i class="fa-solid fa-trash-can"></i>
+                                </button>
+                                <button class="ann-action-btn" id="btnDuplicateSelectedAnn" title="Nhân bản đối tượng đang chọn (Ctrl + D)" disabled>
+                                    <i class="fa-solid fa-clone"></i>
+                                </button>
+                                <button class="ann-action-btn text-warning" id="btnClearAllAnn" title="Xóa toàn bộ các nét vẽ trên trang">
+                                    <i class="fa-solid fa-broom"></i>
+                                </button>
+                            </div>
+                        </div>
+
+                        <!-- Row 2: Ultra-Compact Properties Bar -->
+                        <div class="annotation-props-row" id="annotationPropsRow">
+                            <!-- Color Swatches Palette -->
+                            <div class="ann-prop-item">
+                                <div class="ann-color-palette" id="annColorPalette">
+                                    <button class="ann-color-swatch active" data-color="#ef4444" style="background:#ef4444;" title="Đỏ"></button>
+                                    <button class="ann-color-swatch" data-color="#f59e0b" style="background:#f59e0b;" title="Vàng cam"></button>
+                                    <button class="ann-color-swatch" data-color="#10b981" style="background:#10b981;" title="Xanh lá"></button>
+                                    <button class="ann-color-swatch" data-color="#0ea5e9" style="background:#0ea5e9;" title="Xanh dương"></button>
+                                    <button class="ann-color-swatch" data-color="#8b5cf6" style="background:#8b5cf6;" title="Tím"></button>
+                                    <button class="ann-color-swatch" data-color="#0f172a" style="background:#0f172a;" title="Đen"></button>
+                                    <button class="ann-color-swatch" data-color="#ffffff" style="background:#ffffff;" title="Trắng"></button>
+                                    <label class="ann-color-custom-label" title="Chọn màu tùy biến">
+                                        <i class="fa-solid fa-palette"></i>
+                                        <input type="color" id="annCustomColorPicker" value="#ef4444" class="ann-color-native-input">
+                                    </label>
+                                </div>
+                            </div>
+
+                            <div class="ann-prop-divider"></div>
+
+                            <!-- Stroke Width -->
+                            <div class="ann-prop-item" id="propStrokeWidthItem">
+                                <div class="ann-btn-seg" id="segStrokeWidth">
+                                    <button class="ann-seg-btn" data-width="2" title="Độ dày: 2px">2px</button>
+                                    <button class="ann-seg-btn active" data-width="4" title="Độ dày: 4px">4px</button>
+                                    <button class="ann-seg-btn" data-width="8" title="Độ dày: 8px">8px</button>
+                                    <button class="ann-seg-btn" data-width="14" title="Độ dày: 14px">14px</button>
+                                </div>
+                            </div>
+
+                            <div class="ann-prop-divider" id="propStrokeDivider"></div>
+
+                            <!-- Line Style -->
+                            <div class="ann-prop-item" id="propStrokeStyleItem">
+                                <div class="ann-btn-seg" id="segStrokeStyle">
+                                    <button class="ann-seg-btn active" data-style="solid" title="Nét liền">
+                                        <span class="ann-line-sample solid"></span>
+                                    </button>
+                                    <button class="ann-seg-btn" data-style="dashed" title="Nét đứt">
+                                        <span class="ann-line-sample dashed"></span>
+                                    </button>
+                                </div>
+                            </div>
+
+                            <!-- Font Size -->
+                            <div class="ann-prop-item" id="propFontSizeItem" style="display: none;">
+                                <div class="ann-btn-seg" id="segFontSize">
+                                    <button class="ann-seg-btn" data-size="14" title="Cỡ chữ 14">14</button>
+                                    <button class="ann-seg-btn active" data-size="18" title="Cỡ chữ 18">18</button>
+                                    <button class="ann-seg-btn" data-size="24" title="Cỡ chữ 24">24</button>
+                                    <button class="ann-seg-btn" data-size="32" title="Cỡ chữ 32">32</button>
+                                </div>
+                            </div>
+
+                            <!-- Step Counter Info -->
+                            <div class="ann-prop-item" id="propStepItem" style="display: none;">
+                                <span class="ann-step-next-pill" id="lblNextStepNum" title="Số bước tiếp theo">1</span>
+                                <button class="ann-icon-sub-btn" id="btnResetStepCount" title="Đặt lại số bước về 1">
+                                    <i class="fa-solid fa-rotate-left"></i>
+                                </button>
+                            </div>
+
+                            <!-- Cut/Paste Mode -->
+                            <div class="ann-prop-item" id="propCutPasteItem" style="display: none;">
+                                <div class="ann-btn-seg" id="segCutMode">
+                                    <button class="ann-seg-btn active" data-cut="move" title="Cắt dời (lấp nền trắng chỗ cũ)">
+                                        <i class="fa-solid fa-scissors"></i>
+                                    </button>
+                                    <button class="ann-seg-btn" data-cut="clone" title="Sao chép vùng chọn">
+                                        <i class="fa-regular fa-clone"></i>
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
                     <!-- Single Unified Canvas Viewport (1 Cửa Sổ Duy Nhất) -->
                     <div class="canvas-wrapper" id="cropCanvasWrapper">
                         <div class="canvas-viewport" id="canvasViewport">
                             <div class="canvas-transform-container" id="canvasTransformBox">
                                 <canvas id="cropCanvas"></canvas>
+                                <!-- Inline text editor overlay for typing text & callouts directly on the canvas -->
+                                <textarea id="canvasInlineTextEditor" class="canvas-inline-text-editor" style="display: none;"></textarea>
                             </div>
                             <!-- Magnifier Lens Widget -->
                             <div class="magnifier-lens" id="magnifierLens">

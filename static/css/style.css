@@ -2248,54 +2248,326 @@ input:checked + .slider.round:before {
    REFACTOR v3 — Bộ chuyển chế độ xem, chỉ báo trạng thái & trạng thái rỗng
    ========================================================== */
 
-/* Bộ chuyển 3 chế độ xem (Segmented Control kiểu Apple) */
-.view-mode-switch {
+/* Bộ chuyển 3 Tab Quy trình làm việc (1. Khung & Góc | 2. Lọc & Màu sắc | 3. Chú thích & Biên tập) */
+.workflow-tabs-switch {
     display: flex;
     align-items: center;
-    gap: 2px;
-    background: var(--bg-main);
-    border: 1px solid var(--border);
-    border-radius: 10px;
+    gap: 3px;
+    background: #090d16;
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    border-radius: 12px;
     padding: 3px;
 }
 
-.view-mode-btn {
+.workflow-tab-btn {
     display: flex;
     align-items: center;
-    gap: 6px;
+    gap: 7px;
     background: transparent;
     border: none;
     color: var(--text-muted);
-    font-size: 12.5px;
+    font-size: 13px;
     font-weight: 600;
-    padding: 6px 12px;
-    border-radius: 7px;
+    padding: 7px 14px;
+    border-radius: 9px;
     cursor: pointer;
     white-space: nowrap;
-    transition: background 0.15s ease, color 0.15s ease;
+    transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+    user-select: none;
 }
 
-.view-mode-btn:hover {
+.workflow-tab-btn:hover {
     color: var(--text-main);
-    background: var(--bg-hover);
+    background: rgba(255, 255, 255, 0.06);
 }
 
-.view-mode-btn.active {
-    background: var(--accent);
-    color: #0b1120;
-    box-shadow: 0 2px 8px var(--accent-glow);
+.workflow-tab-btn.active {
+    background: #0284c7;
+    color: #ffffff;
+    box-shadow: 0 2px 10px rgba(2, 132, 199, 0.45);
 }
 
-.view-mode-btn.hold-btn {
-    margin-left: 4px;
-    border-left: 1px solid var(--border);
-    border-radius: 0 7px 7px 0;
+/* ==========================================================
+   Snagit-Style Annotation Toolbar & Dynamic Properties Bar
+   ========================================================== */
+.annotation-bar-container {
+    background: #0d1322;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    z-index: 10;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.25);
 }
 
-.view-mode-btn.hold-btn.active {
-    background: var(--warning);
-    color: #0b1120;
-    box-shadow: none;
+.annotation-tools-row {
+    display: flex;
+    align-items: center;
+    padding: 6px 16px;
+    gap: 8px;
+    overflow-x: auto;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+}
+
+.ann-tool-group {
+    display: flex;
+    align-items: center;
+    gap: 3px;
+}
+
+.ann-tool-divider {
+    width: 1px;
+    height: 22px;
+    background: rgba(255, 255, 255, 0.12);
+    margin: 0 4px;
+    flex-shrink: 0;
+}
+
+.ann-tool-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 32px;
+    height: 32px;
+    background: rgba(255, 255, 255, 0.04);
+    border: 1px solid transparent;
+    color: #94a3b8;
+    font-size: 14px;
+    border-radius: 6px;
+    cursor: pointer;
+    transition: all 0.15s ease;
+    padding: 0;
+}
+
+.ann-tool-btn:hover {
+    background: rgba(255, 255, 255, 0.1);
+    color: #ffffff;
+    border-color: rgba(255, 255, 255, 0.15);
+}
+
+.ann-tool-btn.active {
+    background: rgba(56, 189, 248, 0.18);
+    color: #38bdf8;
+    border-color: rgba(56, 189, 248, 0.5);
+    box-shadow: 0 0 10px rgba(56, 189, 248, 0.25);
+}
+
+.ann-actions-group {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    margin-left: auto;
+}
+
+.ann-action-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 30px;
+    height: 30px;
+    background: rgba(255, 255, 255, 0.04);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    color: #cbd5e1;
+    border-radius: 6px;
+    cursor: pointer;
+    transition: all 0.15s ease;
+}
+
+.ann-action-btn:hover:not(:disabled) {
+    background: rgba(255, 255, 255, 0.12);
+    color: #ffffff;
+}
+
+.ann-action-btn:disabled {
+    opacity: 0.35;
+    cursor: not-allowed;
+}
+
+/* Row 2: Dynamic Properties Bar */
+.annotation-props-row {
+    display: flex;
+    align-items: center;
+    padding: 4px 14px;
+    gap: 10px;
+    background: #090e1a;
+    font-size: 12px;
+    overflow-x: auto;
+}
+
+.ann-prop-item {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-shrink: 0;
+}
+
+.ann-prop-label {
+    color: var(--text-muted);
+    font-weight: 600;
+    font-size: 11px;
+    letter-spacing: 0.3px;
+}
+
+.ann-prop-divider {
+    width: 1px;
+    height: 18px;
+    background: rgba(255, 255, 255, 0.08);
+    margin: 0 2px;
+}
+
+.ann-color-palette {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+}
+
+.ann-color-swatch {
+    width: 18px;
+    height: 18px;
+    border-radius: 50%;
+    border: 2px solid rgba(255, 255, 255, 0.2);
+    cursor: pointer;
+    transition: transform 0.15s ease, box-shadow 0.15s ease;
+    padding: 0;
+}
+
+.ann-color-swatch:hover {
+    transform: scale(1.2);
+}
+
+.ann-color-swatch.active {
+    border-color: #ffffff;
+    box-shadow: 0 0 0 2px #0284c7;
+    transform: scale(1.15);
+}
+
+.ann-color-custom-label {
+    width: 20px;
+    height: 20px;
+    border-radius: 50%;
+    border: 1px dashed rgba(255, 255, 255, 0.4);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    position: relative;
+    color: #cbd5e1;
+    font-size: 9px;
+}
+
+.ann-color-custom-label:hover {
+    color: #ffffff;
+    border-color: #ffffff;
+}
+
+.ann-color-native-input {
+    position: absolute;
+    opacity: 0;
+    width: 100%;
+    height: 100%;
+    cursor: pointer;
+}
+
+.ann-btn-seg {
+    display: flex;
+    align-items: center;
+    gap: 2px;
+    background: rgba(255, 255, 255, 0.04);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 6px;
+    padding: 2px;
+}
+
+.ann-seg-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    background: transparent;
+    border: none;
+    color: var(--text-muted);
+    font-size: 11px;
+    font-weight: 600;
+    padding: 3px 7px;
+    min-width: 24px;
+    border-radius: 4px;
+    cursor: pointer;
+    transition: all 0.15s ease;
+}
+
+.ann-seg-btn:hover {
+    color: #ffffff;
+}
+
+.ann-seg-btn.active {
+    background: #1e293b;
+    color: #38bdf8;
+    font-weight: 600;
+}
+
+.ann-line-sample {
+    display: inline-block;
+    width: 16px;
+    height: 2px;
+    vertical-align: middle;
+}
+
+.ann-line-sample.solid {
+    background: currentColor;
+}
+
+.ann-line-sample.dashed {
+    border-top: 2px dashed currentColor;
+}
+
+.ann-step-next-pill {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 20px;
+    height: 20px;
+    background: #ef4444;
+    color: #ffffff;
+    font-weight: 700;
+    font-size: 11px;
+    border-radius: 50%;
+    border: 1.5px solid #ffffff;
+}
+
+.ann-icon-sub-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 20px;
+    height: 20px;
+    background: rgba(255, 255, 255, 0.05);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    color: var(--text-muted);
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 10px;
+    transition: all 0.15s ease;
+    padding: 0;
+}
+
+.ann-icon-sub-btn:hover {
+    background: rgba(255, 255, 255, 0.15);
+    color: #ffffff;
+}
+
+/* Inline text editor for canvas typing */
+.canvas-inline-text-editor {
+    position: absolute;
+    z-index: 50;
+    background: rgba(15, 23, 42, 0.92);
+    color: #ffffff;
+    border: 2px solid #38bdf8;
+    border-radius: 6px;
+    padding: 6px 10px;
+    font-family: 'Plus Jakarta Sans', sans-serif;
+    font-size: 16px;
+    outline: none;
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+    resize: both;
+    overflow: hidden;
 }
 
 /* Chỉ báo đang dựng ảnh — thay cho lớp phủ chặn toàn màn hình */

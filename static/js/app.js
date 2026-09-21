@@ -11,7 +11,8 @@
  *   nên mở thư mục hàng trăm trang vẫn nhẹ và tức thì.
  */
 
-const VIEW = { EDIT: 'edit', COMPARE: 'compare' };
+const WORKFLOW_TAB = { CROP: 'crop', COLOR: 'color', ANNOTATE: 'annotate' };
+const VIEW = { EDIT: 'edit', COMPARE: 'compare', ANNOTATE: 'annotate' };
 const AUTOSAVE_MS = 60000;
 const META_SAVE_MS = 1200;
 const PREVIEW_DEBOUNCE_MS = 160;
@@ -83,9 +84,27 @@ class DocScanApp {
         this.activeImageId = null;
 
         this.viewMode = VIEW.COMPARE;
+        this.activeTab = WORKFLOW_TAB.COLOR;
         this.holdingCompare = false;
         this.showHandles = true;
         this.sliderPos = 0.5;
+
+        // Snagit-Style Annotation Suite State
+        this.activeAnnTool = 'select';
+        this.annColor = '#ef4444';
+        this.annStrokeWidth = 4;
+        this.annStrokeStyle = 'solid';
+        this.annFontSize = 18;
+        this.annStepCount = 1;
+        this.annCutMode = 'move';
+        this.selectedAnnotationId = null;
+        this.activeDrawingAnnotation = null;
+        this.isDraggingAnnotation = false;
+        this.isResizingAnnotation = false;
+        this.selectedHandle = null;
+        this.dragStartAnnPos = null;
+        this.cutSelectionBox = null;
+        this.patchImagesCache = new Map();
 
         this.dirtyPages = new Set();
         this.selectedPageIds = new Set();
@@ -194,8 +213,27 @@ class DocScanApp {
         this.btnSelectAllPages = $('btnSelectAllPages');
         this.btnDeselectAllPages = $('btnDeselectAllPages');
 
-        this.btnModeEdit = $('btnModeEdit');
-        this.btnModeCompare = $('btnModeCompare');
+        this.btnTabCrop = $('btnTabCrop') || $('btnModeEdit');
+        this.btnTabColor = $('btnTabColor') || $('btnModeCompare');
+        this.btnTabAnnotate = $('btnTabAnnotate');
+        this.btnModeEdit = this.btnTabCrop;
+        this.btnModeCompare = this.btnTabColor;
+
+        this.annotationBarContainer = $('annotationBarContainer');
+        this.annotationPropsRow = $('annotationPropsRow');
+        this.canvasInlineTextEditor = $('canvasInlineTextEditor');
+        this.btnDeleteSelectedAnn = $('btnDeleteSelectedAnn');
+        this.btnDuplicateSelectedAnn = $('btnDuplicateSelectedAnn');
+        this.btnClearAllAnn = $('btnClearAllAnn');
+        this.lblNextStepNum = $('lblNextStepNum');
+        this.btnResetStepCount = $('btnResetStepCount');
+        this.annCustomColorPicker = $('annCustomColorPicker');
+        this.propStrokeWidthItem = $('propStrokeWidthItem');
+        this.propStrokeStyleItem = $('propStrokeStyleItem');
+        this.propFontSizeItem = $('propFontSizeItem');
+        this.propStepItem = $('propStepItem');
+        this.propCutPasteItem = $('propCutPasteItem');
+
         this.canvasViewport = $('canvasViewport');
         this.canvasTransformBox = $('canvasTransformBox');
         this.resultInfoText = $('resultInfoText');
@@ -351,6 +389,18 @@ class DocScanApp {
                 e.preventDefault(); this.redo();
             } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') {
                 e.preventDefault(); this.saveProject();
+            } else if (!typing && ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'd')) {
+                e.preventDefault(); this.duplicateSelectedAnnotation();
+            } else if (!typing && (e.key === 'Delete' || e.key === 'Backspace')) {
+                if (this.selectedAnnotationId) { e.preventDefault(); this.deleteSelectedAnnotation(); }
+            } else if (e.key === 'Escape') {
+                if (this.canvasInlineTextEditor && this.canvasInlineTextEditor.style.display !== 'none') {
+                    this.cancelInlineTextEditor();
+                } else if (this.selectedAnnotationId) {
+                    this.selectedAnnotationId = null;
+                    this.updateAnnotationActionButtons();
+                    this.drawCanvas();
+                }
             } else if (!typing && (e.code === 'Space' || e.key === '\\')) {
                 if (!this.holdingCompare) { e.preventDefault(); this.setHoldingCompare(true); }
             }
@@ -359,9 +409,48 @@ class DocScanApp {
             if ((e.code === 'Space' || e.key === '\\') && this.holdingCompare) this.setHoldingCompare(false);
         });
 
-        // --- 2 Chế độ làm việc: Chỉnh sửa & So sánh ---
-        on(this.btnModeEdit, 'click', () => this.setViewMode(VIEW.EDIT));
-        on(this.btnModeCompare, 'click', () => this.setViewMode(VIEW.COMPARE));
+        // --- 3 Tab Quy trình làm việc (Khung & Góc, Lọc & Màu sắc, Chú thích & Biên tập) ---
+        on(this.btnTabCrop, 'click', () => this.setWorkflowTab(WORKFLOW_TAB.CROP));
+        on(this.btnTabColor, 'click', () => this.setWorkflowTab(WORKFLOW_TAB.COLOR));
+        on(this.btnTabAnnotate, 'click', () => this.setWorkflowTab(WORKFLOW_TAB.ANNOTATE));
+
+        // --- Snagit Annotation Suite Events ---
+        document.querySelectorAll('.ann-tool-btn').forEach(btn => {
+            on(btn, 'click', () => this.setAnnTool(btn.dataset.tool));
+        });
+        document.querySelectorAll('.ann-color-swatch').forEach(sw => {
+            on(sw, 'click', () => this.setAnnColor(sw.dataset.color));
+        });
+        on(this.annCustomColorPicker, 'input', (e) => this.setAnnColor(e.target.value));
+        document.querySelectorAll('#segStrokeWidth .ann-seg-btn').forEach(btn => {
+            on(btn, 'click', () => this.setAnnStrokeWidth(parseInt(btn.dataset.width)));
+        });
+        document.querySelectorAll('#segStrokeStyle .ann-seg-btn').forEach(btn => {
+            on(btn, 'click', () => this.setAnnStrokeStyle(btn.dataset.style));
+        });
+        document.querySelectorAll('#segFontSize .ann-seg-btn').forEach(btn => {
+            on(btn, 'click', () => this.setAnnFontSize(parseInt(btn.dataset.size)));
+        });
+        document.querySelectorAll('#segCutMode .ann-seg-btn').forEach(btn => {
+            on(btn, 'click', () => this.setAnnCutMode(btn.dataset.cut));
+        });
+        on(this.btnResetStepCount, 'click', () => this.resetStepCount());
+        on(this.btnDeleteSelectedAnn, 'click', () => this.deleteSelectedAnnotation());
+        on(this.btnDuplicateSelectedAnn, 'click', () => this.duplicateSelectedAnnotation());
+        on(this.btnClearAllAnn, 'click', () => this.clearAllAnnotations());
+
+        // Inline text editor overlay
+        on(this.canvasInlineTextEditor, 'blur', () => this.commitInlineTextEditor());
+        on(this.canvasInlineTextEditor, 'keydown', (e) => {
+            if (e.key === 'Escape') {
+                e.preventDefault();
+                this.cancelInlineTextEditor();
+            } else if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+                e.preventDefault();
+                this.commitInlineTextEditor();
+            }
+        });
+        on(this.canvasViewport, 'dblclick', (e) => this.onCanvasDoubleClick(e));
 
         // --- Thu phóng & kéo ---
         on(this.btnZoomIn, 'click', () => this.setZoom(this.zoom * 1.25));
@@ -413,15 +502,46 @@ class DocScanApp {
 
         const bindSlider = (input, label, apply, formatter) => {
             if (!input) return;
-            // Ghi 1 mốc hoàn tác duy nhất cho cả lượt kéo, không phải mỗi pixel.
-            on(input, 'pointerdown', () => { if (this.getActivePage()) this.pushHistory('Chỉnh thanh trượt'); });
+            let startSnap = null;
+            let hasChanged = false;
+
+            const onStart = () => {
+                const page = this.getActivePage();
+                if (page) {
+                    startSnap = this.snapshot(page);
+                    hasChanged = false;
+                }
+            };
+
+            on(input, 'pointerdown', onStart);
+            on(input, 'keydown', (e) => {
+                if (['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'PageUp', 'PageDown'].includes(e.key)) {
+                    if (!startSnap) onStart();
+                }
+            });
+
             on(input, 'input', (e) => {
                 const page = this.getActivePage();
                 if (label) label.textContent = formatter(e.target.value);
                 if (!page) return;
+                if (!startSnap) onStart();
+                hasChanged = true;
                 apply(page, e.target.value);
                 if (this.viewMode !== VIEW.COMPARE) this.setViewMode(VIEW.COMPARE);
                 this.requestPreview();
+            });
+
+            on(input, 'change', () => {
+                const page = this.getActivePage();
+                if (page && hasChanged && startSnap) {
+                    page.history.undo.push({ ...startSnap, description: 'Chỉnh thanh trượt' });
+                    if (page.history.undo.length > MAX_HISTORY) page.history.undo.shift();
+                    page.history.redo = [];
+                    this.updateHistoryButtons();
+                    this.scheduleMetaSave();
+                }
+                startSnap = null;
+                hasChanged = false;
             });
         };
 
@@ -452,8 +572,10 @@ class DocScanApp {
         on(this.chkNormalizeDpi, 'change', (e) => {
             const page = this.getActivePage();
             if (!page) return;
+            this.pushHistory(e.target.checked ? 'Bật chuẩn hóa độ phân giải' : 'Tắt chuẩn hóa độ phân giải');
             page.settings.normalize_res = e.target.checked;
             this.markDirty(page);
+            this.requestPreview();
             this.scheduleMetaSave();
         });
 
@@ -649,6 +771,7 @@ class DocScanApp {
             corners: raw.corners || this.fullFrameCorners(raw.width, raw.height),
             rotation: raw.rotation || 0,
             settings: { ...DEFAULT_SETTINGS, ...(raw.settings || {}) },
+            annotations: JSON.parse(JSON.stringify(raw.annotations || [])),
             history: (raw.history && (raw.history.undo || raw.history.redo))
                 ? { undo: [...(raw.history.undo || [])], redo: [...(raw.history.redo || [])] }
                 : { undo: [], redo: [] },
@@ -1244,8 +1367,11 @@ class DocScanApp {
                 rotation: page.rotation || 0,
                 settings: JSON.parse(JSON.stringify(page.settings || {})),
                 docName: page.docName || '',
+                annotations: JSON.parse(JSON.stringify(page.annotations || [])),
             };
         }
+        this.selectedAnnotationId = null;
+        this.updateAnnotationActionButtons();
         this.emptyState.style.display = 'none';
         this.editorStage.style.display = 'flex';
         this.docNameWrapper.style.display = 'flex';
@@ -1510,6 +1636,7 @@ class DocScanApp {
                     corners: page.corners,
                     rotation: page.rotation,
                     settings: page.settings,
+                    annotations: page.annotations || [],
                 }),
                 signal: controller.signal,
             });
@@ -1597,6 +1724,7 @@ class DocScanApp {
                 corners: p.corners,
                 rotation: p.rotation,
                 settings: p.settings,
+                annotations: p.annotations || [],
                 history: p.history,
             }));
         if (!pages.length) return;
@@ -1675,6 +1803,7 @@ class DocScanApp {
                 rotation: p.rotation || 0,
                 settings: JSON.parse(JSON.stringify(p.settings || {})),
                 docName: p.docName || '',
+                annotations: JSON.parse(JSON.stringify(p.annotations || [])),
             };
             this.dirtyPages.delete(p.id);
             count++;
@@ -1689,6 +1818,7 @@ class DocScanApp {
             corners: page.corners,
             rotation: page.rotation,
             settings: page.settings,
+            annotations: page.annotations || [],
             history: page.history,
         };
     }
@@ -1917,6 +2047,8 @@ class DocScanApp {
             corners: JSON.parse(JSON.stringify(page.corners)),
             rotation: page.rotation,
             settings: { ...page.settings },
+            annotations: JSON.parse(JSON.stringify(page.annotations || [])),
+            stepCount: this.annStepCount,
         };
     }
 
@@ -1934,28 +2066,41 @@ class DocScanApp {
         page.corners = JSON.parse(JSON.stringify(snap.corners));
         page.rotation = snap.rotation;
         page.settings = { ...DEFAULT_SETTINGS, ...snap.settings };
+        page.annotations = JSON.parse(JSON.stringify(snap.annotations || []));
+        if (snap.stepCount !== undefined) {
+            this.annStepCount = snap.stepCount;
+            if (this.lblNextStepNum) this.lblNextStepNum.textContent = String(this.annStepCount);
+        }
+        this.selectedAnnotationId = null;
         this.syncInspector(page.settings);
+        if (this.viewMode === VIEW.COMPARE) {
+            this.ensureBaseline();
+        }
+        this.layoutCanvas();
         this.drawCanvas();
         this.requestPreview();
         this.updateHistoryButtons();
+        this.updateAnnotationActionButtons();
     }
 
     undo() {
         const page = this.getActivePage();
-        if (!page || page.history.undo.length === 0) return;
-        page.history.redo.push(this.snapshot(page));
+        if (!page || !page.history || page.history.undo.length === 0) return;
+        const currentSnap = this.snapshot(page);
         const prev = page.history.undo.pop();
+        page.history.redo.push({ ...currentSnap, description: prev.description || '' });
         this.applySnapshot(page, prev);
         this.setStatus(`Đã hoàn tác: ${prev.description || 'thao tác trước'}`, 'info');
     }
 
     redo() {
         const page = this.getActivePage();
-        if (!page || page.history.redo.length === 0) return;
-        page.history.undo.push(this.snapshot(page));
+        if (!page || !page.history || page.history.redo.length === 0) return;
+        const currentSnap = this.snapshot(page);
         const next = page.history.redo.pop();
+        page.history.undo.push({ ...currentSnap, description: next.description || '' });
         this.applySnapshot(page, next);
-        this.setStatus('Đã làm lại thao tác.', 'info');
+        this.setStatus(`Đã làm lại: ${next.description || 'thao tác'}`, 'info');
     }
 
     updateHistoryButtons() {
@@ -1972,13 +2117,42 @@ class DocScanApp {
     // 🎨 KHUNG XEM CANVAS
     // ======================================================
 
-    setViewMode(mode) {
-        this.viewMode = mode;
-        if (mode === VIEW.COMPARE) this.ensureBaseline();
-        this.btnModeEdit?.classList.toggle('active', mode === VIEW.EDIT);
-        this.btnModeCompare?.classList.toggle('active', mode === VIEW.COMPARE);
-        this.showHandles = (mode === VIEW.EDIT);
+    setWorkflowTab(tab) {
+        this.activeTab = tab;
+        this.btnTabCrop?.classList.toggle('active', tab === WORKFLOW_TAB.CROP);
+        this.btnTabColor?.classList.toggle('active', tab === WORKFLOW_TAB.COLOR);
+        this.btnTabAnnotate?.classList.toggle('active', tab === WORKFLOW_TAB.ANNOTATE);
+
+        if (this.annotationBarContainer) {
+            this.annotationBarContainer.style.display = (tab === WORKFLOW_TAB.ANNOTATE) ? 'flex' : 'none';
+        }
+
+        const floatingToolbar = document.querySelector('.floating-toolbar');
+        if (floatingToolbar) {
+            floatingToolbar.style.display = (tab === WORKFLOW_TAB.CROP) ? 'flex' : 'none';
+        }
+
+        if (tab === WORKFLOW_TAB.CROP) {
+            this.viewMode = VIEW.EDIT;
+            this.showHandles = true;
+        } else if (tab === WORKFLOW_TAB.COLOR) {
+            this.viewMode = VIEW.COMPARE;
+            this.showHandles = false;
+            this.ensureBaseline();
+        } else if (tab === WORKFLOW_TAB.ANNOTATE) {
+            this.viewMode = VIEW.ANNOTATE;
+            this.showHandles = false;
+        }
+
+        this.btnModeEdit?.classList.toggle('active', this.viewMode === VIEW.EDIT);
+        this.btnModeCompare?.classList.toggle('active', this.viewMode === VIEW.COMPARE);
         this.layoutCanvas();
+    }
+
+    setViewMode(mode) {
+        if (mode === VIEW.EDIT) this.setWorkflowTab(WORKFLOW_TAB.CROP);
+        else if (mode === VIEW.COMPARE) this.setWorkflowTab(WORKFLOW_TAB.COLOR);
+        else if (mode === VIEW.ANNOTATE) this.setWorkflowTab(WORKFLOW_TAB.ANNOTATE);
     }
 
     setHoldingCompare(on) {
@@ -1988,7 +2162,7 @@ class DocScanApp {
     }
 
     isShowingOriginal() {
-        return this.holdingCompare || this.viewMode === VIEW.EDIT || !this.editedImg;
+        return this.holdingCompare || (this.viewMode === VIEW.EDIT && this.activeTab === WORKFLOW_TAB.CROP) || !this.editedImg;
     }
 
     layoutCanvas() {
@@ -2128,7 +2302,16 @@ class DocScanApp {
             this.setStatus('Chế độ So sánh — kéo thanh trượt để xem chi tiết Trước và Sau.', 'ok');
         } else {
             ctx.drawImage(this.editedImg, this.imgOffsetX, this.imgOffsetY, this.imgRenderW, this.imgRenderH);
-            this.setStatus('Bản đã chỉnh sửa — chữ đã được làm nét và cân bằng ánh sáng.', 'ok');
+            if (this.activeTab === WORKFLOW_TAB.ANNOTATE) {
+                this.setStatus('Bước 3: Chú thích & Biên tập — Chọn công cụ để vẽ hình, mũi tên, vệt dạ quang, chữ, làm mờ.', 'ok');
+            } else {
+                this.setStatus('Bản đã chỉnh sửa — chữ đã được làm nét và cân bằng ánh sáng.', 'ok');
+            }
+        }
+
+        // Vẽ lớp Vector Annotations lên trên ảnh tài liệu
+        if (!showingOriginal) {
+            this.drawAnnotationsLayer(ctx, page);
         }
 
         ctx.restore();
@@ -2321,19 +2504,750 @@ class DocScanApp {
         return { x, y };
     }
 
+    // ======================================================
+    // ✏️ BỘ CÔNG CỤ CHÚ THÍCH & BIÊN TẬP (SNAGIT-STYLE)
+    // ======================================================
+
+    setAnnTool(tool) {
+        this.activeAnnTool = tool;
+        document.querySelectorAll('.ann-tool-btn').forEach(b => {
+            b.classList.toggle('active', b.dataset.tool === tool);
+        });
+
+        if (this.propStepItem) {
+            this.propStepItem.style.display = (tool === 'step') ? 'flex' : 'none';
+        }
+        if (this.propFontSizeItem) {
+            this.propFontSizeItem.style.display = (tool === 'text' || tool === 'callout' || tool === 'arrow') ? 'flex' : 'none';
+        }
+        if (this.propCutPasteItem) {
+            this.propCutPasteItem.style.display = (tool === 'cut_paste') ? 'flex' : 'none';
+        }
+        const isShapeOrLine = ['rect', 'ellipse', 'line', 'arrow'].includes(tool);
+        if (this.propStrokeStyleItem) {
+            this.propStrokeStyleItem.style.display = isShapeOrLine ? 'flex' : 'none';
+        }
+
+        if (tool !== 'select') {
+            this.selectedAnnotationId = null;
+            this.updateAnnotationActionButtons();
+        }
+        this.drawCanvas();
+    }
+
+    setAnnColor(c) {
+        this.annColor = c;
+        document.querySelectorAll('.ann-color-swatch').forEach(sw => {
+            sw.classList.toggle('active', sw.dataset.color.toLowerCase() === c.toLowerCase());
+        });
+        if (this.annCustomColorPicker) this.annCustomColorPicker.value = c;
+        if (this.selectedAnnotationId) {
+            this.updateSelectedAnnotation({ color: c });
+        }
+    }
+
+    setAnnStrokeWidth(w) {
+        this.annStrokeWidth = w;
+        document.querySelectorAll('#segStrokeWidth .ann-seg-btn').forEach(b => {
+            b.classList.toggle('active', parseInt(b.dataset.width) === w);
+        });
+        if (this.selectedAnnotationId) {
+            this.updateSelectedAnnotation({ strokeWidth: w });
+        }
+    }
+
+    setAnnStrokeStyle(s) {
+        this.annStrokeStyle = s;
+        document.querySelectorAll('#segStrokeStyle .ann-seg-btn').forEach(b => {
+            b.classList.toggle('active', b.dataset.style === s);
+        });
+        if (this.selectedAnnotationId) {
+            this.updateSelectedAnnotation({ strokeStyle: s });
+        }
+    }
+
+    setAnnFontSize(sz) {
+        this.annFontSize = sz;
+        document.querySelectorAll('#segFontSize .ann-seg-btn').forEach(b => {
+            b.classList.toggle('active', parseInt(b.dataset.size) === sz);
+        });
+        if (this.selectedAnnotationId) {
+            this.updateSelectedAnnotation({ fontSize: sz });
+        }
+    }
+
+    setAnnCutMode(m) {
+        this.annCutMode = m;
+        document.querySelectorAll('#segCutMode .ann-seg-btn').forEach(b => {
+            b.classList.toggle('active', b.dataset.cut === m);
+        });
+    }
+
+    resetStepCount() {
+        this.annStepCount = 1;
+        if (this.lblNextStepNum) this.lblNextStepNum.textContent = '1';
+    }
+
+    updateAnnotationActionButtons() {
+        const hasSel = !!this.selectedAnnotationId;
+        if (this.btnDeleteSelectedAnn) this.btnDeleteSelectedAnn.disabled = !hasSel;
+        if (this.btnDuplicateSelectedAnn) this.btnDuplicateSelectedAnn.disabled = !hasSel;
+    }
+
+    updateSelectedAnnotation(changes) {
+        const page = this.getActivePage();
+        if (!page || !this.selectedAnnotationId) return;
+        const target = (page.annotations || []).find(a => a.id === this.selectedAnnotationId);
+        if (!target) return;
+        const hasDiff = Object.keys(changes).some(k => target[k] !== changes[k]);
+        if (!hasDiff) return;
+        this.pushHistory('Đổi thuộc tính chú thích');
+        Object.assign(target, changes);
+        this.markDirty(page);
+        this.drawCanvas();
+        this.requestPreview();
+    }
+
+    deleteSelectedAnnotation() {
+        const page = this.getActivePage();
+        if (!page || !this.selectedAnnotationId) return;
+        this.pushHistory('Xóa chú thích');
+        page.annotations = (page.annotations || []).filter(a => a.id !== this.selectedAnnotationId);
+        this.selectedAnnotationId = null;
+        this.updateAnnotationActionButtons();
+        this.markDirty(page);
+        this.drawCanvas();
+        this.requestPreview();
+    }
+
+    duplicateSelectedAnnotation() {
+        const page = this.getActivePage();
+        if (!page || !this.selectedAnnotationId) return;
+        const target = (page.annotations || []).find(a => a.id === this.selectedAnnotationId);
+        if (!target) return;
+        this.pushHistory('Nhân bản chú thích');
+        const clone = JSON.parse(JSON.stringify(target));
+        clone.id = 'ann_' + Date.now() + '_' + Math.random().toString(36).substr(2, 4);
+        const offset = 0.025;
+        if (clone.x !== undefined) clone.x = Math.min(0.95, clone.x + offset);
+        if (clone.y !== undefined) clone.y = Math.min(0.95, clone.y + offset);
+        if (clone.x1 !== undefined) {
+            clone.x1 = Math.min(0.95, clone.x1 + offset);
+            clone.x2 = Math.min(0.95, clone.x2 + offset);
+            clone.y1 = Math.min(0.95, clone.y1 + offset);
+            clone.y2 = Math.min(0.95, clone.y2 + offset);
+        }
+        if (clone.tailX !== undefined) {
+            clone.tailX = Math.min(0.95, clone.tailX + offset);
+            clone.tailY = Math.min(0.95, clone.tailY + offset);
+        }
+        page.annotations = page.annotations || [];
+        page.annotations.push(clone);
+        this.selectedAnnotationId = clone.id;
+        this.updateAnnotationActionButtons();
+        this.markDirty(page);
+        this.drawCanvas();
+        this.requestPreview();
+    }
+
+    async clearAllAnnotations() {
+        const page = this.getActivePage();
+        if (!page || !page.annotations || page.annotations.length === 0) return;
+        const ok = await this.askConfirm(
+            'Xóa toàn bộ chú thích?',
+            'Bạn có chắc chắn muốn xóa toàn bộ các nét vẽ, chữ và chú thích trên trang này không?'
+        );
+        if (!ok) return;
+        this.pushHistory('Xóa toàn bộ chú thích');
+        page.annotations = [];
+        this.selectedAnnotationId = null;
+        this.updateAnnotationActionButtons();
+        this.markDirty(page);
+        this.drawCanvas();
+        this.requestPreview();
+    }
+
+    openInlineTextEditor(ann, canvasX, canvasY) {
+        if (!this.canvasInlineTextEditor) return;
+        this.editingAnnId = ann.id;
+        const el = this.canvasInlineTextEditor;
+        el.value = ann.text || '';
+        el.style.display = 'block';
+        el.style.left = `${canvasX}px`;
+        el.style.top = `${canvasY}px`;
+        el.style.color = ann.color || '#ffffff';
+        el.style.fontSize = `${Math.max(14, Math.round((ann.fontSize || 18) * this.zoom))}px`;
+        setTimeout(() => { el.focus(); el.select(); }, 20);
+    }
+
+    commitInlineTextEditor() {
+        if (!this.canvasInlineTextEditor || this.canvasInlineTextEditor.style.display === 'none') return;
+        const page = this.getActivePage();
+        const text = this.canvasInlineTextEditor.value.trim();
+        this.canvasInlineTextEditor.style.display = 'none';
+        if (!page || !this.editingAnnId) return;
+
+        const ann = (page.annotations || []).find(a => a.id === this.editingAnnId);
+        if (ann && ann.text !== text) {
+            this.pushHistory('Sửa nội dung chữ');
+            ann.text = text || (ann.type === 'callout' ? 'Ghi chú' : '');
+            this.markDirty(page);
+            this.drawCanvas();
+            this.requestPreview();
+        }
+        this.editingAnnId = null;
+    }
+
+    cancelInlineTextEditor() {
+        if (this.canvasInlineTextEditor) this.canvasInlineTextEditor.style.display = 'none';
+        this.editingAnnId = null;
+    }
+
+    onCanvasDoubleClick(e) {
+        if (this.activeTab !== WORKFLOW_TAB.ANNOTATE) return;
+        const page = this.getActivePage();
+        if (!page) return;
+        const pos = this.canvasCoords(e);
+        const normX = (pos.x - this.imgOffsetX) / this.imgRenderW;
+        const normY = (pos.y - this.imgOffsetY) / this.imgRenderH;
+        const hit = this.hitTestAnnotation(page, normX, normY);
+        if (hit && (hit.type === 'text' || hit.type === 'callout' || hit.type === 'arrow')) {
+            const bx = (hit.x !== undefined) ? hit.x : (hit.x1 + hit.x2) / 2;
+            const by = (hit.y !== undefined) ? hit.y : (hit.y1 + hit.y2) / 2;
+            const cx = this.imgOffsetX + bx * this.imgRenderW;
+            const cy = this.imgOffsetY + by * this.imgRenderH;
+            this.openInlineTextEditor(hit, cx, cy);
+        }
+    }
+
+    getAnnotationBoundingBox(ann) {
+        if (ann.x !== undefined && ann.w !== undefined) {
+            return { x: ann.x, y: ann.y, w: ann.w, h: ann.h };
+        }
+        if (ann.x1 !== undefined && ann.x2 !== undefined) {
+            const minX = Math.min(ann.x1, ann.x2);
+            const minY = Math.min(ann.y1, ann.y2);
+            const w = Math.max(0.02, Math.abs(ann.x2 - ann.x1));
+            const h = Math.max(0.02, Math.abs(ann.y2 - ann.y1));
+            return { x: minX, y: minY, w, h };
+        }
+        if (ann.type === 'step') {
+            const r = (ann.radius || 18) / Math.max(100, this.imgRenderW);
+            return { x: ann.x - r, y: ann.y - r, w: r * 2, h: r * 2 };
+        }
+        return { x: ann.x || 0, y: ann.y || 0, w: ann.w || 0.1, h: ann.h || 0.05 };
+    }
+
+    hitTestAnnotation(page, normX, normY) {
+        const anns = page.annotations || [];
+        for (let i = anns.length - 1; i >= 0; i--) {
+            const ann = anns[i];
+            if (ann.type === 'line' || ann.type === 'arrow') {
+                const x1 = ann.x1, y1 = ann.y1, x2 = ann.x2, y2 = ann.y2;
+                const dx = x2 - x1, dy = y2 - y1;
+                const lenSq = dx * dx + dy * dy;
+                if (lenSq === 0) continue;
+                const t = Math.max(0, Math.min(1, ((normX - x1) * dx + (normY - y1) * dy) / lenSq));
+                const px = x1 + t * dx, py = y1 + t * dy;
+                if (Math.hypot(normX - px, normY - py) <= 0.025) return ann;
+            } else if (ann.type === 'step') {
+                const r = (ann.radius || 18) / Math.max(100, this.imgRenderW);
+                if (Math.hypot(normX - ann.x, normY - ann.y) <= r + 0.015) return ann;
+            } else {
+                const b = this.getAnnotationBoundingBox(ann);
+                if (normX >= b.x - 0.01 && normX <= b.x + b.w + 0.01 &&
+                    normY >= b.y - 0.01 && normY <= b.y + b.h + 0.01) {
+                    return ann;
+                }
+            }
+        }
+        return null;
+    }
+
+    hitTestAnnotationHandle(ann, normX, normY) {
+        const hitTol = 16 / Math.max(100, this.imgRenderW);
+        if (ann.type === 'callout' && ann.tailX !== undefined) {
+            if (Math.hypot(normX - ann.tailX, normY - ann.tailY) <= hitTol * 1.5) {
+                return 'tail';
+            }
+        }
+        const b = this.getAnnotationBoundingBox(ann);
+        const handles = [
+            { name: 'tl', x: b.x, y: b.y },
+            { name: 'tr', x: b.x + b.w, y: b.y },
+            { name: 'br', x: b.x + b.w, y: b.y + b.h },
+            { name: 'bl', x: b.x, y: b.y + b.h },
+        ];
+        for (const h of handles) {
+            if (Math.hypot(normX - h.x, normY - h.y) <= hitTol) return h.name;
+        }
+        return null;
+    }
+
+    finalizeCutPasteSelection(page, box) {
+        const normX = Math.min(box.startX, box.endX);
+        const normY = Math.min(box.startY, box.endY);
+        const normW = Math.abs(box.endX - box.startX);
+        const normH = Math.abs(box.endY - box.startY);
+        if (normW < 0.01 || normH < 0.01 || !this.editedImg) return;
+
+        this.pushHistory(this.annCutMode === 'move' ? 'Cắt dời vùng chọn' : 'Sao chép vùng chọn');
+
+        const nw = this.editedImg.naturalWidth || this.editedImg.width || 1000;
+        const nh = this.editedImg.naturalHeight || this.editedImg.height || 1000;
+        const px = Math.max(0, Math.round(normX * nw));
+        const py = Math.max(0, Math.round(normY * nh));
+        const pw = Math.min(nw - px, Math.round(normW * nw));
+        const ph = Math.min(nh - py, Math.round(normH * nh));
+
+        if (pw <= 0 || ph <= 0) return;
+
+        const offCanvas = document.createElement('canvas');
+        offCanvas.width = pw;
+        offCanvas.height = ph;
+        const offCtx = offCanvas.getContext('2d');
+        offCtx.drawImage(this.editedImg, px, py, pw, ph, 0, 0, pw, ph);
+        const dataUrl = offCanvas.toDataURL('image/png');
+
+        page.annotations = page.annotations || [];
+
+        if (this.annCutMode === 'move') {
+            page.annotations.push({
+                id: 'ann_' + Date.now() + '_wo',
+                type: 'whiteout',
+                x: normX,
+                y: normY,
+                w: normW,
+                h: normH,
+            });
+        }
+
+        const patchAnn = {
+            id: 'ann_' + Date.now() + '_patch',
+            type: 'image_patch',
+            x: normX,
+            y: normY,
+            w: normW,
+            h: normH,
+            patchDataUrl: dataUrl,
+        };
+
+        page.annotations.push(patchAnn);
+
+        this.selectedAnnotationId = patchAnn.id;
+        this.setAnnTool('select');
+        this.updateAnnotationActionButtons();
+        this.markDirty(page);
+        this.drawCanvas();
+        this.requestPreview();
+        this.toastOk(this.annCutMode === 'move' ? 'Đã cắt vùng chọn. Bạn có thể kéo thả sang vị trí mới.' : 'Đã sao chép vùng chọn.');
+    }
+
+    drawAnnotationsLayer(ctx, page) {
+        const anns = page.annotations || [];
+        anns.forEach(ann => {
+            const isSel = (ann.id === this.selectedAnnotationId);
+            this.drawSingleAnnotation(ctx, ann, isSel);
+        });
+
+        if (this.activeDrawingAnnotation) {
+            this.drawSingleAnnotation(ctx, this.activeDrawingAnnotation, false);
+        }
+
+        if (this.cutSelectionBox) {
+            this.drawCutSelectionBox(ctx, this.cutSelectionBox);
+        }
+    }
+
+    drawSingleAnnotation(ctx, ann, isSel = false) {
+        ctx.save();
+        const rw = this.imgRenderW;
+        const rh = this.imgRenderH;
+        const ox = this.imgOffsetX;
+        const oy = this.imgOffsetY;
+
+        const x = ox + (ann.x !== undefined ? ann.x : (ann.startX !== undefined ? Math.min(ann.startX, ann.currentX) : 0)) * rw;
+        const y = oy + (ann.y !== undefined ? ann.y : (ann.startY !== undefined ? Math.min(ann.startY, ann.currentY) : 0)) * rh;
+        const w = (ann.w !== undefined ? ann.w : (ann.startX !== undefined ? Math.abs(ann.currentX - ann.startX) : 0.1)) * rw;
+        const h = (ann.h !== undefined ? ann.h : (ann.startY !== undefined ? Math.abs(ann.currentY - ann.startY) : 0.05)) * rh;
+
+        const color = ann.color || '#ef4444';
+        const strokeW = Math.max(2, Math.round((ann.strokeWidth || 4) * (rw / 800)));
+
+        if (ann.strokeStyle === 'dashed') {
+            ctx.setLineDash([8, 6]);
+        }
+
+        // 1. Hình chữ nhật
+        if (ann.type === 'rect') {
+            ctx.strokeStyle = color;
+            ctx.lineWidth = strokeW;
+            ctx.strokeRect(x, y, w, h);
+        }
+        // 2. Hình tròn / Elip
+        else if (ann.type === 'ellipse') {
+            ctx.strokeStyle = color;
+            ctx.lineWidth = strokeW;
+            ctx.beginPath();
+            ctx.ellipse(x + w / 2, y + h / 2, Math.max(1, Math.abs(w / 2)), Math.max(1, Math.abs(h / 2)), 0, 0, Math.PI * 2);
+            ctx.stroke();
+        }
+        // 3. Đường thẳng
+        else if (ann.type === 'line') {
+            const x1 = ox + (ann.x1 !== undefined ? ann.x1 : ann.startX) * rw;
+            const y1 = oy + (ann.y1 !== undefined ? ann.y1 : ann.startY) * rh;
+            const x2 = ox + (ann.x2 !== undefined ? ann.x2 : ann.currentX) * rw;
+            const y2 = oy + (ann.y2 !== undefined ? ann.y2 : ann.currentY) * rh;
+            ctx.strokeStyle = color;
+            ctx.lineWidth = strokeW;
+            ctx.beginPath();
+            ctx.moveTo(x1, y1);
+            ctx.lineTo(x2, y2);
+            ctx.stroke();
+        }
+        // 4. Mũi tên kèm nhãn dọc
+        else if (ann.type === 'arrow') {
+            const x1 = ox + (ann.x1 !== undefined ? ann.x1 : ann.startX) * rw;
+            const y1 = oy + (ann.y1 !== undefined ? ann.y1 : ann.startY) * rh;
+            const x2 = ox + (ann.x2 !== undefined ? ann.x2 : ann.currentX) * rw;
+            const y2 = oy + (ann.y2 !== undefined ? ann.y2 : ann.currentY) * rh;
+
+            ctx.strokeStyle = color;
+            ctx.fillStyle = color;
+            ctx.lineWidth = strokeW;
+            ctx.beginPath();
+            ctx.moveTo(x1, y1);
+            ctx.lineTo(x2, y2);
+            ctx.stroke();
+
+            const angle = Math.atan2(y2 - y1, x2 - x1);
+            const headLen = Math.max(14, strokeW * 3.5);
+            ctx.beginPath();
+            ctx.moveTo(x2, y2);
+            ctx.lineTo(x2 - headLen * Math.cos(angle - Math.PI / 7), y2 - headLen * Math.sin(angle - Math.PI / 7));
+            ctx.lineTo(x2 - headLen * Math.cos(angle + Math.PI / 7), y2 - headLen * Math.sin(angle + Math.PI / 7));
+            ctx.closePath();
+            ctx.fill();
+
+            if (ann.text) {
+                const fs = Math.max(11, Math.round((ann.fontSize || 16) * (rw / 800)));
+                ctx.font = 'bold ' + fs + 'px "Plus Jakarta Sans", sans-serif';
+                const mx = (x1 + x2) / 2;
+                const my = (y1 + y2) / 2;
+                const tm = ctx.measureText(ann.text);
+                const pw = tm.width + 16;
+                const ph = fs + 12;
+                ctx.fillStyle = 'rgba(15, 23, 42, 0.88)';
+                this.roundRect(ctx, mx - pw / 2, my - ph / 2, pw, ph, 6);
+                ctx.fill();
+                ctx.strokeStyle = color;
+                ctx.lineWidth = 1.5;
+                ctx.stroke();
+                ctx.fillStyle = '#ffffff';
+                ctx.textAlign = 'center';
+                ctx.textBaseline = 'middle';
+                ctx.fillText(ann.text, mx, my);
+            }
+        }
+        // 5. Bút dạ quang (Highlighter)
+        else if (ann.type === 'highlighter') {
+            ctx.fillStyle = color;
+            ctx.globalAlpha = 0.38;
+            ctx.fillRect(x, y, w, h);
+        }
+        // 6. Hộp văn bản (Text)
+        else if (ann.type === 'text') {
+            const fs = Math.max(13, Math.round((ann.fontSize || 18) * (rw / 800)));
+            ctx.font = (ann.bold ? 'bold ' : '') + fs + 'px "Plus Jakarta Sans", sans-serif';
+            ctx.fillStyle = color;
+            ctx.textBaseline = 'top';
+            ctx.fillText(ann.text || 'Ghi chú...', x, y);
+        }
+        // 7. Bóng thoại (Callout Snagit)
+        else if (ann.type === 'callout') {
+            const tx = ox + (ann.tailX !== undefined ? ann.tailX : (ann.startX !== undefined ? ann.startX : ann.x)) * rw;
+            const ty = oy + (ann.tailY !== undefined ? ann.tailY : (ann.startY !== undefined ? ann.startY : ann.y)) * rh;
+            const bw = Math.max(60, w);
+            const bh = Math.max(34, h);
+            const bg = ann.fillColor || '#0284c7';
+
+            ctx.fillStyle = bg;
+            ctx.strokeStyle = '#ffffff';
+            ctx.lineWidth = strokeW;
+
+            // Đuôi bóng thoại
+            ctx.beginPath();
+            ctx.moveTo(x + bw / 2 - 12, y + bh / 2);
+            ctx.lineTo(tx, ty);
+            ctx.lineTo(x + bw / 2 + 12, y + bh / 2);
+            ctx.closePath();
+            ctx.fill();
+
+            // Thân bóng thoại
+            this.roundRect(ctx, x, y, bw, bh, 8);
+            ctx.fill();
+            ctx.stroke();
+
+            // Chữ bên trong bóng thoại
+            const fs = Math.max(12, Math.round((ann.fontSize || 16) * (rw / 800)));
+            ctx.font = 'bold ' + fs + 'px "Plus Jakarta Sans", sans-serif';
+            ctx.fillStyle = '#ffffff';
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            ctx.fillText(ann.text || 'Chú thích', x + bw / 2, y + bh / 2);
+        }
+        // 8. Đánh số bước tuần tự (Step Badges 1, 2, 3...)
+        else if (ann.type === 'step') {
+            const cx = ox + ann.x * rw;
+            const cy = oy + ann.y * rh;
+            const r = Math.max(13, Math.round((ann.radius || 18) * (rw / 1000)));
+
+            ctx.beginPath();
+            ctx.arc(cx, cy, r, 0, Math.PI * 2);
+            ctx.fillStyle = color;
+            ctx.fill();
+            ctx.strokeStyle = '#ffffff';
+            ctx.lineWidth = 2.5;
+            ctx.stroke();
+
+            ctx.font = 'bold ' + Math.round(r * 1.2) + 'px "Plus Jakarta Sans", sans-serif';
+            ctx.fillStyle = '#ffffff';
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            ctx.fillText(String(ann.stepNumber || 1), cx, cy - 1);
+        }
+        // 9. Làm mờ bảo mật (Blur / Pixelate Redaction)
+        else if (ann.type === 'blur') {
+            ctx.fillStyle = 'rgba(15, 23, 42, 0.88)';
+            ctx.fillRect(x, y, w, h);
+            ctx.strokeStyle = '#38bdf8';
+            ctx.lineWidth = 1.5;
+            ctx.setLineDash([4, 4]);
+            ctx.strokeRect(x, y, w, h);
+
+            ctx.fillStyle = '#38bdf8';
+            ctx.font = 'bold 11px sans-serif';
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            ctx.fillText('🔒 ĐÃ CHE MỜ', x + w / 2, y + h / 2);
+        }
+        // 10. Tẩy trắng / Xóa (Smart Whiteout)
+        else if (ann.type === 'whiteout') {
+            ctx.fillStyle = '#ffffff';
+            ctx.fillRect(x, y, w, h);
+        }
+        // 11. Cắt - Kéo - Dán (Image Patch)
+        else if (ann.type === 'image_patch' && ann.patchDataUrl) {
+            let cached = this.patchImagesCache.get(ann.id);
+            if (!cached) {
+                cached = new Image();
+                cached.src = ann.patchDataUrl;
+                this.patchImagesCache.set(ann.id, cached);
+                cached.onload = () => this.drawCanvas();
+            }
+            if (cached.complete) {
+                ctx.drawImage(cached, x, y, w, h);
+            }
+            ctx.strokeStyle = 'rgba(56, 189, 248, 0.6)';
+            ctx.lineWidth = 1;
+            ctx.setLineDash([3, 3]);
+            ctx.strokeRect(x, y, w, h);
+        }
+
+        // Bounding Box & Handles khi đang được chọn
+        if (isSel) {
+            ctx.setLineDash([5, 4]);
+            ctx.strokeStyle = '#38bdf8';
+            ctx.lineWidth = 2;
+            const b = this.getAnnotationBoundingBox(ann);
+            const bx = ox + b.x * rw;
+            const by = oy + b.y * rh;
+            const bw = b.w * rw;
+            const bh = b.h * rh;
+            ctx.strokeRect(bx - 4, by - 4, bw + 8, bh + 8);
+
+            ctx.setLineDash([]);
+            ctx.fillStyle = '#38bdf8';
+            ctx.strokeStyle = '#ffffff';
+            ctx.lineWidth = 1.5;
+            const handlePoints = [
+                [bx - 4, by - 4],
+                [bx + bw + 4, by - 4],
+                [bx + bw + 4, by + bh + 4],
+                [bx - 4, by + bh + 4],
+            ];
+            handlePoints.forEach(([hx, hy]) => {
+                ctx.fillRect(hx - 4, hy - 4, 8, 8);
+                ctx.strokeRect(hx - 4, hy - 4, 8, 8);
+            });
+
+            if (ann.type === 'callout' && ann.tailX !== undefined) {
+                const tx = ox + ann.tailX * rw;
+                const ty = oy + ann.tailY * rh;
+                ctx.beginPath();
+                ctx.arc(tx, ty, 6, 0, Math.PI * 2);
+                ctx.fillStyle = '#f59e0b';
+                ctx.fill();
+                ctx.stroke();
+            }
+        }
+
+        ctx.restore();
+    }
+
+    drawCutSelectionBox(ctx, box) {
+        ctx.save();
+        const rw = this.imgRenderW;
+        const rh = this.imgRenderH;
+        const ox = this.imgOffsetX;
+        const oy = this.imgOffsetY;
+
+        const x = ox + Math.min(box.startX, box.endX) * rw;
+        const y = oy + Math.min(box.startY, box.endY) * rh;
+        const w = Math.abs(box.endX - box.startX) * rw;
+        const h = Math.abs(box.endY - box.startY) * rh;
+
+        ctx.strokeStyle = '#38bdf8';
+        ctx.lineWidth = 2;
+        ctx.setLineDash([6, 5]);
+        ctx.strokeRect(x, y, w, h);
+
+        ctx.fillStyle = 'rgba(56, 189, 248, 0.15)';
+        ctx.fillRect(x, y, w, h);
+
+        ctx.fillStyle = '#38bdf8';
+        ctx.font = 'bold 11px sans-serif';
+        ctx.fillText('✂️ Vùng cắt dán', x + 6, y - 6);
+
+        ctx.restore();
+    }
+
     onPointerDown(e) {
         const page = this.getActivePage();
         if (!page) return;
         const pos = this.canvasCoords(e);
-        // Kính lúp lấy mẫu từ bộ đệm canvas (hệ toạ độ MÀN HÌNH), còn `pos` đã bị
-        // nghịch-xoay về hệ toạ độ ảnh. Dùng lẫn hai hệ này thì kính lúp soi sai vùng.
         const screen = this.screenCoords(e);
 
+        // --- XỬ LÝ KHI Ở TAB 3: CHÚ THÍCH & BIÊN TẬP ---
+        if (this.activeTab === WORKFLOW_TAB.ANNOTATE && !this.isShowingOriginal()) {
+            const normX = (pos.x - this.imgOffsetX) / this.imgRenderW;
+            const normY = (pos.y - this.imgOffsetY) / this.imgRenderH;
+
+            // 1. Tool Select & Move / Resize
+            if (this.activeAnnTool === 'select') {
+                if (this.selectedAnnotationId) {
+                    const selAnn = (page.annotations || []).find(a => a.id === this.selectedAnnotationId);
+                    if (selAnn) {
+                        const handle = this.hitTestAnnotationHandle(selAnn, normX, normY);
+                        if (handle) {
+                            this.isResizingAnnotation = true;
+                            this.selectedHandle = handle;
+                            this.dragStartAnnPos = { normX, normY, origAnn: JSON.parse(JSON.stringify(selAnn)) };
+                            this.annDragStartSnapshot = this.snapshot(page);
+                            this.annHasMoved = false;
+                            return;
+                        }
+                    }
+                }
+
+                const hit = this.hitTestAnnotation(page, normX, normY);
+                if (hit) {
+                    this.selectedAnnotationId = hit.id;
+                    this.isDraggingAnnotation = true;
+                    this.dragStartAnnPos = { normX, normY, origAnn: JSON.parse(JSON.stringify(hit)) };
+                    this.annDragStartSnapshot = this.snapshot(page);
+                    this.annHasMoved = false;
+                    this.updateAnnotationActionButtons();
+                    this.drawCanvas();
+                    return;
+                } else {
+                    if (this.selectedAnnotationId) {
+                        this.selectedAnnotationId = null;
+                        this.updateAnnotationActionButtons();
+                        this.drawCanvas();
+                    }
+                }
+            }
+            // 2. Tool Step (Đánh số bước)
+            else if (this.activeAnnTool === 'step') {
+                this.pushHistory('Thêm đánh số bước');
+                const ann = {
+                    id: 'ann_' + Date.now() + '_' + Math.random().toString(36).substr(2, 4),
+                    type: 'step',
+                    x: Math.max(0.02, Math.min(0.98, normX)),
+                    y: Math.max(0.02, Math.min(0.98, normY)),
+                    radius: 18,
+                    stepNumber: this.annStepCount,
+                    color: this.annColor,
+                    strokeWidth: 2,
+                };
+                page.annotations = page.annotations || [];
+                page.annotations.push(ann);
+                this.annStepCount++;
+                if (this.lblNextStepNum) this.lblNextStepNum.textContent = String(this.annStepCount);
+                this.selectedAnnotationId = ann.id;
+                this.updateAnnotationActionButtons();
+                this.markDirty(page);
+                this.drawCanvas();
+                this.requestPreview();
+                return;
+            }
+            // 3. Tool Text (Văn bản)
+            else if (this.activeAnnTool === 'text') {
+                this.pushHistory('Thêm hộp chữ');
+                const ann = {
+                    id: 'ann_' + Date.now() + '_' + Math.random().toString(36).substr(2, 4),
+                    type: 'text',
+                    x: Math.max(0.02, Math.min(0.95, normX)),
+                    y: Math.max(0.02, Math.min(0.95, normY)),
+                    w: 0.25,
+                    h: 0.06,
+                    text: 'Ghi chú...',
+                    color: this.annColor,
+                    fontSize: this.annFontSize,
+                    bold: true,
+                };
+                page.annotations = page.annotations || [];
+                page.annotations.push(ann);
+                this.selectedAnnotationId = ann.id;
+                this.updateAnnotationActionButtons();
+                this.markDirty(page);
+                this.drawCanvas();
+                this.requestPreview();
+                this.openInlineTextEditor(ann, pos.x, pos.y);
+                return;
+            }
+            // 4. Tool Cut-Paste (Cắt dán)
+            else if (this.activeAnnTool === 'cut_paste') {
+                this.cutSelectionBox = { startX: normX, startY: normY, endX: normX, endY: normY };
+                this.drawCanvas();
+                return;
+            }
+            // 5. Các công cụ vẽ khác (rect, ellipse, line, arrow, highlighter, callout, blur, whiteout)
+            else {
+                this.activeDrawingAnnotation = {
+                    id: 'ann_' + Date.now() + '_' + Math.random().toString(36).substr(2, 4),
+                    type: this.activeAnnTool,
+                    startX: normX,
+                    startY: normY,
+                    currentX: normX,
+                    currentY: normY,
+                    color: this.annColor,
+                    strokeWidth: this.annStrokeWidth,
+                    strokeStyle: this.annStrokeStyle,
+                    fontSize: this.annFontSize,
+                };
+                return;
+            }
+        }
+
+        // --- XỬ LÝ KHI Ở TAB 2: SO SÁNH TRƯỚC / SAU ---
         if (this.viewMode === VIEW.COMPARE && !this.holdingCompare && this.editedImg) {
             const sliderX = this.imgOffsetX + this.imgRenderW * this.sliderPos;
             if (Math.abs(pos.x - sliderX) <= 22) { this.isSliding = true; return; }
         }
 
+        // --- XỬ LÝ KHI Ở TAB 1: CĂN CHỈNH 4 GÓC MÉP GIẤY ---
         if (this.showHandles && this.isShowingOriginal()) {
             const corners = page.corners || this.fullFrameCorners(page.width, page.height);
             const rot = (page.rotation || 0) % 360;
@@ -2353,7 +3267,8 @@ class DocScanApp {
                 const sy = originY + corners[i][1] * scaleY;
                 if (Math.hypot(pos.x - sx, pos.y - sy) <= hit) {
                     this.draggingCornerIndex = i;
-                    this.pushHistory('Kéo chỉnh góc mép giấy');
+                    this.cornerDragStartSnapshot = this.snapshot(page);
+                    this.cornerHasMoved = false;
                     this.drawCanvas();
                     this.showMagnifier(screen.x, screen.y, i);
                     return;
@@ -2361,6 +3276,7 @@ class DocScanApp {
             }
         }
 
+        // Kéo xoay khung xem ảnh (Pan)
         this.isPanning = true;
         this.panStartX = e.clientX - this.panX;
         this.panStartY = e.clientY - this.panY;
@@ -2368,8 +3284,94 @@ class DocScanApp {
     }
 
     onPointerMove(e) {
+        const pos = this.canvasCoords(e);
+
+        // --- XỬ LÝ KHI Ở TAB 3: CHÚ THÍCH & BIÊN TẬP ---
+        if (this.activeTab === WORKFLOW_TAB.ANNOTATE && !this.isShowingOriginal()) {
+            const normX = (pos.x - this.imgOffsetX) / this.imgRenderW;
+            const normY = (pos.y - this.imgOffsetY) / this.imgRenderH;
+
+            if (this.activeDrawingAnnotation) {
+                this.activeDrawingAnnotation.currentX = normX;
+                this.activeDrawingAnnotation.currentY = normY;
+                this.drawCanvas();
+                return;
+            }
+            if (this.cutSelectionBox) {
+                this.cutSelectionBox.endX = normX;
+                this.cutSelectionBox.endY = normY;
+                this.drawCanvas();
+                return;
+            }
+            if (this.isDraggingAnnotation && this.selectedAnnotationId && this.dragStartAnnPos) {
+                const page = this.getActivePage();
+                const sel = (page?.annotations || []).find(a => a.id === this.selectedAnnotationId);
+                if (sel) {
+                    const deltaX = normX - this.dragStartAnnPos.normX;
+                    const deltaY = normY - this.dragStartAnnPos.normY;
+                    if (Math.hypot(deltaX, deltaY) > 0.002) {
+                        this.annHasMoved = true;
+                    }
+                    const orig = this.dragStartAnnPos.origAnn;
+                    if (orig.x !== undefined) { sel.x = orig.x + deltaX; sel.y = orig.y + deltaY; }
+                    if (orig.x1 !== undefined) {
+                        sel.x1 = orig.x1 + deltaX; sel.x2 = orig.x2 + deltaX;
+                        sel.y1 = orig.y1 + deltaY; sel.y2 = orig.y2 + deltaY;
+                    }
+                    if (orig.tailX !== undefined) {
+                        sel.tailX = orig.tailX + deltaX; sel.tailY = orig.tailY + deltaY;
+                    }
+                    this.drawCanvas();
+                }
+                return;
+            }
+            if (this.isResizingAnnotation && this.selectedAnnotationId && this.dragStartAnnPos) {
+                const page = this.getActivePage();
+                const sel = (page?.annotations || []).find(a => a.id === this.selectedAnnotationId);
+                if (sel) {
+                    this.annHasMoved = true;
+                    const orig = this.dragStartAnnPos.origAnn;
+                    if (this.selectedHandle === 'tail') {
+                        sel.tailX = normX; sel.tailY = normY;
+                    } else if (this.selectedHandle === 'br') {
+                        sel.w = Math.max(0.02, normX - orig.x); sel.h = Math.max(0.02, normY - orig.y);
+                    } else if (this.selectedHandle === 'tl') {
+                        const right = orig.x + orig.w; const bottom = orig.y + orig.h;
+                        sel.x = Math.min(right - 0.02, normX); sel.y = Math.min(bottom - 0.02, normY);
+                        sel.w = right - sel.x; sel.h = bottom - sel.y;
+                    } else if (this.selectedHandle === 'tr') {
+                        const left = orig.x; const bottom = orig.y + orig.h;
+                        sel.y = Math.min(bottom - 0.02, normY);
+                        sel.w = Math.max(0.02, normX - left); sel.h = bottom - sel.y;
+                    } else if (this.selectedHandle === 'bl') {
+                        const right = orig.x + orig.w; const top = orig.y;
+                        sel.x = Math.min(right - 0.02, normX);
+                        sel.w = right - sel.x; sel.h = Math.max(0.02, normY - top);
+                    }
+                    this.drawCanvas();
+                }
+                return;
+            }
+
+            if (this.activeAnnTool === 'select') {
+                const page = this.getActivePage();
+                if (page && this.selectedAnnotationId) {
+                    const selAnn = (page.annotations || []).find(a => a.id === this.selectedAnnotationId);
+                    if (selAnn && this.hitTestAnnotationHandle(selAnn, normX, normY)) {
+                        this.canvasViewport.style.cursor = 'crosshair';
+                        return;
+                    }
+                }
+                const hit = page ? this.hitTestAnnotation(page, normX, normY) : null;
+                this.canvasViewport.style.cursor = hit ? 'move' : 'default';
+                return;
+            } else {
+                this.canvasViewport.style.cursor = 'crosshair';
+                return;
+            }
+        }
+
         if (this.isSliding) {
-            const pos = this.canvasCoords(e);
             this.sliderPos = Math.max(0.01, Math.min(0.99, (pos.x - this.imgOffsetX) / this.imgRenderW));
             this.drawCanvas();
             return;
@@ -2385,7 +3387,6 @@ class DocScanApp {
         if (this.draggingCornerIndex !== -1) {
             const page = this.getActivePage();
             if (!page) return;
-            const pos = this.canvasCoords(e);
             const screen = this.screenCoords(e);
             const rot = (page.rotation || 0) % 360;
             const isSwapped = (rot === 90 || rot === 270);
@@ -2400,7 +3401,7 @@ class DocScanApp {
 
             const x = (pos.x - originX) / scaleX;
             const y = (pos.y - originY) / scaleY;
-            // Cho phép kéo ra ngoài mép ảnh 10% để đắp thêm viền giấy.
+            this.cornerHasMoved = true;
             page.corners[this.draggingCornerIndex] = [
                 Math.max(-page.width * 0.1, Math.min(page.width * 1.1, x)),
                 Math.max(-page.height * 0.1, Math.min(page.height * 1.1, y)),
@@ -2411,7 +3412,6 @@ class DocScanApp {
         }
 
         if (this.viewMode === VIEW.COMPARE && !this.holdingCompare && this.editedImg && this.imgRenderW) {
-            const pos = this.canvasCoords(e);
             const sliderX = this.imgOffsetX + this.imgRenderW * this.sliderPos;
             this.canvasViewport.style.cursor = Math.abs(pos.x - sliderX) <= 18 ? 'ew-resize' : '';
         } else {
@@ -2421,11 +3421,123 @@ class DocScanApp {
 
     onPointerUp() {
         this.isSliding = false;
+
+        // --- XỬ LÝ KHI Ở TAB 3: CHÚ THÍCH & BIÊN TẬP ---
+        if (this.activeTab === WORKFLOW_TAB.ANNOTATE) {
+            const page = this.getActivePage();
+            if (this.activeDrawingAnnotation && page) {
+                const d = this.activeDrawingAnnotation;
+                page.annotations = page.annotations || [];
+                let finalAnn = null;
+
+                if (d.type === 'callout') {
+                    finalAnn = {
+                        id: d.id,
+                        type: 'callout',
+                        x: Math.min(d.startX, d.currentX),
+                        y: Math.min(d.startY, d.currentY),
+                        w: Math.max(0.18, Math.abs(d.currentX - d.startX)),
+                        h: Math.max(0.07, Math.abs(d.currentY - d.startY)),
+                        tailX: d.startX,
+                        tailY: d.startY,
+                        color: '#ffffff',
+                        fillColor: d.color,
+                        strokeWidth: d.strokeWidth,
+                        fontSize: d.fontSize,
+                        text: 'Chú thích',
+                    };
+                } else if (d.type === 'line' || d.type === 'arrow') {
+                    if (Math.hypot(d.currentX - d.startX, d.currentY - d.startY) > 0.015) {
+                        finalAnn = {
+                            id: d.id,
+                            type: d.type,
+                            x1: d.startX,
+                            y1: d.startY,
+                            x2: d.currentX,
+                            y2: d.currentY,
+                            color: d.color,
+                            strokeWidth: d.strokeWidth,
+                            strokeStyle: d.strokeStyle,
+                            fontSize: d.fontSize,
+                            text: d.type === 'arrow' ? '' : undefined,
+                        };
+                    }
+                } else {
+                    const w = Math.abs(d.currentX - d.startX);
+                    const h = Math.abs(d.currentY - d.startY);
+                    if (w > 0.01 && h > 0.01) {
+                        finalAnn = {
+                            id: d.id,
+                            type: d.type,
+                            x: Math.min(d.startX, d.currentX),
+                            y: Math.min(d.startY, d.currentY),
+                            w,
+                            h,
+                            color: d.color,
+                            strokeWidth: d.strokeWidth,
+                            strokeStyle: d.strokeStyle,
+                        };
+                    }
+                }
+
+                if (finalAnn) {
+                    // Ghi mốc hoàn tác TRƯỚC KHI đẩy đối tượng mới vào
+                    this.pushHistory(`Vẽ ${d.type}`);
+                    page.annotations.push(finalAnn);
+                    this.selectedAnnotationId = finalAnn.id;
+                    this.updateAnnotationActionButtons();
+                    this.markDirty(page);
+                    this.drawCanvas();
+                    this.requestPreview();
+                }
+                this.activeDrawingAnnotation = null;
+                return;
+            }
+
+            if (this.cutSelectionBox && page) {
+                this.finalizeCutPasteSelection(page, this.cutSelectionBox);
+                this.cutSelectionBox = null;
+                return;
+            }
+
+            if (this.isDraggingAnnotation || this.isResizingAnnotation) {
+                if (this.annHasMoved && this.annDragStartSnapshot && page) {
+                    const desc = this.isResizingAnnotation ? 'Co giãn chú thích' : 'Di chuyển chú thích';
+                    page.history.undo.push({ ...this.annDragStartSnapshot, description: desc });
+                    if (page.history.undo.length > MAX_HISTORY) page.history.undo.shift();
+                    page.history.redo = [];
+                    this.updateHistoryButtons();
+                    this.scheduleMetaSave();
+                    this.markDirty(page);
+                    this.drawCanvas();
+                    this.requestPreview();
+                }
+                this.isDraggingAnnotation = false;
+                this.isResizingAnnotation = false;
+                this.selectedHandle = null;
+                this.annDragStartSnapshot = null;
+                this.annHasMoved = false;
+                return;
+            }
+        }
+
         if (this.draggingCornerIndex !== -1) {
             this.draggingCornerIndex = -1;
             this.hideMagnifier();
-            this.drawCanvas();
-            this.requestPreview();
+            if (this.cornerHasMoved && this.cornerDragStartSnapshot) {
+                const page = this.getActivePage();
+                if (page) {
+                    page.history.undo.push({ ...this.cornerDragStartSnapshot, description: 'Kéo chỉnh góc mép giấy' });
+                    if (page.history.undo.length > MAX_HISTORY) page.history.undo.shift();
+                    page.history.redo = [];
+                    this.updateHistoryButtons();
+                    this.scheduleMetaSave();
+                    this.drawCanvas();
+                    this.requestPreview();
+                }
+            }
+            this.cornerHasMoved = false;
+            this.cornerDragStartSnapshot = null;
         }
         if (this.isPanning) {
             this.isPanning = false;
@@ -3098,6 +4210,7 @@ class DocScanApp {
                         activePage.rotation = snap.rotation;
                         activePage.settings = snap.settings;
                         activePage.docName = snap.docName;
+                        activePage.annotations = JSON.parse(JSON.stringify(snap.annotations || []));
                     }
                     this.dirtyPages.delete(activePage.id);
                     this.updateSaveState();
