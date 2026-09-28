@@ -186,6 +186,7 @@ class DocScanApp {
         this.btnPanelApplyAsOriginal = $('btnPanelApplyAsOriginal');
 
         this.btnExportPdf = $('btnExportPdf');
+        this.btnCopyCurrent = $('btnCopyCurrent');
         this.btnDownloadCurrent = $('btnDownloadCurrent');
 
         this.emptyState = $('emptyState');
@@ -391,6 +392,8 @@ class DocScanApp {
                 e.preventDefault(); this.saveProject();
             } else if (!typing && ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'd')) {
                 e.preventDefault(); this.duplicateSelectedAnnotation();
+            } else if (!typing && !window.getSelection()?.toString() && ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'c')) {
+                if (this.getActivePage()) { e.preventDefault(); this.copyCurrentPageImage(); }
             } else if (!typing && (e.key === 'Delete' || e.key === 'Backspace')) {
                 if (this.selectedAnnotationId) { e.preventDefault(); this.deleteSelectedAnnotation(); }
             } else if (e.key === 'Escape') {
@@ -582,6 +585,7 @@ class DocScanApp {
         // --- Lưu & xuất trên thanh Top Bar (phục vụ trực tiếp cho trang đang mở) ---
         on(this.btnSaveToDisk, 'click', () => this.saveProject());
         on(this.btnExportPdf, 'click', () => this.exportCurrentPagePdf());
+        on(this.btnCopyCurrent, 'click', () => this.copyCurrentPageImage());
         on(this.btnDownloadCurrent, 'click', () => this.downloadCurrentPage('jpeg'));
 
         // --- Xuất theo Thư mục (ở thanh công cụ Thumbnail) ---
@@ -660,6 +664,7 @@ class DocScanApp {
             this.editorStage.style.display = 'none';
             this.emptyState.style.display = 'flex';
             this.docNameWrapper.style.display = 'none';
+            if (this.btnCopyCurrent) this.btnCopyCurrent.disabled = true;
             if (this.btnDownloadCurrent) this.btnDownloadCurrent.disabled = true;
             this.updateHistoryButtons();
             localStorage.setItem('docscan_root_path', data.root_path);
@@ -1179,6 +1184,7 @@ class DocScanApp {
         if (this.btnDownloadFolderZip) this.btnDownloadFolderZip.disabled = !hasSelected;
         if (this.btnExportPdf) this.btnExportPdf.disabled = !hasActivePage;
         if (this.btnSaveToDisk) this.btnSaveToDisk.disabled = this.dirtyPages.size === 0;
+        if (this.btnCopyCurrent) this.btnCopyCurrent.disabled = !hasActivePage;
         if (this.btnDownloadCurrent) this.btnDownloadCurrent.disabled = !hasActivePage;
 
         // Bảng Inspector bên phải: Chỉ kích hoạt khi đang có 1 ảnh được chọn xem/sửa
@@ -1375,6 +1381,7 @@ class DocScanApp {
         this.emptyState.style.display = 'none';
         this.editorStage.style.display = 'flex';
         this.docNameWrapper.style.display = 'flex';
+        if (this.btnCopyCurrent) this.btnCopyCurrent.disabled = false;
         this.btnDownloadCurrent.disabled = false;
 
         this.txtDocName.value = page.docName;
@@ -3736,6 +3743,7 @@ class DocScanApp {
                     this.editorStage.style.display = 'none';
                     this.emptyState.style.display = 'flex';
                     this.docNameWrapper.style.display = 'none';
+                    if (this.btnCopyCurrent) this.btnCopyCurrent.disabled = true;
                     if (this.btnDownloadCurrent) this.btnDownloadCurrent.disabled = true;
                     this.updateHistoryButtons();
                 }
@@ -3955,6 +3963,68 @@ class DocScanApp {
         } finally {
             this.hideLoading();
         }
+    }
+
+    async copyCurrentPageImage() {
+        const page = this.getActivePage();
+        if (!page) return;
+        try {
+            this.showLoading('Đang sao chép ảnh vào bộ nhớ tạm…');
+            if (this.dirtyPages.has(page.id)) {
+                await this.saveDirtyPages(true);
+            }
+            const imageUrl = `/api/image?file=${encodeURIComponent(page.filename)}&rel=${encodeURIComponent(page.relativePath)}&kind=edited&v=${page.version || Date.now()}`;
+            const res = await fetch(imageUrl);
+            if (!res.ok) throw new Error('Không thể tải ảnh kết quả.');
+            const blob = await res.blob();
+            const pngBlob = await this.blobToPngBlob(blob);
+
+            if (!navigator.clipboard || !navigator.clipboard.write) {
+                throw new Error('Trình duyệt không hỗ trợ sao chép ảnh vào Clipboard.');
+            }
+
+            await navigator.clipboard.write([
+                new ClipboardItem({ 'image/png': pngBlob })
+            ]);
+            this.toastOk('Đã sao chép ảnh kết quả vào bộ nhớ tạm (Clipboard).');
+        } catch (err) {
+            console.error('Sao chép ảnh thất bại:', err);
+            this.toastErr(err.message || 'Không thể sao chép ảnh vào bộ nhớ tạm.');
+        } finally {
+            this.hideLoading();
+        }
+    }
+
+    blobToPngBlob(blob) {
+        return new Promise((resolve, reject) => {
+            if (blob.type === 'image/png') {
+                resolve(blob);
+                return;
+            }
+            const img = new Image();
+            const url = URL.createObjectURL(blob);
+            img.onload = () => {
+                URL.revokeObjectURL(url);
+                try {
+                    const canvas = document.createElement('canvas');
+                    canvas.width = img.naturalWidth || img.width;
+                    canvas.height = img.naturalHeight || img.height;
+                    const ctx = canvas.getContext('2d');
+                    ctx.drawImage(img, 0, 0);
+                    canvas.toBlob((b) => {
+                        if (b) resolve(b);
+                        else reject(new Error('Chuyển đổi định dạng ảnh thất bại.'));
+                    }, 'image/png');
+                } catch (e) {
+                    reject(e);
+                }
+            };
+            img.onerror = () => {
+                URL.revokeObjectURL(url);
+                reject(new Error('Không đọc được dữ liệu ảnh để sao chép.'));
+            };
+            img.src = url;
+        });
     }
 
     async downloadCurrentPage(format = 'jpeg') {
