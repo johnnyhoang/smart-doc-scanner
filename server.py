@@ -15,6 +15,7 @@ MÔ HÌNH TRUNG TÂM
 """
 
 import errno
+import math
 import os
 import threading
 from collections import OrderedDict
@@ -33,6 +34,13 @@ from core import renderer as rd
 from core.detector import detect_document_corners, imread_unicode
 from core.compressor import generate_pdf_from_images
 from core.namer import get_basic_document_name, ai_ocr_suggest_document_name
+from core.pdf_stitcher import (
+    render_pdf_to_images,
+    stitch_images,
+    encode_stitched_image,
+    make_stitched_preview,
+    parse_color_hex,
+)
 
 app = FastAPI(title="DocScan Studio API", version="3.0.0")
 
@@ -314,6 +322,39 @@ class AiSuggestRequest(BaseModel):
     relative_path: Optional[str] = ""
     filename: str
     page_index: Optional[int] = 1
+    root_path: Optional[str] = None
+
+
+class StitchPreviewRequest(BaseModel):
+    relative_path: Optional[str] = ""
+    filenames: Optional[List[str]] = None
+    layout: str = "grid"
+    cols: int = 3
+    spacing: int = 24
+    padding: int = 32
+    bg_color: str = "#ffffff"
+    draw_border: bool = True
+    last_row_align: str = "center"
+    scale: float = 1.0
+    root_path: Optional[str] = None
+
+
+class StitchExportRequest(BaseModel):
+    relative_path: Optional[str] = ""
+    filenames: Optional[List[str]] = None
+    layout: str = "grid"
+    cols: int = 3
+    spacing: int = 24
+    padding: int = 32
+    bg_color: str = "#ffffff"
+    draw_border: bool = True
+    last_row_align: str = "center"
+    scale: float = 1.0
+    format: str = "jpeg"
+    quality: int = 88
+    doc_name: Optional[str] = None
+    save_path: Optional[str] = None
+    import_to_project: bool = False
     root_path: Optional[str] = None
 
 
@@ -1361,6 +1402,245 @@ def legacy_pdfs(req: CleanupLegacyPdfRequest):
 
     return {"success": True, "deleted": deleted, "failed": failed,
             "files": found, "total": len(found)}
+
+
+# ==========================================================
+# GHÉP FILE PDF THÀNH 1 ẢNH (DÀI HOẶC LƯỚI / GRID)
+# ==========================================================
+
+@app.post("/api/stitch-preview-upload")
+async def stitch_preview_upload(
+    file: UploadFile = File(...),
+    layout: str = Form("grid"),
+    cols: int = Form(3),
+    spacing: int = Form(24),
+    padding: int = Form(32),
+    bg_color: str = Form("#ffffff"),
+    draw_border: bool = Form(True),
+    last_row_align: str = Form("center"),
+    scale: float = Form(1.0),
+):
+    """Tạo nhanh ảnh xem trước từ file PDF được tải lên."""
+    contents = await file.read()
+    if len(contents) > MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Tệp quá lớn ({ps.format_file_size(len(contents))}).",
+        )
+
+    def _process():
+        images = render_pdf_to_images(contents, dpi=150.0, max_dim_per_page=1600)
+        c_bgr = parse_color_hex(bg_color, (255, 255, 255))
+        stitched = stitch_images(
+            images,
+            layout=layout,
+            cols=cols,
+            spacing=spacing,
+            padding=padding,
+            bg_color=c_bgr,
+            draw_border=draw_border,
+            last_row_align=last_row_align,
+            scale=scale,
+            max_total_dim=8000,
+        )
+        sh, sw = stitched.shape[:2]
+        preview_bytes = make_stitched_preview(stitched, max_preview_dim=1600, quality=80)
+        return preview_bytes, sw, sh, len(images)
+
+    preview_bytes, sw, sh, num_pages = await run_in_threadpool(_process)
+
+    return Response(
+        content=preview_bytes,
+        media_type="image/jpeg",
+        headers={
+            "Cache-Control": "no-store",
+            "X-Out-Width": str(sw),
+            "X-Out-Height": str(sh),
+            "X-Total-Pages": str(num_pages),
+            "X-Cols": str(cols),
+            "X-Rows": str(math.ceil(num_pages / max(1, cols)) if layout == "grid" else (num_pages if layout == "vertical" else 1)),
+        },
+    )
+
+
+@app.post("/api/stitch-preview-pages")
+async def stitch_preview_pages(req: StitchPreviewRequest):
+    """Tạo nhanh ảnh xem trước từ các trang đã có trong dự án."""
+    root = active_root(req.root_path)
+    rel = ps.normalize_rel(req.relative_path)
+    filenames = req.filenames or ps.order_page_files(
+        ps.list_page_files(ps.folder_dir(root, rel)),
+        ps.read_meta(root, rel).get("order") or [],
+    )
+    if not filenames:
+        raise HTTPException(status_code=400, detail="Không có trang nào được chọn để ghép.")
+
+    def _process():
+        images = _load_edited_images(root, rel, filenames)
+        if not images:
+            raise HTTPException(status_code=400, detail="Không tải được dữ liệu ảnh của các trang đã chọn.")
+        c_bgr = parse_color_hex(req.bg_color, (255, 255, 255))
+        stitched = stitch_images(
+            images,
+            layout=req.layout,
+            cols=req.cols,
+            spacing=req.spacing,
+            padding=req.padding,
+            bg_color=c_bgr,
+            draw_border=req.draw_border,
+            last_row_align=req.last_row_align,
+            scale=req.scale,
+            max_total_dim=8000,
+        )
+        sh, sw = stitched.shape[:2]
+        preview_bytes = make_stitched_preview(stitched, max_preview_dim=1600, quality=80)
+        return preview_bytes, sw, sh, len(images)
+
+    preview_bytes, sw, sh, num_pages = await run_in_threadpool(_process)
+
+    return Response(
+        content=preview_bytes,
+        media_type="image/jpeg",
+        headers={
+            "Cache-Control": "no-store",
+            "X-Out-Width": str(sw),
+            "X-Out-Height": str(sh),
+            "X-Total-Pages": str(num_pages),
+            "X-Cols": str(req.cols),
+            "X-Rows": str(math.ceil(num_pages / max(1, req.cols)) if req.layout == "grid" else (num_pages if req.layout == "vertical" else 1)),
+        },
+    )
+
+
+@app.post("/api/stitch-export-upload")
+async def stitch_export_upload(
+    file: UploadFile = File(...),
+    layout: str = Form("grid"),
+    cols: int = Form(3),
+    spacing: int = Form(24),
+    padding: int = Form(32),
+    bg_color: str = Form("#ffffff"),
+    draw_border: bool = Form(True),
+    last_row_align: str = Form("center"),
+    scale: float = Form(1.0),
+    format: str = Form("jpeg"),
+    quality: int = Form(88),
+    doc_name: Optional[str] = Form(None),
+    save_path: Optional[str] = Form(None),
+    import_to_project: bool = Form(False),
+    relative_path: Optional[str] = Form(""),
+    root_path: Optional[str] = Form(None),
+):
+    """Xuất ảnh ghép đầy đủ độ phân giải từ file PDF tải lên."""
+    contents = await file.read()
+    if len(contents) > MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Tệp quá lớn ({ps.format_file_size(len(contents))}).",
+        )
+
+    def _process():
+        images = render_pdf_to_images(contents, dpi=200.0, max_dim_per_page=2400)
+        c_bgr = parse_color_hex(bg_color, (255, 255, 255))
+        stitched = stitch_images(
+            images,
+            layout=layout,
+            cols=cols,
+            spacing=spacing,
+            padding=padding,
+            bg_color=c_bgr,
+            draw_border=draw_border,
+            last_row_align=last_row_align,
+            scale=scale,
+        )
+        return stitched, len(images)
+
+    stitched, num_pages = await run_in_threadpool(_process)
+
+    fmt = (format or "jpeg").lower()
+    ext = "png" if fmt == "png" else "jpg"
+    title = ps.sanitize_component(doc_name or ps.stem_of(file.filename or "Ghep-PDF") or "Ghep-PDF")
+
+    # 1. Thêm trực tiếp vào thư mục dự án
+    if import_to_project:
+        root = active_root(root_path)
+        rel = ps.normalize_rel(relative_path)
+        page_name = f"{title}_ghep"
+        payload = _save_imported_image(root, rel, stitched, page_name)
+        return {"success": True, "imported": True, "page": payload, "pages": num_pages}
+
+    data, mime = encode_stitched_image(stitched, format=fmt, quality=quality)
+
+    # 2. Ghi ra nơi người dùng chọn
+    target = _checked_save_path(save_path)
+    if target:
+        result = _write_export(target, data, f"ảnh ghép {ext.upper()}")
+        return {**result, "pages": num_pages, "width": stitched.shape[1], "height": stitched.shape[0]}
+
+    # 3. Phản hồi tệp tải về
+    return Response(
+        content=data,
+        media_type=mime,
+        headers={"Content-Disposition": f'attachment; filename="{title}.{ext}"'},
+    )
+
+
+@app.post("/api/stitch-export-pages")
+async def stitch_export_pages(req: StitchExportRequest):
+    """Xuất ảnh ghép đầy đủ độ phân giải từ các trang trong dự án."""
+    root = active_root(req.root_path)
+    rel = ps.normalize_rel(req.relative_path)
+    filenames = req.filenames or ps.order_page_files(
+        ps.list_page_files(ps.folder_dir(root, rel)),
+        ps.read_meta(root, rel).get("order") or [],
+    )
+    if not filenames:
+        raise HTTPException(status_code=400, detail="Không có trang nào được chọn để ghép.")
+
+    def _process():
+        images = _load_edited_images(root, rel, filenames)
+        if not images:
+            raise HTTPException(status_code=400, detail="Không tải được dữ liệu ảnh của các trang đã chọn.")
+        c_bgr = parse_color_hex(req.bg_color, (255, 255, 255))
+        stitched = stitch_images(
+            images,
+            layout=req.layout,
+            cols=req.cols,
+            spacing=req.spacing,
+            padding=req.padding,
+            bg_color=c_bgr,
+            draw_border=req.draw_border,
+            last_row_align=req.last_row_align,
+            scale=req.scale,
+        )
+        return stitched, len(images)
+
+    stitched, num_pages = await run_in_threadpool(_process)
+
+    fmt = (req.format or "jpeg").lower()
+    ext = "png" if fmt == "png" else "jpg"
+    folder_name = os.path.basename(ps.folder_dir(root, rel)) or "Tai-Lieu"
+    title = ps.sanitize_component(req.doc_name or f"{folder_name}_{num_pages}_trang_ghep")
+
+    # 1. Thêm trực tiếp vào thư mục dự án
+    if req.import_to_project:
+        payload = _save_imported_image(root, rel, stitched, title)
+        return {"success": True, "imported": True, "page": payload, "pages": num_pages}
+
+    data, mime = encode_stitched_image(stitched, format=fmt, quality=req.quality)
+
+    # 2. Ghi ra nơi người dùng chọn
+    target = _checked_save_path(req.save_path)
+    if target:
+        result = _write_export(target, data, f"ảnh ghép {ext.upper()}")
+        return {**result, "pages": num_pages, "width": stitched.shape[1], "height": stitched.shape[0]}
+
+    # 3. Phản hồi tệp tải về
+    return Response(
+        content=data,
+        media_type=mime,
+        headers={"Content-Disposition": f'attachment; filename="{title}.{ext}"'},
+    )
 
 
 # ==========================================================

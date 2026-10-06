@@ -58,6 +58,9 @@
                 <button id="btnExportPdf" class="btn btn-primary" disabled title="Lưu trang đang mở thành tệp PDF — bạn chọn nơi lưu, mặc định là thư mục tài liệu">
                     <i class="fa-solid fa-file-pdf"></i> Lưu PDF
                 </button>
+                <button id="btnStitchPdf" class="btn btn-secondary" title="Ghép file PDF hoặc các trang thành 1 ảnh dài / ảnh lưới (Grid)">
+                    <i class="fa-solid fa-table-cells-large text-accent"></i> Ghép PDF &rarr; 1 Ảnh
+                </button>
                 <button id="btnCopyCurrent" class="btn btn-secondary" disabled title="Sao chép ảnh kết quả vào bộ nhớ tạm (Ctrl + C hoặc nhấp chuột)">
                     <i class="fa-regular fa-copy"></i> Sao chép ảnh
                 </button>
@@ -135,6 +138,9 @@
                         </div>
                         <button class="btn btn-primary btn-xs" id="btnExportFolderPdf" title="Lưu các trang đã chọn thành một tệp PDF — bạn chọn nơi lưu" disabled>
                             <i class="fa-solid fa-file-pdf"></i> <span id="lblExportPdf">Lưu PDF</span>
+                        </button>
+                        <button class="btn btn-secondary btn-xs" id="btnStitchFolderPages" title="Ghép các trang đã chọn thành 1 ảnh dài hoặc ảnh lưới" disabled>
+                            <i class="fa-solid fa-table-cells-large"></i> <span id="lblStitchFolder">Ghép 1 ảnh</span>
                         </button>
                         <button class="btn btn-secondary btn-xs" id="btnDownloadFolderZip" title="Tải các ảnh đã chọn dưới dạng tệp ZIP" disabled>
                             <i class="fa-solid fa-file-zipper"></i> <span id="lblDownloadZip">Lưu ảnh</span>
@@ -763,6 +769,192 @@
                     <button class="btn btn-secondary" id="btnUnsavedCancel">Hủy bỏ</button>
                     <button class="btn btn-secondary" id="btnUnsavedDiscard" style="color: #ef4444; border-color: rgba(239, 68, 68, 0.3);">Không lưu</button>
                     <button class="btn btn-primary" id="btnUnsavedSave"><i class="fa-solid fa-floppy-disk"></i> Lưu thay đổi</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Modal 6: Ghép PDF thành 1 ảnh (Dài / Lưới Grid) -->
+        <div class="modal-backdrop" id="stitchPdfModal" style="display: none;">
+            <div class="modal-card modal-card-xl">
+                <div class="modal-header">
+                    <div class="modal-header-title-box">
+                        <h3 id="stitchModalTitle"><i class="fa-solid fa-table-cells-large text-accent"></i> Ghép file PDF thành 1 ảnh (Dài / Lưới)</h3>
+                        <p class="modal-desc" style="margin-top: 4px; font-size: 12px; color: var(--text-muted);">
+                            Chuyển đổi toàn bộ các trang của file PDF thành 1 ảnh dài cuộn hoặc ảnh rộng dạng lưới nhiều cột
+                        </p>
+                    </div>
+                    <button class="modal-close-btn" id="btnCloseStitchModal"><i class="fa-solid fa-xmark"></i></button>
+                </div>
+                <div class="modal-body stitch-modal-body">
+                    <!-- Cột trái: Bộ điều khiển cấu hình -->
+                    <div class="stitch-controls-col">
+                        <!-- Nguồn tài liệu -->
+                        <div class="stitch-control-card">
+                            <span class="stitch-control-label"><i class="fa-solid fa-file-pdf text-accent"></i> Nguồn tài liệu</span>
+                            <div class="stitch-source-tabs">
+                                <button class="stitch-tab-btn active" id="btnStitchTabUpload" data-src="upload">
+                                    <i class="fa-solid fa-cloud-arrow-up"></i> Tải PDF từ máy
+                                </button>
+                                <button class="stitch-tab-btn" id="btnStitchTabFolder" data-src="folder">
+                                    <i class="fa-regular fa-folder-open"></i> Trang trong thư mục
+                                </button>
+                            </div>
+
+                            <div class="stitch-upload-area" id="stitchUploadArea">
+                                <input type="file" id="stitchFileInput" accept="application/pdf,.pdf" hidden>
+                                <label for="stitchFileInput" class="stitch-dropzone" id="stitchDropzone">
+                                    <i class="fa-solid fa-file-pdf drop-icon"></i>
+                                    <div class="drop-title" id="stitchDropTitle">Kéo thả file PDF vào đây hoặc <span>chọn file</span></div>
+                                    <div class="drop-subtitle" id="stitchDropSubtitle">Hỗ trợ PDF scan, xuất từ Word hoặc in ảo</div>
+                                </label>
+                            </div>
+
+                            <div class="stitch-folder-area" id="stitchFolderArea" style="display: none;">
+                                <div class="stitch-folder-box">
+                                    <i class="fa-solid fa-images text-accent"></i>
+                                    <div>
+                                        <strong id="stitchFolderPagesCount">0 trang</strong>
+                                        <p class="text-muted" style="font-size: 11.5px; margin: 2px 0 0 0;">Lấy theo thứ tự đã sắp xếp trong thư mục đang mở.</p>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Kiểu bố cục ghép -->
+                        <div class="stitch-control-card">
+                            <span class="stitch-control-label"><i class="fa-solid fa-layer-group text-accent"></i> Kiểu bố cục ảnh ghép</span>
+                            <div class="stitch-layout-cards">
+                                <button class="stitch-layout-card" data-layout="vertical" title="Toàn bộ trang xếp thành 1 cột dài cuộn xuống">
+                                    <i class="fa-solid fa-arrows-up-down"></i>
+                                    <strong>Ảnh dài</strong>
+                                    <small>1 cột dọc</small>
+                                </button>
+                                <button class="stitch-layout-card active" data-layout="grid" title="Xếp dạng lưới nhiều cột (ví dụ 3 cột: 5 trang -> 3 trên, 2 dưới)">
+                                    <i class="fa-solid fa-table-cells-large"></i>
+                                    <strong>Ảnh lưới</strong>
+                                    <small>Rộng N cột</small>
+                                </button>
+                                <button class="stitch-layout-card" data-layout="horizontal" title="Toàn bộ trang xếp thành 1 hàng ngang">
+                                    <i class="fa-solid fa-arrows-left-right"></i>
+                                    <strong>Ảnh ngang</strong>
+                                    <small>1 hàng ngang</small>
+                                </button>
+                            </div>
+
+                            <!-- Tùy chọn lưới -->
+                            <div class="stitch-grid-settings" id="stitchGridSettings">
+                                <div class="stitch-form-group">
+                                    <span class="stitch-sub-label">Số cột (trang trên mỗi hàng):</span>
+                                    <div class="stitch-seg-buttons" id="segStitchCols">
+                                        <button class="stitch-seg-btn" data-cols="2">2 cột</button>
+                                        <button class="stitch-seg-btn active" data-cols="3">3 cột</button>
+                                        <button class="stitch-seg-btn" data-cols="4">4 cột</button>
+                                        <button class="stitch-seg-btn" data-cols="5">5 cột</button>
+                                    </div>
+                                </div>
+
+                                <div class="stitch-form-group">
+                                    <span class="stitch-sub-label">Bố trí hàng cuối (nếu thiếu cột):</span>
+                                    <div class="stitch-seg-buttons" id="segStitchAlign">
+                                        <button class="stitch-seg-btn active" data-align="center" title="Ví dụ 5 trang: 3 trang trên, 2 trang dưới căn giữa cân đối">Căn giữa (Ví dụ 3 trên, 2 dưới)</button>
+                                        <button class="stitch-seg-btn" data-align="left" title="Căn từ lề trái">Căn trái</button>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Tinh chỉnh hiển thị -->
+                        <div class="stitch-control-card">
+                            <span class="stitch-control-label"><i class="fa-solid fa-sliders text-accent"></i> Tinh chỉnh hiển thị & Chất lượng</span>
+                            <div class="stitch-options-grid">
+                                <div class="stitch-field">
+                                    <label>Khoảng cách:</label>
+                                    <select id="selStitchSpacing" class="stitch-select">
+                                        <option value="0">0 px (Dính liền)</option>
+                                        <option value="16">16 px (Hẹp)</option>
+                                        <option value="24" selected>24 px (Chuẩn)</option>
+                                        <option value="36">36 px (Rộng)</option>
+                                    </select>
+                                </div>
+                                <div class="stitch-field">
+                                    <label>Màu nền:</label>
+                                    <select id="selStitchBg" class="stitch-select">
+                                        <option value="#ffffff" selected>Trắng (#fff)</option>
+                                        <option value="#f8fafc">Xám nhạt (#f8fafc)</option>
+                                        <option value="#0f172a">Đen tối (#0f172a)</option>
+                                    </select>
+                                </div>
+                                <div class="stitch-field">
+                                    <label>Độ phân giải:</label>
+                                    <select id="selStitchScale" class="stitch-select">
+                                        <option value="1.0" selected>Gốc 100% (Sắc nét)</option>
+                                        <option value="0.75">Chuẩn 75% (Tối ưu)</option>
+                                        <option value="0.5">Nhẹ 50% (Tiết kiệm)</option>
+                                    </select>
+                                </div>
+                                <div class="stitch-field">
+                                    <label>Định dạng xuất:</label>
+                                    <select id="selStitchFormat" class="stitch-select">
+                                        <option value="jpeg" selected>Ảnh JPG (Nhẹ)</option>
+                                        <option value="png">Ảnh PNG (Sắc nét)</option>
+                                    </select>
+                                </div>
+                            </div>
+                            <div class="stitch-checkbox-wrap">
+                                <label class="custom-checkbox">
+                                    <input type="checkbox" id="chkStitchBorder" checked>
+                                    <span class="checkmark"></span>
+                                    Vẽ đường viền mỏng phân tách từng trang
+                                </label>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Cột phải: Xem trước trực tiếp -->
+                    <div class="stitch-preview-col">
+                        <div class="stitch-preview-topbar">
+                            <div class="stitch-meta-badges">
+                                <span class="badge-item" id="stitchBadgePages"><i class="fa-regular fa-file-pdf text-accent"></i> 0 trang</span>
+                                <span class="badge-item" id="stitchBadgeLayout"><i class="fa-solid fa-table-cells text-accent"></i> Lưới 3 cột</span>
+                                <span class="badge-item highlight" id="stitchBadgeDim">-- × -- px</span>
+                            </div>
+                            <div class="stitch-zoom-tools">
+                                <button class="btn-icon-subtle" id="btnStitchZoomFit" title="Vừa khung hình"><i class="fa-solid fa-expand"></i> Vừa khung</button>
+                                <button class="btn-icon-subtle" id="btnStitchZoom100" title="Kích thước thật 100%"><i class="fa-solid fa-compress"></i> 1:1</button>
+                            </div>
+                        </div>
+
+                        <div class="stitch-preview-stage" id="stitchPreviewStage">
+                            <div class="stitch-canvas-wrap" id="stitchCanvasWrap">
+                                <img id="stitchPreviewImg" class="stitch-stage-img" src="" alt="Xem trước ảnh ghép" style="display: none;">
+                                <div class="stitch-stage-empty" id="stitchStageEmpty">
+                                    <div class="empty-icon-circle"><i class="fa-solid fa-file-pdf"></i></div>
+                                    <h4>Chưa có file PDF nào được chọn</h4>
+                                    <p>Tải file PDF hoặc chọn trang từ thư mục để xem trước ảnh ghép tại đây</p>
+                                </div>
+                            </div>
+
+                            <div class="stitch-loading-glass" id="stitchLoadingGlass" style="display: none;">
+                                <div class="modern-spinner"></div>
+                                <span id="stitchLoadingText">Đang trích xuất và ghép ảnh…</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="modal-footer stitch-footer">
+                    <button class="btn btn-secondary" id="btnCancelStitchModal">Đóng</button>
+                    <div class="stitch-actions-right">
+                        <button class="btn btn-secondary" id="btnStitchCopy" disabled title="Sao chép ảnh vào bộ nhớ tạm (Clipboard)">
+                            <i class="fa-regular fa-copy"></i> Sao chép ảnh
+                        </button>
+                        <button class="btn btn-secondary" id="btnStitchImportProject" disabled title="Lưu ảnh ghép vào thư mục hiện tại của dự án">
+                            <i class="fa-solid fa-folder-plus text-accent"></i> Thêm vào dự án
+                        </button>
+                        <button class="btn btn-primary" id="btnStitchExport" disabled title="Lưu ảnh ghép vào máy tính">
+                            <i class="fa-solid fa-floppy-disk"></i> Lưu ảnh ghép
+                        </button>
+                    </div>
                 </div>
             </div>
         </div>

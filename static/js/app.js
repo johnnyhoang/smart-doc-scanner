@@ -186,6 +186,7 @@ class DocScanApp {
         this.btnPanelApplyAsOriginal = $('btnPanelApplyAsOriginal');
 
         this.btnExportPdf = $('btnExportPdf');
+        this.btnStitchPdf = $('btnStitchPdf');
         this.btnCopyCurrent = $('btnCopyCurrent');
         this.btnDownloadCurrent = $('btnDownloadCurrent');
 
@@ -205,9 +206,26 @@ class DocScanApp {
         this.sortDropdown = $('sortDropdown');
         this.btnExportFolderPdf = $('btnExportFolderPdf');
         this.lblExportPdf = $('lblExportPdf');
+        this.btnStitchFolderPages = $('btnStitchFolderPages');
+        this.lblStitchFolder = $('lblStitchFolder');
         this.btnDownloadFolderZip = $('btnDownloadFolderZip');
         this.lblDownloadZip = $('lblDownloadZip');
         this.controlPanel = $('controlPanel');
+
+        this.stitchPdfModal = $('stitchPdfModal');
+        this.stitchState = {
+            source: 'upload',
+            file: null,
+            layout: 'grid',
+            cols: 3,
+            lastRowAlign: 'center',
+            spacing: 24,
+            bgColor: '#ffffff',
+            scale: 1.0,
+            format: 'jpeg',
+            drawBorder: true,
+            zoom: 'fit',
+        };
 
         this.selectionActionBar = $('selectionActionBar');
         this.selectionCount = $('selectionCount');
@@ -585,12 +603,15 @@ class DocScanApp {
         // --- Lưu & xuất trên thanh Top Bar (phục vụ trực tiếp cho trang đang mở) ---
         on(this.btnSaveToDisk, 'click', () => this.saveProject());
         on(this.btnExportPdf, 'click', () => this.exportCurrentPagePdf());
+        on(this.btnStitchPdf, 'click', () => this.openStitchModal('upload'));
         on(this.btnCopyCurrent, 'click', () => this.copyCurrentPageImage());
         on(this.btnDownloadCurrent, 'click', () => this.downloadCurrentPage('jpeg'));
 
         // --- Xuất theo Thư mục (ở thanh công cụ Thumbnail) ---
         on(this.btnExportFolderPdf, 'click', () => this.exportFolderPdf(this.activeFolderId));
+        on(this.btnStitchFolderPages, 'click', () => this.openStitchModal('folder'));
         on(this.btnDownloadFolderZip, 'click', () => this.downloadFolderZip(this.activeFolderId));
+        this.initStitchPdfModal();
 
         // --- Chọn ảnh đa mục tiêu ---
         on(this.btnToggleSelectAll, 'click', () => this.toggleSelectAll());
@@ -1165,11 +1186,15 @@ class DocScanApp {
         if (this.lblExportPdf) {
             this.lblExportPdf.textContent = count > 0 ? `Lưu PDF (${count})` : 'Lưu PDF';
         }
+        if (this.lblStitchFolder) {
+            this.lblStitchFolder.textContent = count > 0 ? `Ghép ảnh (${count})` : 'Ghép 1 ảnh';
+        }
         if (this.lblDownloadZip) {
             this.lblDownloadZip.textContent = count > 0 ? `Lưu ảnh (${count})` : 'Lưu ảnh';
         }
 
         if (this.btnExportFolderPdf) this.btnExportFolderPdf.disabled = count === 0;
+        if (this.btnStitchFolderPages) this.btnStitchFolderPages.disabled = count === 0;
         if (this.btnDownloadFolderZip) this.btnDownloadFolderZip.disabled = count === 0;
     }
 
@@ -1184,6 +1209,7 @@ class DocScanApp {
         if (this.btnToggleSelectAll) this.btnToggleSelectAll.disabled = !hasImages;
         if (this.btnSortMenu) this.btnSortMenu.disabled = !hasImages;
         if (this.btnExportFolderPdf) this.btnExportFolderPdf.disabled = !hasSelected;
+        if (this.btnStitchFolderPages) this.btnStitchFolderPages.disabled = !hasSelected;
         if (this.btnDownloadFolderZip) this.btnDownloadFolderZip.disabled = !hasSelected;
         if (this.btnExportPdf) this.btnExportPdf.disabled = !hasActivePage;
         if (this.btnSaveToDisk) this.btnSaveToDisk.disabled = this.dirtyPages.size === 0;
@@ -4353,6 +4379,505 @@ class DocScanApp {
 
     hideLoading() {
         if (this.loadingOverlay) this.loadingOverlay.style.display = 'none';
+    }
+
+    // ======================================================
+    // 📑 GHÉP FILE PDF THÀNH 1 ẢNH (DÀI / LƯỚI GRID)
+    // ======================================================
+
+    initStitchPdfModal() {
+        const modal = this.stitchPdfModal;
+        if (!modal) return;
+
+        // Đóng modal
+        const closeBtns = [$('btnCloseStitchModal'), $('btnCancelStitchModal')];
+        closeBtns.forEach(btn => btn && on(btn, 'click', () => this.closeStitchModal()));
+        on(modal, 'click', (e) => {
+            if (e.target === modal) this.closeStitchModal();
+        });
+
+        // Tabs nguồn (Upload PDF vs Folder Pages)
+        const tabUpload = $('btnStitchTabUpload');
+        const tabFolder = $('btnStitchTabFolder');
+        on(tabUpload, 'click', () => this.switchStitchSource('upload'));
+        on(tabFolder, 'click', () => this.switchStitchSource('folder'));
+
+        // Input & Drag-and-drop PDF
+        const fileInput = $('stitchFileInput');
+        const dropzone = $('stitchDropzone');
+        if (fileInput) {
+            on(fileInput, 'change', (e) => {
+                if (e.target.files && e.target.files[0]) {
+                    this.setStitchFile(e.target.files[0]);
+                }
+            });
+        }
+        if (dropzone) {
+            ['dragenter', 'dragover'].forEach(ev => {
+                on(dropzone, ev, (e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    dropzone.classList.add('dragover');
+                });
+            });
+            ['dragleave', 'drop'].forEach(ev => {
+                on(dropzone, ev, (e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    dropzone.classList.remove('dragover');
+                });
+            });
+            on(dropzone, 'drop', (e) => {
+                const files = e.dataTransfer?.files;
+                if (files && files.length > 0) {
+                    const pdf = Array.from(files).find(f => f.name.toLowerCase().endsWith('.pdf') || f.type === 'application/pdf');
+                    if (pdf) {
+                        this.setStitchFile(pdf);
+                    } else {
+                        this.toastErr('Vui lòng chọn hoặc thả tệp định dạng PDF.');
+                    }
+                }
+            });
+        }
+
+        // Bố cục (Vertical / Grid / Horizontal)
+        modal.querySelectorAll('.stitch-layout-card').forEach(btn => {
+            on(btn, 'click', () => {
+                modal.querySelectorAll('.stitch-layout-card').forEach(b => b.classList.remove('active'));
+                btn.classList.add('active');
+                this.stitchState.layout = btn.dataset.layout;
+                const gridSettings = $('stitchGridSettings');
+                if (gridSettings) {
+                    gridSettings.style.display = btn.dataset.layout === 'grid' ? 'flex' : 'none';
+                }
+                this.scheduleStitchPreview();
+            });
+        });
+
+        // Số cột khi chọn Grid
+        $('segStitchCols')?.querySelectorAll('.stitch-seg-btn').forEach(btn => {
+            on(btn, 'click', () => {
+                $('segStitchCols').querySelectorAll('.stitch-seg-btn').forEach(b => b.classList.remove('active'));
+                btn.classList.add('active');
+                this.stitchState.cols = parseInt(btn.dataset.cols, 10) || 3;
+                this.scheduleStitchPreview();
+            });
+        });
+
+        // Căn hàng cuối khi chọn Grid
+        $('segStitchAlign')?.querySelectorAll('.stitch-seg-btn').forEach(btn => {
+            on(btn, 'click', () => {
+                $('segStitchAlign').querySelectorAll('.stitch-seg-btn').forEach(b => b.classList.remove('active'));
+                btn.classList.add('active');
+                this.stitchState.lastRowAlign = btn.dataset.align || 'center';
+                this.scheduleStitchPreview();
+            });
+        });
+
+        // Các tùy chọn select & checkbox
+        const bindChange = (id, key, parseFn = x => x) => {
+            const el = $(id);
+            if (el) on(el, 'change', (e) => {
+                this.stitchState[key] = parseFn(e.target.value ?? e.target.checked);
+                this.scheduleStitchPreview();
+            });
+        };
+        bindChange('selStitchSpacing', 'spacing', x => parseInt(x, 10));
+        bindChange('selStitchBg', 'bgColor');
+        bindChange('selStitchScale', 'scale', x => parseFloat(x));
+        bindChange('selStitchFormat', 'format');
+        const chkBorder = $('chkStitchBorder');
+        if (chkBorder) on(chkBorder, 'change', (e) => {
+            this.stitchState.drawBorder = e.target.checked;
+            this.scheduleStitchPreview();
+        });
+
+        // Zoom preview
+        on($('btnStitchZoomFit'), 'click', () => {
+            const img = $('stitchPreviewImg');
+            if (img) {
+                img.style.maxWidth = '100%';
+                img.style.maxHeight = '100%';
+                img.style.transform = 'none';
+            }
+        });
+        on($('btnStitchZoom100'), 'click', () => {
+            const img = $('stitchPreviewImg');
+            if (img) {
+                img.style.maxWidth = 'none';
+                img.style.maxHeight = 'none';
+                img.style.transform = 'none';
+            }
+        });
+
+        // Hành động xuất
+        on($('btnStitchExport'), 'click', () => this.handleStitchExport('save'));
+        on($('btnStitchCopy'), 'click', () => this.handleStitchExport('copy'));
+        on($('btnStitchImportProject'), 'click', () => this.handleStitchExport('import'));
+    }
+
+    openStitchModal(source = 'upload') {
+        if (!this.stitchPdfModal) return;
+        this.stitchPdfModal.style.display = 'flex';
+        this.switchStitchSource(source);
+    }
+
+    closeStitchModal() {
+        if (!this.stitchPdfModal) return;
+        this.stitchPdfModal.style.display = 'none';
+        if (this._stitchPreviewUrl) {
+            URL.revokeObjectURL(this._stitchPreviewUrl);
+            this._stitchPreviewUrl = null;
+        }
+    }
+
+    switchStitchSource(src) {
+        this.stitchState.source = src;
+        const btnUpload = $('btnStitchTabUpload');
+        const btnFolder = $('btnStitchTabFolder');
+        const areaUpload = $('stitchUploadArea');
+        const areaFolder = $('stitchFolderArea');
+
+        if (btnUpload) btnUpload.classList.toggle('active', src === 'upload');
+        if (btnFolder) btnFolder.classList.toggle('active', src === 'folder');
+        if (areaUpload) areaUpload.style.display = src === 'upload' ? 'block' : 'none';
+        if (areaFolder) areaFolder.style.display = src === 'folder' ? 'block' : 'none';
+
+        if (src === 'folder') {
+            const folder = this.getActiveFolder();
+            const ids = folder ? (folder.imageIds || []) : [];
+            const selectedInFolder = ids.filter(id => this.selectedPageIds.has(id));
+            const targetIds = selectedInFolder.length > 0 ? selectedInFolder : ids;
+            const countEl = $('stitchFolderPagesCount');
+            if (countEl) {
+                countEl.textContent = `${targetIds.length} trang ${selectedInFolder.length > 0 ? '(đã chọn)' : 'trong thư mục'}`;
+            }
+            if (targetIds.length === 0) {
+                this.toastErr('Thư mục hiện tại chưa có trang nào để ghép.');
+            }
+        }
+
+        this.scheduleStitchPreview();
+    }
+
+    setStitchFile(file) {
+        this.stitchState.file = file;
+        const dropTitle = $('stitchDropTitle');
+        const dropSubtitle = $('stitchDropSubtitle');
+        if (dropTitle) dropTitle.innerHTML = `<i class="fa-solid fa-file-check text-success"></i> <strong>${escapeHtml(file.name)}</strong>`;
+        if (dropSubtitle) dropSubtitle.textContent = `Dung lượng: ${formatBytes(file.size)}`;
+        this.scheduleStitchPreview();
+    }
+
+    scheduleStitchPreview() {
+        clearTimeout(this._stitchTimer);
+        this._stitchTimer = setTimeout(() => this.updateStitchPreview(), 150);
+    }
+
+    async updateStitchPreview() {
+        const state = this.stitchState;
+        const imgEl = $('stitchPreviewImg');
+        const emptyEl = $('stitchStageEmpty');
+        const loadingEl = $('stitchLoadingGlass');
+        const btnExport = $('btnStitchExport');
+        const btnCopy = $('btnStitchCopy');
+        const btnImport = $('btnStitchImportProject');
+
+        if (state.source === 'upload' && !state.file) {
+            if (imgEl) imgEl.style.display = 'none';
+            if (emptyEl) emptyEl.style.display = 'block';
+            [btnExport, btnCopy, btnImport].forEach(b => b && (b.disabled = true));
+            return;
+        }
+
+        if (state.source === 'folder') {
+            const folder = this.getActiveFolder();
+            const ids = folder ? (folder.imageIds || []) : [];
+            const selectedInFolder = ids.filter(id => this.selectedPageIds.has(id));
+            const targetIds = selectedInFolder.length > 0 ? selectedInFolder : ids;
+            if (targetIds.length === 0) {
+                if (imgEl) imgEl.style.display = 'none';
+                if (emptyEl) emptyEl.style.display = 'block';
+                [btnExport, btnCopy, btnImport].forEach(b => b && (b.disabled = true));
+                return;
+            }
+        }
+
+        if (loadingEl) loadingEl.style.display = 'flex';
+
+        try {
+            let res;
+            if (state.source === 'upload') {
+                const fd = new FormData();
+                fd.append('file', state.file);
+                fd.append('layout', state.layout);
+                fd.append('cols', state.cols);
+                fd.append('spacing', state.spacing);
+                fd.append('bg_color', state.bgColor);
+                fd.append('draw_border', state.drawBorder ? 'true' : 'false');
+                fd.append('last_row_align', state.lastRowAlign);
+                fd.append('scale', state.scale);
+
+                res = await fetch('/api/stitch-preview-upload', { method: 'POST', body: fd });
+            } else {
+                const folder = this.getActiveFolder();
+                const ids = folder ? (folder.imageIds || []) : [];
+                const selectedInFolder = ids.filter(id => this.selectedPageIds.has(id));
+                const targetIds = selectedInFolder.length > 0 ? selectedInFolder : ids;
+                const filenames = targetIds.map(id => this.pages.get(id)?.filename).filter(Boolean);
+
+                res = await fetch('/api/stitch-preview-pages', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        relative_path: folder ? folder.relativePath : '',
+                        filenames,
+                        layout: state.layout,
+                        cols: state.cols,
+                        spacing: state.spacing,
+                        bg_color: state.bgColor,
+                        draw_border: state.drawBorder,
+                        last_row_align: state.lastRowAlign,
+                        scale: state.scale,
+                    }),
+                });
+            }
+
+            if (!res.ok) {
+                let detail = 'Không tạo được ảnh xem trước.';
+                try {
+                    const err = await res.json();
+                    if (err && err.detail) detail = err.detail;
+                } catch (_) {}
+                throw new Error(detail);
+            }
+
+            const blob = await res.blob();
+            if (this._stitchPreviewUrl) URL.revokeObjectURL(this._stitchPreviewUrl);
+            this._stitchPreviewUrl = URL.createObjectURL(blob);
+
+            if (imgEl) {
+                imgEl.src = this._stitchPreviewUrl;
+                imgEl.style.display = 'block';
+            }
+            if (emptyEl) emptyEl.style.display = 'none';
+
+            // Đọc thông số kết xuất từ headers
+            const outW = res.headers.get('X-Out-Width') || '--';
+            const outH = res.headers.get('X-Out-Height') || '--';
+            const totalPages = res.headers.get('X-Total-Pages') || '0';
+            const cols = res.headers.get('X-Cols') || state.cols;
+
+            const badgePages = $('stitchBadgePages');
+            const badgeLayout = $('stitchBadgeLayout');
+            const badgeDim = $('stitchBadgeDim');
+
+            if (badgePages) badgePages.innerHTML = `<i class="fa-regular fa-file-pdf text-accent"></i> ${totalPages} trang`;
+            if (badgeDim) badgeDim.textContent = `${outW} × ${outH} px`;
+
+            if (badgeLayout) {
+                if (state.layout === 'vertical') {
+                    badgeLayout.innerHTML = '<i class="fa-solid fa-arrows-up-down text-accent"></i> Dọc 1 cột';
+                } else if (state.layout === 'horizontal') {
+                    badgeLayout.innerHTML = '<i class="fa-solid fa-arrows-left-right text-accent"></i> Ngang 1 hàng';
+                } else {
+                    const numP = parseInt(totalPages, 10) || 0;
+                    const numC = parseInt(cols, 10) || 3;
+                    if (numP === 5 && numC === 3) {
+                        badgeLayout.innerHTML = '<i class="fa-solid fa-table-cells text-accent"></i> Lưới 3 cột (3 trên, 2 dưới)';
+                    } else {
+                        badgeLayout.innerHTML = `<i class="fa-solid fa-table-cells text-accent"></i> Lưới ${numC} cột`;
+                    }
+                }
+            }
+
+            [btnExport, btnCopy, btnImport].forEach(b => b && (b.disabled = false));
+        } catch (err) {
+            console.error('[stitch-preview]', err);
+            this.toastErr(err.message);
+            if (imgEl) imgEl.style.display = 'none';
+            if (emptyEl) emptyEl.style.display = 'block';
+            [btnExport, btnCopy, btnImport].forEach(b => b && (b.disabled = true));
+        } finally {
+            if (loadingEl) loadingEl.style.display = 'none';
+        }
+    }
+
+    async handleStitchExport(action = 'save') {
+        const state = this.stitchState;
+        const isUpload = state.source === 'upload';
+        const ext = (state.format || 'jpeg').toLowerCase() === 'png' ? 'png' : 'jpg';
+
+        let suggestedTitle = 'Ghep-PDF';
+        let relPath = '';
+
+        if (isUpload && state.file) {
+            const base = state.file.name.replace(/\.[^/.]+$/, "");
+            suggestedTitle = `${base}_ghep_${state.layout}`;
+        } else {
+            const folder = this.getActiveFolder();
+            relPath = folder ? folder.relativePath : '';
+            const fName = folder ? folder.name : 'Tai-Lieu';
+            suggestedTitle = `${fName}_ghep_${state.layout}`;
+        }
+
+        try {
+            if (action === 'save') {
+                const savePath = await this.askSavePath(suggestedTitle, ext, relPath);
+                if (!savePath) return; // Người dùng hủy
+
+                this.showLoading('Đang kết xuất và lưu ảnh ghép…');
+
+                if (isUpload) {
+                    const fd = new FormData();
+                    fd.append('file', state.file);
+                    fd.append('layout', state.layout);
+                    fd.append('cols', state.cols);
+                    fd.append('spacing', state.spacing);
+                    fd.append('bg_color', state.bgColor);
+                    fd.append('draw_border', state.drawBorder ? 'true' : 'false');
+                    fd.append('last_row_align', state.lastRowAlign);
+                    fd.append('scale', state.scale);
+                    fd.append('format', state.format);
+                    fd.append('doc_name', suggestedTitle);
+                    fd.append('save_path', savePath);
+
+                    const res = await fetch('/api/stitch-export-upload', { method: 'POST', body: fd });
+                    if (!res.ok) {
+                        const err = await res.json().catch(() => ({}));
+                        throw new Error(err.detail || 'Không lưu được ảnh ghép.');
+                    }
+                    const data = await res.json();
+                    this.toastOk(this.savedMessage(`ảnh ghép (${data.pages} trang)`, data));
+                } else {
+                    const folder = this.getActiveFolder();
+                    const ids = folder ? (folder.imageIds || []) : [];
+                    const selectedInFolder = ids.filter(id => this.selectedPageIds.has(id));
+                    const targetIds = selectedInFolder.length > 0 ? selectedInFolder : ids;
+                    const filenames = targetIds.map(id => this.pages.get(id)?.filename).filter(Boolean);
+
+                    const data = await apiJson('/api/stitch-export-pages', {
+                        relative_path: relPath,
+                        filenames,
+                        layout: state.layout,
+                        cols: state.cols,
+                        spacing: state.spacing,
+                        bg_color: state.bgColor,
+                        draw_border: state.drawBorder,
+                        last_row_align: state.lastRowAlign,
+                        scale: state.scale,
+                        format: state.format,
+                        doc_name: suggestedTitle,
+                        save_path: savePath,
+                    });
+                    this.toastOk(this.savedMessage(`ảnh ghép (${data.pages} trang)`, data));
+                }
+            } else if (action === 'copy') {
+                this.showLoading('Đang chuẩn bị ảnh để sao chép…');
+                let blob;
+                if (isUpload) {
+                    const fd = new FormData();
+                    fd.append('file', state.file);
+                    fd.append('layout', state.layout);
+                    fd.append('cols', state.cols);
+                    fd.append('spacing', state.spacing);
+                    fd.append('bg_color', state.bgColor);
+                    fd.append('draw_border', state.drawBorder ? 'true' : 'false');
+                    fd.append('last_row_align', state.lastRowAlign);
+                    fd.append('scale', state.scale);
+                    fd.append('format', 'png');
+
+                    const res = await fetch('/api/stitch-export-upload', { method: 'POST', body: fd });
+                    if (!res.ok) throw new Error('Không thể tạo dữ liệu ảnh để sao chép.');
+                    blob = await res.blob();
+                } else {
+                    const folder = this.getActiveFolder();
+                    const ids = folder ? (folder.imageIds || []) : [];
+                    const selectedInFolder = ids.filter(id => this.selectedPageIds.has(id));
+                    const targetIds = selectedInFolder.length > 0 ? selectedInFolder : ids;
+                    const filenames = targetIds.map(id => this.pages.get(id)?.filename).filter(Boolean);
+
+                    const res = await fetch('/api/stitch-export-pages', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            relative_path: relPath,
+                            filenames,
+                            layout: state.layout,
+                            cols: state.cols,
+                            spacing: state.spacing,
+                            bg_color: state.bgColor,
+                            draw_border: state.drawBorder,
+                            last_row_align: state.lastRowAlign,
+                            scale: state.scale,
+                            format: 'png',
+                        }),
+                    });
+                    if (!res.ok) throw new Error('Không thể tạo dữ liệu ảnh để sao chép.');
+                    blob = await res.blob();
+                }
+
+                if (!navigator.clipboard || !navigator.clipboard.write) {
+                    throw new Error('Trình duyệt không hỗ trợ sao chép ảnh vào Clipboard.');
+                }
+                const pngBlob = await this.blobToPngBlob(blob);
+                await navigator.clipboard.write([new ClipboardItem({ 'image/png': pngBlob })]);
+                this.toastOk('Đã sao chép ảnh ghép vào bộ nhớ tạm (Clipboard).');
+            } else if (action === 'import') {
+                this.showLoading('Đang thêm ảnh ghép vào thư mục dự án…');
+                const folder = this.getActiveFolder();
+                const curRel = folder ? folder.relativePath : '';
+
+                if (isUpload) {
+                    const fd = new FormData();
+                    fd.append('file', state.file);
+                    fd.append('layout', state.layout);
+                    fd.append('cols', state.cols);
+                    fd.append('spacing', state.spacing);
+                    fd.append('bg_color', state.bgColor);
+                    fd.append('draw_border', state.drawBorder ? 'true' : 'false');
+                    fd.append('last_row_align', state.lastRowAlign);
+                    fd.append('scale', state.scale);
+                    fd.append('import_to_project', 'true');
+                    fd.append('relative_path', curRel);
+                    fd.append('doc_name', suggestedTitle);
+
+                    const res = await fetch('/api/stitch-export-upload', { method: 'POST', body: fd });
+                    if (!res.ok) {
+                        const err = await res.json().catch(() => ({}));
+                        throw new Error(err.detail || 'Không thể thêm vào dự án.');
+                    }
+                } else {
+                    const ids = folder ? (folder.imageIds || []) : [];
+                    const selectedInFolder = ids.filter(id => this.selectedPageIds.has(id));
+                    const targetIds = selectedInFolder.length > 0 ? selectedInFolder : ids;
+                    const filenames = targetIds.map(id => this.pages.get(id)?.filename).filter(Boolean);
+
+                    await apiJson('/api/stitch-export-pages', {
+                        relative_path: curRel,
+                        filenames,
+                        layout: state.layout,
+                        cols: state.cols,
+                        spacing: state.spacing,
+                        bg_color: state.bgColor,
+                        draw_border: state.drawBorder,
+                        last_row_align: state.lastRowAlign,
+                        scale: state.scale,
+                        import_to_project: true,
+                        doc_name: suggestedTitle,
+                    });
+                }
+
+                this.closeStitchModal();
+                this.toastOk('Đã thêm ảnh ghép vào thư mục dự án.');
+                await this.loadProject(this.rootPath, false);
+            }
+        } catch (err) {
+            console.error('[stitch-export]', err);
+            this.toastErr(err.message || 'Thao tác không thành công.');
+        } finally {
+            this.hideLoading();
+        }
     }
 }
 
