@@ -368,6 +368,41 @@ def test_xuat_anh_zip_va_xuat_pdf_theo_danh_sach_chon():
         p.close()
 
 
+def test_import_pdf_quy_doi_ve_anh():
+    """Tệp PDF (scan, export từ word hay in) quy đổi trọn vẹn thành ảnh trong bộ ba."""
+    p = Project()
+    try:
+        doc = fitz.open()
+        p1 = doc.new_page(width=300, height=400)
+        p1.draw_rect([10, 10, 80, 80], color=(1, 0, 0))
+        p2 = doc.new_page(width=300, height=400)
+        p2.draw_rect([20, 20, 90, 90], color=(0, 1, 0))
+        pdf_bytes = doc.tobytes()
+
+        res = p.client.post(
+            "/api/import",
+            files={"file": ("Tài Liệu Hợp Đồng.pdf", pdf_bytes, "application/pdf")},
+            data={"relative_path": ""},
+        )
+        assert res.status_code == 200, res.text
+        data = res.json()
+        assert isinstance(data, list) and len(data) == 2, "PDF 2 trang phải sinh 2 trang ảnh"
+
+        for page in data:
+            fname = page["filename"]
+            assert fname.endswith(".jpg")
+            assert os.path.exists(p.path("", fname)), f"thiếu ảnh {fname}"
+            assert os.path.exists(p.goc_path("", fname)), f"thiếu ảnh gốc cho {fname}"
+            assert page["has_raw_original"] is True
+            assert len(page["corners"]) == 4
+
+        # Quét lại phải đủ 2 trang
+        scanned = p.scan("")
+        assert len(scanned) == 2
+    finally:
+        p.close()
+
+
 if __name__ == "__main__":
     cases = [(n, f) for n, f in sorted(globals().items())
              if n.startswith("test_") and callable(f)]

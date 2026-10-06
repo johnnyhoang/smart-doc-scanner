@@ -159,10 +159,10 @@
                     </div>
 
                     <div class="sidebar-footer">
-                        <input type="file" id="fileInput" accept="image/*" multiple hidden>
+                        <input type="file" id="fileInput" accept="image/*,application/pdf,.pdf" multiple hidden>
                         <label class="add-page-box" for="fileInput">
                             <i class="fa-solid fa-cloud-arrow-up"></i>
-                            <span>Thêm ảnh (hoặc Ctrl+V dán)</span>
+                            <span>Thêm ảnh / PDF (hoặc Ctrl+V dán)</span>
                         </label>
                     </div>
                 </div>
@@ -181,13 +181,14 @@
                         <div class="drop-illustration">
                             <i class="fa-solid fa-file-arrow-up"></i>
                         </div>
-                        <h2>Kéo & thả ảnh tài liệu vào đây</h2>
-                        <p>Hỗ trợ ảnh chụp điện thoại, tài liệu nghiêng, cong, nhăn, bóng đổ (JPG, PNG, WEBP, HEIC)</p>
+                        <h2>Kéo & thả ảnh hoặc file PDF vào đây</h2>
+                        <p>Hỗ trợ tài liệu ảnh (JPG, PNG, WEBP) và file PDF (PDF scan, PDF xuất từ Word/In ấn quy đổi thành ảnh xử lý)</p>
                         <label class="btn btn-primary btn-lg upload-hero">
-                            <i class="fa-solid fa-folder-open"></i> Chọn ảnh từ máy tính
-                            <input type="file" id="heroFileInput" accept="image/*" multiple hidden>
+                            <i class="fa-solid fa-folder-open"></i> Chọn ảnh hoặc PDF từ máy tính
+                            <input type="file" id="heroFileInput" accept="image/*,application/pdf,.pdf" multiple hidden>
                         </label>
                         <div class="features-badge-row">
+                            <span class="badge"><i class="fa-solid fa-file-pdf text-accent"></i> Đọc mọi file PDF quy về ảnh sắc nét</span>
                             <span class="badge"><i class="fa-solid fa-paste text-accent"></i> Dán ảnh trực tiếp từ Clipboard (Ctrl + V)</span>
                             <span class="badge"><i class="fa-solid fa-hard-drive text-success"></i> Tự động lưu ảnh gốc & ảnh sửa vào thư mục máy</span>
                             <span class="badge"><i class="fa-solid fa-wand-magic-sparkles"></i> Gợi ý tên AI thông minh</span>

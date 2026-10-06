@@ -1027,7 +1027,7 @@ class DocScanApp {
 
         const folder = this.getActiveFolder();
         const relPath = folder ? folder.relativePath : '';
-        this.showLoading(`Đang thêm ${files.length} ảnh vào "${folder ? folder.name : ''}"…`);
+        this.showLoading(`Đang xử lý ${files.length} tệp (ảnh / PDF) vào "${folder ? folder.name : ''}"…`);
 
         let firstId = null;
         let added = 0;
@@ -1040,14 +1040,17 @@ class DocScanApp {
                 const res = await fetch('/api/import', { method: 'POST', body: form });
                 if (!res.ok) {
                     const err = await res.json().catch(() => ({}));
-                    throw new Error(err.detail || `Không thêm được ảnh "${file.name}".`);
+                    throw new Error(err.detail || `Không thêm được tệp "${file.name}".`);
                 }
                 const raw = await res.json();
-                const page = this.toPage(raw);
-                this.pages.set(page.id, page);
-                if (folder && !folder.imageIds.includes(page.id)) folder.imageIds.push(page.id);
-                if (!firstId) firstId = page.id;
-                added++;
+                const rawList = Array.isArray(raw) ? raw : [raw];
+                for (const item of rawList) {
+                    const page = this.toPage(item);
+                    this.pages.set(page.id, page);
+                    if (folder && !folder.imageIds.includes(page.id)) folder.imageIds.push(page.id);
+                    if (!firstId) firstId = page.id;
+                    added++;
+                }
             }
 
             this.renderFolderTree();
@@ -1055,7 +1058,7 @@ class DocScanApp {
             this.renderPageList();
             if (firstId) await this.selectPage(firstId);
             this.updateFolderActionButtons();
-            this.toastOk(`Đã thêm ${added} ảnh và lưu ngay ảnh gốc, ảnh đã sửa & metadata vào máy.`);
+            this.toastOk(`Đã thêm ${added} trang tài liệu và quy đổi lưu ảnh gốc, ảnh đã sửa & metadata vào máy.`);
         } catch (err) {
             this.toastErr(err.message);
         } finally {

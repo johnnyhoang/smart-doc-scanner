@@ -533,37 +533,69 @@ def get_image(
 # ==========================================================
 # NHẬP ẢNH — GHI NGAY ĐỦ BỘ BA XUỐNG ĐĨA
 # ==========================================================
+# NHẬP ẢNH & PDF — GHI NGAY ĐỦ BỘ BA XUỐNG ĐĨA
+# ==========================================================
 
-@app.post("/api/import")
-async def import_image(
-    file: UploadFile = File(...),
-    relative_path: str = Form(""),
-    root_path: Optional[str] = Form(None),
-):
+def _convert_pdf_to_images(contents: bytes) -> List[np.ndarray]:
     """
-    Nhập một ảnh vào thư mục đang mở và lưu ngay:
-        _goc/<stem>_goc.jpg  +  <stem>.jpg  +  .docscan_meta.json
-    Nhờ vậy dữ liệu an toàn kể cả khi tắt ứng dụng đột ngột.
+    Quy đổi toàn bộ các trang của tệp PDF (scan, export từ Word, in ảo, v.v.)
+    thành danh sách ảnh numpy BGR chuẩn để xử lý như ảnh thông thường.
+    Độ phân giải dựng (rasterize) đạt chuẩn in ấn sắc nét (300 DPI, tối đa 2600px/chiều).
     """
-    root = active_root(root_path)
-    rel = ps.normalize_rel(relative_path)
-
-    contents = await file.read()
-    if len(contents) > MAX_UPLOAD_BYTES:
+    try:
+        import fitz
+    except ImportError:
         raise HTTPException(
-            status_code=413,
-            detail=f"Ảnh quá lớn ({ps.format_file_size(len(contents))}). "
-                   f"Giới hạn là {ps.format_file_size(MAX_UPLOAD_BYTES)} cho mỗi tệp.",
+            status_code=500,
+            detail="Máy chủ chưa cài đặt thư viện đọc PDF (PyMuPDF).",
         )
 
-    # Phần còn lại nặng CPU -> đẩy sang luồng riêng để không đóng băng các yêu cầu khác.
-    return await run_in_threadpool(_import_decoded, root, rel, file.filename, contents)
+    try:
+        doc = fitz.open(stream=contents, filetype="pdf")
+    except Exception as e:
+        print(f"[pdf-decode] {e}")
+        raise HTTPException(status_code=400, detail="Tệp PDF bị hỏng hoặc không đúng định dạng.")
+
+    if len(doc) == 0:
+        raise HTTPException(status_code=400, detail="Tệp PDF rỗng, không có trang nào.")
+
+    images: List[np.ndarray] = []
+    for page_idx in range(len(doc)):
+        page = doc[page_idx]
+        rect = page.rect
+        w_pt, h_pt = float(rect.width), float(rect.height)
+        if w_pt <= 0 or h_pt <= 0:
+            continue
+
+        # Đặt DPI sắc nét: chuẩn 300 DPI (hệ số 300/72 ~ 4.167), giới hạn cạnh dài 2600px
+        # để đảm bảo chi tiết cực nét mà không tràn RAM.
+        max_dim_target = 2600.0
+        scale = min(300.0 / 72.0, max_dim_target / max(w_pt, h_pt))
+        scale = max(scale, 150.0 / 72.0)  # Tối thiểu 150 DPI cho văn bản nhỏ
+
+        matrix = fitz.Matrix(scale, scale)
+        pix = page.get_pixmap(matrix=matrix, alpha=False)
+        samples = np.frombuffer(pix.samples, dtype=np.uint8)
+        img = samples.reshape((pix.height, pix.width, pix.n))
+
+        if pix.n == 3:
+            bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+        elif pix.n == 1:
+            bgr = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+        elif pix.n == 4:
+            bgr = cv2.cvtColor(img, cv2.COLOR_RGBA2BGR)
+        else:
+            bgr = cv2.cvtColor(img[:, :, :3], cv2.COLOR_RGB2BGR)
+
+        images.append(bgr)
+
+    if not images:
+        raise HTTPException(status_code=400, detail="Không thể trích xuất trang nào từ tệp PDF.")
+
+    return images
 
 
-def _import_decoded(root: str, rel: str, source_name: Optional[str], contents: bytes) -> Dict[str, Any]:
-    img = cv2.imdecode(np.frombuffer(contents, np.uint8), cv2.IMREAD_COLOR)
-    if img is None:
-        raise HTTPException(status_code=400, detail="Tệp không phải là ảnh hợp lệ hoặc đã hỏng.")
+def _save_imported_image(root: str, rel: str, img: np.ndarray, source_name: Optional[str]) -> Dict[str, Any]:
     if img.shape[0] * img.shape[1] > MAX_UPLOAD_PIXELS:
         raise HTTPException(
             status_code=413,
@@ -600,6 +632,59 @@ def _import_decoded(root: str, rel: str, source_name: Optional[str], contents: b
     payload = page_payload(root, rel, filename)
     payload["name_suggestions"] = name_suggestions
     return payload
+
+
+@app.post("/api/import")
+async def import_image(
+    file: UploadFile = File(...),
+    relative_path: str = Form(""),
+    root_path: Optional[str] = Form(None),
+):
+    """
+    Nhập một ảnh hoặc tệp PDF vào thư mục đang mở và lưu ngay:
+        _goc/<stem>_goc.jpg  +  <stem>.jpg  +  .docscan_meta.json
+    Tất cả các tệp (kể cả PDF scan hay PDF từ Word/In) đều được quy về ảnh.
+    Nhờ vậy dữ liệu an toàn kể cả khi tắt ứng dụng đột ngột.
+    """
+    root = active_root(root_path)
+    rel = ps.normalize_rel(relative_path)
+
+    contents = await file.read()
+    if len(contents) > MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Tệp quá lớn ({ps.format_file_size(len(contents))}). "
+                   f"Giới hạn là {ps.format_file_size(MAX_UPLOAD_BYTES)} cho mỗi tệp.",
+        )
+
+    # Phần còn lại nặng CPU -> đẩy sang luồng riêng để không đóng băng các yêu cầu khác.
+    return await run_in_threadpool(_import_decoded, root, rel, file.filename, contents)
+
+
+def _import_decoded(root: str, rel: str, source_name: Optional[str], contents: bytes) -> Any:
+    # 1. Nhận diện tệp PDF theo đuôi hoặc magic bytes (%PDF)
+    is_pdf = False
+    if source_name and source_name.lower().endswith(".pdf"):
+        is_pdf = True
+    elif contents.startswith(b"%PDF-"):
+        is_pdf = True
+
+    if is_pdf:
+        images = _convert_pdf_to_images(contents)
+        base_stem = ps.stem_of(source_name or "Tai_Lieu")
+        results = []
+        for idx, img in enumerate(images, start=1):
+            page_name = f"{base_stem}_trang_{idx}" if len(images) > 1 else base_stem
+            payload = _save_imported_image(root, rel, img, page_name)
+            results.append(payload)
+        return results if len(results) > 1 else results[0]
+
+    # 2. Xử lý ảnh tiêu chuẩn (JPG, PNG, WEBP, BMP...)
+    img = cv2.imdecode(np.frombuffer(contents, np.uint8), cv2.IMREAD_COLOR)
+    if img is None:
+        raise HTTPException(status_code=400, detail="Tệp không phải là ảnh hoặc PDF hợp lệ hoặc đã hỏng.")
+
+    return _save_imported_image(root, rel, img, source_name)
 
 
 # ==========================================================
