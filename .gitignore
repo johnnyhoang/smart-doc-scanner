@@ -13,10 +13,13 @@ ENV/
 # OS
 .DS_Store
 Thumbs.db
+*.app
 
 # App outputs & runtime files
 _goc/
 .docscan_meta.json
+.docscan_config.json
+test_input.jpg
 output_*.jpg
 output_*.png
 output_*.pdf

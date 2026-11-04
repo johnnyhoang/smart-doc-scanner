@@ -18,6 +18,8 @@ import errno
 import json
 import math
 import os
+import subprocess
+import sys
 import threading
 from collections import OrderedDict
 from typing import List, Optional, Dict, Any
@@ -555,7 +557,12 @@ def open_folder(req: OpenFolderRequest):
         raise HTTPException(status_code=400, detail=str(e))
     if not os.path.isdir(target):
         raise HTTPException(status_code=404, detail="Thư mục không tồn tại trên máy.")
-    os.startfile(target)
+    if sys.platform == "win32":
+        os.startfile(target)
+    elif sys.platform == "darwin":
+        subprocess.run(["open", target])
+    else:
+        subprocess.run(["xdg-open", target])
     return {"success": True}
 
 
