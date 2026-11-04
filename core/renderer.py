@@ -284,6 +284,111 @@ def bake_annotations(img: np.ndarray, annotations: Optional[list]) -> np.ndarray
     return cv2.cvtColor(np.array(final_pil), cv2.COLOR_RGB2BGR)
 
 
+def apply_page_format(
+    image: np.ndarray,
+    preset: str = "original",
+    orientation: str = "auto",
+    fit_mode: str = "fill",
+    margin_pct: float = 0.0,
+    stretch_x: float = 1.0,
+    stretch_y: float = 1.0,
+    bg_color: Tuple[int, int, int] = (255, 255, 255),
+) -> np.ndarray:
+    """
+    Chuẩn hóa ảnh tài liệu theo các khổ giấy và tỉ lệ chuẩn:
+      - Văn bản: A4, A5, A3, Letter
+      - Giấy tờ: Passport đơn, Passport 2 trang mở, CCCD/ID Card
+      - Tỉ lệ: 2:3, 16:9, 4:3, 1:1
+    Resize/co giãn trực tiếp trên ảnh hiện tại để vừa khít 100% tỉ lệ chuẩn, không phủ lề.
+    """
+    if image is None or image.size == 0:
+        return image
+
+    h, w = image.shape[:2]
+    if h <= 0 or w <= 0:
+        return image
+
+    PRESET_RATIOS = {
+        "a4": 1.41421356,
+        "a5": 1.4189,
+        "a3": 1.41421356,
+        "letter": 11.0 / 8.5,
+        "passport": 45.0 / 35.0,
+        "passport_single": 45.0 / 35.0,
+        "passport_4x6": 6.0 / 4.0,
+        "passport_spread": 176.0 / 125.0,
+        "id_card": 85.6 / 54.0,
+        "ratio_2_3": 3.0 / 2.0,
+        "ratio_16_9": 16.0 / 9.0,
+        "ratio_4_3": 4.0 / 3.0,
+        "ratio_1_1": 1.0,
+    }
+
+    if preset and preset != "original":
+        base_r = PRESET_RATIOS.get(preset, 1.41421356)
+
+        if orientation == "auto":
+            is_landscape = (w >= h)
+        elif orientation == "landscape":
+            is_landscape = True
+        else:
+            is_landscape = False
+
+        # Tính toán tỉ lệ mục tiêu W / H
+        if preset in ("passport_spread", "id_card", "ratio_16_9", "ratio_4_3"):
+            target_r = base_r if is_landscape else (1.0 / base_r)
+        elif preset in ("ratio_1_1",):
+            target_r = 1.0
+        else:
+            target_r = (1.0 / base_r) if not is_landscape else base_r
+
+        cur_r = w / float(h)
+
+        if fit_mode == "crop":
+            # Cắt xén phủ kín: Giữ nguyên tỉ lệ điểm ảnh, cắt bớt mép ngoài để vừa khít
+            if cur_r < target_r:
+                crop_h = max(1, int(round(w / target_r)))
+                y1 = max(0, (h - crop_h) // 2)
+                image = image[y1:y1 + crop_h, :]
+            else:
+                crop_w = max(1, int(round(h * target_r)))
+                x1 = max(0, (w - crop_w) // 2)
+                image = image[:, x1:x1 + crop_w]
+        else:
+            # fit_mode in ("fill", "stretch", "fit"):
+            # Resize / Co giãn trực tiếp ảnh hiện tại để đạt 100% tỉ lệ chuẩn (KHÔNG phủ lề)
+            if cur_r < target_r:
+                new_w = max(1, int(round(h * target_r)))
+                new_h = h
+            else:
+                new_w = w
+                new_h = max(1, int(round(w / target_r)))
+            image = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
+
+    # Co giãn tinh chỉnh theo chiều ngang/dọc (stretch_x / stretch_y)
+    sx = float(stretch_x) if stretch_x is not None else 1.0
+    sy = float(stretch_y) if stretch_y is not None else 1.0
+    if abs(sx - 1.0) > 0.005 or abs(sy - 1.0) > 0.005:
+        cur_h, cur_w = image.shape[:2]
+        new_w = max(10, int(round(cur_w * sx)))
+        new_h = max(10, int(round(cur_h * sy)))
+        if new_w != cur_w or new_h != cur_h:
+            image = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
+
+    # Nếu người dùng cố ý đặt lề viền phụ > 0%
+    margin = float(margin_pct or 0.0)
+    if margin > 0.005:
+        margin = min(0.25, margin)
+        cur_h, cur_w = image.shape[:2]
+        pad_x = int(round(cur_w * margin))
+        pad_y = int(round(cur_h * margin))
+        image = cv2.copyMakeBorder(image, pad_y, pad_y, pad_x, pad_x, cv2.BORDER_CONSTANT, value=bg_color)
+
+    return image
+
+
+
+
 def render_page(
     original: np.ndarray,
     corners: Optional[list],
@@ -303,8 +408,12 @@ def render_page(
     if max_dim:
         work, scale = scale_to_max(original, max_dim)
 
-    if corners and len(corners) == 4:
+    if corners and len(corners) in (4, 6):
         pts = np.array(corners, dtype=np.float32) * scale
+        margin_pct = float(settings.get("margin_percent", 0.0))
+        if margin_pct > 0.001:
+            from core.detector import expand_quad
+            pts = expand_quad(pts, work.shape[:2], margin_pct)
     else:
         pts, _ = detect_document_corners(
             work, margin_percent=float(settings.get("margin_percent", 0.02))
@@ -319,6 +428,23 @@ def render_page(
     if settings.get("dewarp_enabled") and float(settings.get("dewarp_strength", 0.8)) > 0.05:
         warped, _, _ = ai_auto_unwrinkle(warped, strength=float(settings["dewarp_strength"]))
 
+    # Bước 2: Khổ ảnh & Cỡ giấy chuẩn (A4, Passport, CCCD, 2:3, 16:9...)
+    page_preset = settings.get("page_size_preset", "original")
+    scale_x = float(settings.get("page_scale_x", 1.0))
+    scale_y = float(settings.get("page_scale_y", 1.0))
+    margin_pct = float(settings.get("page_margin_pct", 0.0))
+
+    if (page_preset and page_preset != "original") or abs(scale_x - 1.0) > 0.005 or abs(scale_y - 1.0) > 0.005 or margin_pct > 0.005:
+        warped = apply_page_format(
+            warped,
+            preset=page_preset or "original",
+            orientation=settings.get("page_orientation", "auto"),
+            fit_mode=settings.get("page_fit_mode", "fill"),
+            margin_pct=margin_pct,
+            stretch_x=scale_x,
+            stretch_y=scale_y,
+        )
+
     enhanced = enhance_document(
         warped,
         mode=settings.get("mode", "natural"),
@@ -326,6 +452,7 @@ def render_page(
         sharpness=float(settings.get("sharpness", 0.6)),
         contrast=float(settings.get("contrast", 0.2)),
         brightness=float(settings.get("brightness", 0.0)),
+        filter_intensity=float(settings.get("filter_intensity", 1.0)),
     )
 
     if annotations:

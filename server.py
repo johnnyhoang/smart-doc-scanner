@@ -15,6 +15,7 @@ MÔ HÌNH TRUNG TÂM
 """
 
 import errno
+import json
 import math
 import os
 import threading
@@ -53,7 +54,36 @@ app = FastAPI(title="DocScan Studio API", version="3.0.0")
 # PHIÊN LÀM VIỆC & BỘ NHỚ ĐỆM ĐIỂM ẢNH
 # ==========================================================
 
-SESSION: Dict[str, Optional[str]] = {"root": None}
+CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".docscan_config.json")
+
+
+def load_saved_root() -> str:
+    try:
+        if os.path.exists(CONFIG_FILE):
+            with open(CONFIG_FILE, "r", encoding="utf-8") as fp:
+                data = json.load(fp)
+                path = data.get("last_root")
+                if path and os.path.isdir(path):
+                    return os.path.abspath(path)
+    except Exception:
+        pass
+    default_dir = os.path.join(os.path.expanduser("~"), "Documents", "DocScan_Projects")
+    try:
+        os.makedirs(default_dir, exist_ok=True)
+    except Exception:
+        pass
+    return os.path.abspath(default_dir)
+
+
+def save_active_root(root: str):
+    try:
+        with open(CONFIG_FILE, "w", encoding="utf-8") as fp:
+            json.dump({"last_root": os.path.abspath(root)}, fp, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[config-save] {e}")
+
+
+SESSION: Dict[str, Optional[str]] = {"root": load_saved_root()}
 
 # Chặn ảnh quá khổ làm cạn RAM máy người dùng.
 MAX_UPLOAD_BYTES = 80 * 1024 * 1024     # 80 MB cho một tệp ảnh
@@ -296,6 +326,7 @@ class DownloadSingleRequest(BaseModel):
     filename: str
     format: str = "jpeg"
     doc_name: Optional[str] = None
+    quality: Optional[int] = None
     save_path: Optional[str] = None
     root_path: Optional[str] = None
 
@@ -485,6 +516,7 @@ def scan_directory(req: ScanDirectoryRequest):
             raise HTTPException(status_code=400, detail="Không thể tạo hoặc truy cập thư mục này trên máy tính.")
 
     SESSION["root"] = root
+    save_active_root(root)
     ORIGINALS.clear()
 
     try:
@@ -501,6 +533,16 @@ def scan_directory(req: ScanDirectoryRequest):
         "pages": pages,
         "total_folders": len(folders),
         "total_images": len(pages),
+    }
+
+
+@app.get("/api/session")
+def get_session():
+    """Lấy đường dẫn thư mục dự án đang mở để giao diện khôi phục tức thì khi tải lại trang."""
+    root = active_root()
+    return {
+        "root_path": root,
+        "root_name": os.path.basename(root) or root,
     }
 
 
@@ -577,11 +619,11 @@ def get_image(
 # NHẬP ẢNH & PDF — GHI NGAY ĐỦ BỘ BA XUỐNG ĐĨA
 # ==========================================================
 
-def _convert_pdf_to_images(contents: bytes) -> List[np.ndarray]:
+def _convert_pdf_to_images(contents: bytes, dpi: float = 150.0) -> List[np.ndarray]:
     """
     Quy đổi toàn bộ các trang của tệp PDF (scan, export từ Word, in ảo, v.v.)
     thành danh sách ảnh numpy BGR chuẩn để xử lý như ảnh thông thường.
-    Độ phân giải dựng (rasterize) đạt chuẩn in ấn sắc nét (300 DPI, tối đa 2600px/chiều).
+    Độ phân giải dựng (rasterize) đạt chuẩn 150 DPI tối ưu (cạnh dài tối đa 1800px).
     """
     try:
         import fitz
@@ -608,11 +650,11 @@ def _convert_pdf_to_images(contents: bytes) -> List[np.ndarray]:
         if w_pt <= 0 or h_pt <= 0:
             continue
 
-        # Đặt DPI sắc nét: chuẩn 300 DPI (hệ số 300/72 ~ 4.167), giới hạn cạnh dài 2600px
-        # để đảm bảo chi tiết cực nét mà không tràn RAM.
-        max_dim_target = 2600.0
-        scale = min(300.0 / 72.0, max_dim_target / max(w_pt, h_pt))
-        scale = max(scale, 150.0 / 72.0)  # Tối thiểu 150 DPI cho văn bản nhỏ
+        # Đặt chuẩn 150 DPI (hệ số 150/72 ~ 2.083), giới hạn cạnh dài 1800px
+        # đảm bảo tài liệu nhẹ mượt, xử lý nhanh mà văn bản vẫn rõ ràng.
+        max_dim_target = 1800.0
+        scale = min(dpi / 72.0, max_dim_target / max(w_pt, h_pt))
+        scale = max(scale, 100.0 / 72.0)
 
         matrix = fitz.Matrix(scale, scale)
         pix = page.get_pixmap(matrix=matrix, alpha=False)
@@ -636,7 +678,13 @@ def _convert_pdf_to_images(contents: bytes) -> List[np.ndarray]:
     return images
 
 
-def _save_imported_image(root: str, rel: str, img: np.ndarray, source_name: Optional[str]) -> Dict[str, Any]:
+def _save_imported_image(
+    root: str,
+    rel: str,
+    img: np.ndarray,
+    source_name: Optional[str],
+    overwrite: bool = False,
+) -> Dict[str, Any]:
     if img.shape[0] * img.shape[1] > MAX_UPLOAD_PIXELS:
         raise HTTPException(
             status_code=413,
@@ -648,7 +696,10 @@ def _save_imported_image(root: str, rel: str, img: np.ndarray, source_name: Opti
         filename=source_name, page_index=len(ps.list_page_files(ps.folder_dir(root, rel))) + 1
     )
     source_stem = ps.stem_of(source_name or "") or base_name
-    stem = ps.unique_stem(root, rel, source_stem)
+    if overwrite:
+        stem = ps.sanitize_component(source_stem) or "Tai-Lieu"
+    else:
+        stem = ps.unique_stem(root, rel, source_stem)
     filename = ps.edited_filename(stem)
 
     ps.write_original(root, rel, filename, img)
@@ -680,6 +731,7 @@ async def import_image(
     file: UploadFile = File(...),
     relative_path: str = Form(""),
     root_path: Optional[str] = Form(None),
+    overwrite: bool = Form(False),
 ):
     """
     Nhập một ảnh hoặc tệp PDF vào thư mục đang mở và lưu ngay:
@@ -699,10 +751,10 @@ async def import_image(
         )
 
     # Phần còn lại nặng CPU -> đẩy sang luồng riêng để không đóng băng các yêu cầu khác.
-    return await run_in_threadpool(_import_decoded, root, rel, file.filename, contents)
+    return await run_in_threadpool(_import_decoded, root, rel, file.filename, contents, overwrite)
 
 
-def _import_decoded(root: str, rel: str, source_name: Optional[str], contents: bytes) -> Any:
+def _import_decoded(root: str, rel: str, source_name: Optional[str], contents: bytes, overwrite: bool = False) -> Any:
     # 1. Nhận diện tệp PDF theo đuôi hoặc magic bytes (%PDF)
     is_pdf = False
     if source_name and source_name.lower().endswith(".pdf"):
@@ -716,7 +768,7 @@ def _import_decoded(root: str, rel: str, source_name: Optional[str], contents: b
         results = []
         for idx, img in enumerate(images, start=1):
             page_name = f"{base_stem}_trang_{idx}" if len(images) > 1 else base_stem
-            payload = _save_imported_image(root, rel, img, page_name)
+            payload = _save_imported_image(root, rel, img, page_name, overwrite=overwrite)
             results.append(payload)
         return results if len(results) > 1 else results[0]
 
@@ -725,7 +777,7 @@ def _import_decoded(root: str, rel: str, source_name: Optional[str], contents: b
     if img is None:
         raise HTTPException(status_code=400, detail="Tệp không phải là ảnh hoặc PDF hợp lệ hoặc đã hỏng.")
 
-    return _save_imported_image(root, rel, img, source_name)
+    return _save_imported_image(root, rel, img, source_name, overwrite=overwrite)
 
 
 # ==========================================================
@@ -750,13 +802,27 @@ def process_preview(req: ProcessRequest):
 
     original = load_original(root, rel, req.filename)
     preview = rd.render_page(original, req.corners, req.rotation, settings, max_dim=rd.PREVIEW_MAX_DIM, annotations=annotations)
-    data = rd.encode_preview(preview, quality=88)
+    quality = int(settings.get("quality", 85))
+    data = rd.encode_preview(preview, quality=quality)
 
-    # Ước tính kích thước bản kết xuất đầy đủ theo tỉ lệ thu nhỏ đã áp dụng.
+    # Ước tính kích thước bản kết xuất đầy đủ theo tỉ lệ thu nhỏ đã áp dụng và chuẩn hóa DPI.
     oh, ow = original.shape[:2]
     ph, pw = preview.shape[:2]
     scale_back = max(1.0, max(oh, ow) / float(rd.PREVIEW_MAX_DIM))
-    est_w, est_h = int(pw * scale_back), int(ph * scale_back)
+    raw_w, raw_h = int(round(pw * scale_back)), int(round(ph * scale_back))
+
+    normalize_res = bool(settings.get("normalize_res", True))
+    if normalize_res and max(raw_w, raw_h) > 1800:
+        scale_print = 1800.0 / float(max(raw_w, raw_h))
+        est_w = int(round(raw_w * scale_print))
+        est_h = int(round(raw_h * scale_print))
+    else:
+        est_w = raw_w
+        est_h = raw_h
+
+    pixel_ratio = (float(est_w) * float(est_h)) / float(max(1, pw * ph))
+    # Sử dụng hàm mũ 0.72 phù hợp với đặc tính nén JPEG của văn bản/scan để sai số ước tính < 3%
+    est_bytes = int(round(len(data) * (pixel_ratio ** 0.72)))
 
     return Response(
         content=data,
@@ -765,6 +831,7 @@ def process_preview(req: ProcessRequest):
             "Cache-Control": "no-store",
             "X-Out-Width": str(est_w),
             "X-Out-Height": str(est_h),
+            "X-Out-Size": str(est_bytes),
             "X-Preview-Width": str(pw),
             "X-Preview-Height": str(ph),
         },
@@ -873,14 +940,16 @@ def _friendly_write_error(exc: Exception) -> str:
 
 def _save_one_folder(root: str, rel: str, req: SaveFolderRequest) -> Dict[str, Any]:
     saved: List[str] = []
+    saved_details: Dict[str, Any] = {}
     failed: List[Dict[str, str]] = []
 
     for state in req.pages:
         try:
             # Không giữ lại ảnh đã kết xuất: lưu một thư mục lớn sẽ ngốn hết bộ nhớ.
             # Tệp PDF bên dưới đọc lại từ đĩa theo từng trang.
-            commit_page(root, rel, state)
+            res = commit_page(root, rel, state)
             saved.append(state.filename)
+            saved_details[state.filename] = res
         except HTTPException:
             raise
         except Exception as e:
@@ -915,6 +984,7 @@ def _save_one_folder(root: str, rel: str, req: SaveFolderRequest) -> Dict[str, A
         "relative_path": rel,
         "saved_pages": len(saved),
         "saved_filenames": saved,
+        "saved_details": saved_details,
         "failed_pages": failed,
         "pdf_saved": pdf_saved,
         "target_dir": ps.folder_dir(root, rel),
@@ -930,6 +1000,7 @@ def save_project(req: SaveProjectRequest):
     pdfs = 0
 
     saved_filenames: List[str] = []
+    saved_details: Dict[str, Any] = {}
     failed_pages: List[Dict[str, str]] = []
 
     for folder_req in req.folders:
@@ -938,6 +1009,7 @@ def save_project(req: SaveProjectRequest):
         rel = ps.normalize_rel(folder_req.relative_path)
         outcome = _save_one_folder(root, rel, folder_req)
         saved_filenames.extend(outcome["saved_filenames"])
+        saved_details.update(outcome.get("saved_details", {}))
         failed_pages.extend(outcome["failed_pages"])
         if outcome["saved_pages"]:
             folders_saved += 1
@@ -953,6 +1025,7 @@ def save_project(req: SaveProjectRequest):
         "pages_saved": pages_saved,
         "pdfs_saved": pdfs,
         "saved_filenames": saved_filenames,
+        "saved_details": saved_details,
         "failed_pages": failed_pages,
     }
 
@@ -1326,14 +1399,28 @@ def download_single(req: DownloadSingleRequest):
     if not os.path.exists(path):
         raise HTTPException(status_code=404, detail="Trang này chưa được lưu trên máy.")
 
-    img = imread_unicode(path)
-    if img is None:
-        raise HTTPException(status_code=400, detail="Không đọc được tệp ảnh.")
+    stored = ps.get_page_meta(root, rel, req.filename) or {}
+    page_settings = stored.get("settings") or {}
+
+    quality = req.quality if req.quality is not None else int(page_settings.get("quality", 85))
+    normalize_res = bool(page_settings.get("normalize_res", True))
 
     fmt = (req.format or "jpeg").lower()
-    from core.compressor import compress_image_to_bytes
-    data, _size, _dim = compress_image_to_bytes(img, format=fmt, quality=92, normalize_res=False)
     ext = "jpg" if fmt in ("jpg", "jpeg") else fmt
+
+    # Nếu xuất file JPG và chất lượng trùng với bản đã commit trên đĩa,
+    # đọc trực tiếp tệp để bảo đảm dung lượng chính xác từng byte khớp với thông số xem trước.
+    saved_quality = int(page_settings.get("quality", 85))
+    if ext == "jpg" and (req.quality is None or req.quality == saved_quality):
+        with open(path, "rb") as fp:
+            data = fp.read()
+    else:
+        img = imread_unicode(path)
+        if img is None:
+            raise HTTPException(status_code=400, detail="Không đọc được tệp ảnh.")
+        from core.compressor import compress_image_to_bytes
+        data, _size, _dim = compress_image_to_bytes(img, format=fmt, quality=quality, normalize_res=normalize_res)
+
     title = ps.sanitize_component(req.doc_name or ps.stem_of(req.filename))
 
     target = _checked_save_path(req.save_path)

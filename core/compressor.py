@@ -8,13 +8,13 @@ from typing import List, Tuple
 
 def normalize_resolution_for_print(
     image: np.ndarray,
-    target_long_edge: int = 3200,
-    min_long_edge: int = 1600
+    target_long_edge: int = 1800,
+    min_long_edge: int = 1200
 ) -> np.ndarray:
     """
-    Normalizes document resolution:
-    - If image is ultra-high resolution (> 3200px): scales down with INTER_AREA to optimize memory without loss of print detail.
-    - If image is lower resolution (< 1600px): upscales with INTER_LANCZOS4 for crisp text strokes without smudging.
+    Normalizes document resolution to standard 150 DPI (A4 target ~1750-1800px):
+    - If image is ultra-high resolution (> 1800px): scales down with INTER_AREA to optimize memory without loss of print detail.
+    - If image is lower resolution (< 1200px): upscales with INTER_LANCZOS4 for crisp text strokes without smudging.
     """
     h, w = image.shape[:2]
     long_edge = max(h, w)

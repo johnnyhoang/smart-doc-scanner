@@ -21,16 +21,18 @@ def remove_crease_shadows_and_folds(
     h, w = image.shape[:2]
     
     # Large smooth illumination gradient without local text distortions
-    k = max(51, int(min(h, w) * 0.12)) | 1
-    bg = cv2.GaussianBlur(l_chan, (k, k), 0).astype(np.float32) + 1.0
+    k = max(31, int(min(h, w) * 0.08)) | 1
+    dilated = cv2.dilate(l_chan, cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15)))
+    bg = cv2.GaussianBlur(dilated, (k, k), 0).astype(np.float32) + 1.0
 
     # Illumination division normalization
     l_float = l_chan.astype(np.float32)
     normalized_l = (l_float / bg) * 255.0
-    normalized_l = np.clip(normalized_l, 0, 255).astype(np.uint8)
+    normalized_l = np.clip(normalized_l * 1.05, 0, 255).astype(np.uint8)
 
-    # Blend with original luminance based on strength
-    l_bleached = cv2.addWeighted(normalized_l, strength, l_chan, 1.0 - strength, 0)
+    # Blend with original luminance based on strength (multiplied for distinct effect)
+    blend_factor = min(1.0, float(strength) * 1.25)
+    l_bleached = cv2.addWeighted(normalized_l, blend_factor, l_chan, 1.0 - blend_factor, 0)
 
     result_lab = cv2.merge([l_bleached, a_chan, b_chan])
     return cv2.cvtColor(result_lab, cv2.COLOR_LAB2BGR)
@@ -38,13 +40,14 @@ def remove_crease_shadows_and_folds(
 
 def unsharp_mask(
     image: np.ndarray, 
-    sigma: float = 1.0, 
-    strength: float = 0.6, 
-    threshold: int = 2
+    sigma: float = 1.5, 
+    strength: float = 0.8, 
+    threshold: int = 1
 ) -> np.ndarray:
     """
     Sharpens text edges subtly without generating grain noise or halo artifacts.
     Operates on the Luminance channel to prevent color fringing.
+    Scales with image dimensions so sharpness is clearly visible on preview and full resolutions.
     """
     if strength <= 0.01:
         return image.copy()
@@ -52,11 +55,13 @@ def unsharp_mask(
     lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
     l, a, b = cv2.split(lab)
 
-    blurred = cv2.GaussianBlur(l, (0, 0), sigma)
+    h, w = image.shape[:2]
+    eff_sigma = max(1.2, min(3.0, min(h, w) / 500.0))
+    blurred = cv2.GaussianBlur(l, (0, 0), eff_sigma)
     diff = l.astype(np.float32) - blurred.astype(np.float32)
 
-    mask = np.abs(diff) > threshold
-    sharpened_l = l.astype(np.float32) + strength * diff * mask
+    mask = np.abs(diff) >= threshold
+    sharpened_l = l.astype(np.float32) + (strength * 1.6) * diff * mask
     sharpened_l = np.clip(sharpened_l, 0, 255).astype(np.uint8)
 
     merged = cv2.merge([sharpened_l, a, b])
@@ -244,7 +249,8 @@ def enhance_document(
     shadow_reduction: float = 0.6,
     sharpness: float = 0.6,
     contrast: float = 0.2,
-    brightness: float = 0.0
+    brightness: float = 0.0,
+    filter_intensity: float = 1.0,
 ) -> np.ndarray:
     """
     Comprehensive document enhancement & restoration pipeline.
@@ -297,7 +303,7 @@ def enhance_document(
 
         blur = cv2.GaussianBlur(enhanced, (0, 0), 1.2)
         sharp = cv2.addWeighted(enhanced, 1.5, blur, -0.5, 0)
-        return cv2.cvtColor(sharp, cv2.COLOR_GRAY2BGR)
+        img_result = cv2.cvtColor(sharp, cv2.COLOR_GRAY2BGR)
 
     elif mode == "clean_bg":
         lab = cv2.cvtColor(img_balanced, cv2.COLOR_BGR2LAB)
@@ -327,19 +333,32 @@ def enhance_document(
         # 'natural' mode (default)
         lab = cv2.cvtColor(img_balanced, cv2.COLOR_BGR2LAB)
         l, a, b = cv2.split(lab)
-
-        if contrast > 0:
-            clahe = cv2.createCLAHE(clipLimit=1.0 + (contrast * 1.5), tileGridSize=(8, 8))
-            l = clahe.apply(l)
-
         merged = cv2.merge([l, a, b])
         img_result = cv2.cvtColor(merged, cv2.COLOR_LAB2BGR)
 
-    # Step 3: Subtle text unsharp masking
-    if sharpness > 0:
-        img_result = unsharp_mask(img_result, sigma=1.0, strength=sharpness)
+    # Step 2b: Filter intensity blending (áp dụng bộ lọc xx% thay vì luôn 100%)
+    intensity = float(filter_intensity)
+    if intensity < 0.999:
+        intensity = max(0.0, min(1.0, intensity))
+        img_result = cv2.addWeighted(img_result, intensity, img_balanced, 1.0 - intensity, 0)
 
-    # Step 4: Brightness adjustment
+    # Step 3: Contrast adjustment across ALL modes (tăng tương phản rõ rệt trên mọi bộ lọc)
+    if contrast > 0.01:
+        lab_c = cv2.cvtColor(img_result, cv2.COLOR_BGR2LAB)
+        l_c, a_c, b_c = cv2.split(lab_c)
+        clahe = cv2.createCLAHE(clipLimit=1.0 + (contrast * 3.5), tileGridSize=(8, 8))
+        l_enhanced = clahe.apply(l_c)
+        # S-curve dynamic range stretching for crisp, deep dark text and clean paper
+        factor = 1.0 + contrast * 0.75
+        l_float = l_enhanced.astype(np.float32)
+        l_stretched = np.clip(128.0 + (l_float - 128.0) * factor, 0, 255).astype(np.uint8)
+        img_result = cv2.cvtColor(cv2.merge([l_stretched, a_c, b_c]), cv2.COLOR_LAB2BGR)
+
+    # Step 4: Subtle text unsharp masking
+    if sharpness > 0:
+        img_result = unsharp_mask(img_result, strength=sharpness)
+
+    # Step 5: Brightness adjustment
     if abs(brightness) > 0.01:
         img_float = img_result.astype(np.float32) + (brightness * 50.0)
         img_result = np.clip(img_float, 0, 255).astype(np.uint8)

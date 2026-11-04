@@ -207,15 +207,18 @@
                 <div class="editor-stage" id="editorStage" style="display: none;">
                     <!-- Stage Top Bar: 3 Tabs (1. Khung & Góc, 2. Lọc & Màu sắc, 3. Chú thích & Biên tập) -->
                     <div class="stage-top-bar">
-                        <div class="workflow-tabs-switch" role="tablist" aria-label="Quy trình 3 bước xử lý tài liệu">
-                            <button class="workflow-tab-btn" id="btnTabCrop" data-tab="crop" title="Bước 1: Cắt & Nắn khung — 4 góc mép giấy, xoay, mở lề, làm phẳng trang">
+                        <div class="workflow-tabs-switch" role="tablist" aria-label="Quy trình 4 bước xử lý tài liệu">
+                            <button class="workflow-tab-btn" id="btnTabCrop" data-tab="crop" title="Bước 1: Chỉnh khung góc — 4 góc mép giấy, gáy giữa sách / hộ chiếu">
                                 <i class="fa-solid fa-crop-simple"></i> <span>1. Khung & Góc</span>
                             </button>
-                            <button class="workflow-tab-btn active" id="btnTabColor" data-tab="color" title="Bước 2: Lọc & Chỉnh màu — Bộ lọc ma thuật, trắng đen scan, khử bóng, làm nét">
-                                <i class="fa-solid fa-sliders"></i> <span>2. Lọc & Màu sắc</span>
+                            <button class="workflow-tab-btn" id="btnTabPageSize" data-tab="pagesize" title="Bước 2: Khổ ảnh — Chọn khổ chuẩn A4, Passport, CCCD, tỉ lệ 2:3, 16:9...">
+                                <i class="fa-solid fa-file-lines text-accent"></i> <span>2. Khổ ảnh</span>
                             </button>
-                            <button class="workflow-tab-btn" id="btnTabAnnotate" data-tab="annotate" title="Bước 3: Chú thích & Biên tập — Vẽ hình, mũi tên, vệt dạ quang, chữ, bóng thoại, làm mờ, cắt dán">
-                                <i class="fa-solid fa-pen-ruler"></i> <span>3. Chú thích & Biên tập</span>
+                            <button class="workflow-tab-btn active" id="btnTabColor" data-tab="color" title="Bước 3: Lọc & Màu sắc — Bộ lọc ma thuật, trắng đen, khử bóng, làm nét">
+                                <i class="fa-solid fa-sliders"></i> <span>3. Lọc & Màu sắc</span>
+                            </button>
+                            <button class="workflow-tab-btn" id="btnTabAnnotate" data-tab="annotate" title="Bước 4: Chú thích & Biên tập — Vẽ hình, mũi tên, vệt dạ quang, chữ, bóng thoại, làm mờ">
+                                <i class="fa-solid fa-pen-ruler"></i> <span>4. Chú thích</span>
                             </button>
                         </div>
 
@@ -406,10 +409,54 @@
                             <button class="tool-btn" id="btnAutoDetect" title="Tự động nhận diện chính xác 4 góc mép giấy" disabled>
                                 <i class="fa-solid fa-expand"></i> Tự nhận góc
                             </button>
-                            <button class="tool-btn" id="btnExpandMargin" title="Mở rộng lề 2% ra phía ngoài" disabled>
+                            <button class="tool-btn" id="btnToggleBookSpread" title="Bật/tắt chế độ 2 trang dính nhau (Sách / Hộ chiếu) - thêm 2 điểm giữa gáy để nắn thẳng" disabled>
+                                <i class="fa-solid fa-book-open text-accent"></i> <span id="lblToggleBookSpread">2 trang (gáy giữa)</span>
+                            </button>
+                            <div class="divider-v"></div>
+                            <!-- Giãn rộng theo tỉ lệ mẫu chuẩn A4, 2:3, 16:9, 4:3, 1:1 -->
+                            <div class="tool-select-wrapper" title="Giãn rộng khung cắt theo mẫu tỉ lệ chuẩn">
+                                <i class="fa-solid fa-shapes text-accent"></i>
+                                <select id="selAspectPreset" class="tool-select" disabled>
+                                    <option value="" selected disabled>Tỉ lệ chuẩn (A4, 2:3, 16:9...)</option>
+                                    <optgroup label="Tự động theo hướng ảnh">
+                                        <option value="a4">A4 (Tài liệu / Giấy in 1:1.41)</option>
+                                        <option value="2:3">2:3 (Ảnh chụp DSLR / Bìa sách)</option>
+                                        <option value="16:9">16:9 (Màn hình rộng / Trình chiếu)</option>
+                                        <option value="4:3">4:3 (Tài liệu chuẩn / Tablet)</option>
+                                        <option value="1:1">1:1 (Vuông)</option>
+                                    </optgroup>
+                                    <optgroup label="Cố định khổ dọc (Portrait)">
+                                        <option value="a4_portrait">A4 đứng (1 : 1.414)</option>
+                                        <option value="2:3_portrait">2:3 đứng (Ảnh chân dung)</option>
+                                        <option value="3:4_portrait">3:4 đứng (Tài liệu)</option>
+                                        <option value="9:16_portrait">9:16 đứng (Story / Điện thoại)</option>
+                                    </optgroup>
+                                    <optgroup label="Cố định khổ ngang (Landscape)">
+                                        <option value="a4_landscape">A4 ngang (1.414 : 1)</option>
+                                        <option value="3:2_landscape">3:2 ngang (Ảnh phong cảnh)</option>
+                                        <option value="4:3_landscape">4:3 ngang (Tài liệu ngang)</option>
+                                        <option value="16:9_landscape">16:9 ngang (Màn hình 16:9)</option>
+                                    </optgroup>
+                                </select>
+                            </div>
+                            <div class="divider-v"></div>
+                            <!-- Giãn rộng / thu hẹp theo chiều ngang, chiều dọc & 4 phía -->
+                            <button class="tool-btn" id="btnExpandX" title="Giãn rộng khung cắt theo chiều ngang (+2%). Giữ Alt hoặc Shift để thu hẹp." disabled>
+                                <i class="fa-solid fa-arrows-left-right text-info"></i> Giãn ngang
+                            </button>
+                            <button class="tool-btn" id="btnShrinkX" title="Thu hẹp khung cắt theo chiều ngang (-2%)" disabled>
+                                <i class="fa-solid fa-compress text-muted"></i> Thu ngang
+                            </button>
+                            <button class="tool-btn" id="btnExpandY" title="Giãn rộng khung cắt theo chiều dọc (+2%). Giữ Alt hoặc Shift để thu hẹp." disabled>
+                                <i class="fa-solid fa-arrows-up-down text-info"></i> Giãn dọc
+                            </button>
+                            <button class="tool-btn" id="btnShrinkY" title="Thu hẹp khung cắt theo chiều dọc (-2%)" disabled>
+                                <i class="fa-solid fa-compress text-muted"></i> Thu dọc
+                            </button>
+                            <button class="tool-btn" id="btnExpandMargin" title="Mở rộng đều lề 2% cả 4 phía" disabled>
                                 <i class="fa-solid fa-maximize"></i> Mở lề 2%
                             </button>
-                            <button class="tool-btn" id="btnShrinkMargin" title="Thu hẹp lề 2% vào phía trong" disabled>
+                            <button class="tool-btn" id="btnShrinkMargin" title="Thu hẹp đều lề 2% cả 4 phía" disabled>
                                 <i class="fa-solid fa-minimize"></i> Thu lề 2%
                             </button>
                             <div class="divider-v"></div>
@@ -487,9 +534,85 @@
                     </button>
                 </div>
 
-                <!-- Color Enhancement & Restoration Modes -->
-                <div class="panel-section">
-                    <h3 class="section-title"><i class="fa-solid fa-sliders"></i> Bộ lọc & Chế độ màu</h3>
+                <!-- Bước 2: Khổ ảnh & Cỡ giấy chuẩn -->
+                <div class="panel-section" id="sectionPageSize">
+                    <h3 class="section-title"><i class="fa-solid fa-file-lines text-accent"></i> Khổ ảnh chuẩn (Bước 2)</h3>
+                    
+                    <div class="setting-group">
+                        <label class="setting-label-sm">Khổ tài liệu / Tỉ lệ chuẩn:</label>
+                        <select id="selPageSizePreset" class="form-select-full">
+                            <option value="original" selected>📄 Khổ tự do (Theo góc cắt gốc)</option>
+                            <optgroup label="Khổ chuẩn văn bản & In ấn">
+                                <option value="a4">A4 (210 × 297 mm - Chuẩn in ấn)</option>
+                                <option value="a5">A5 (148 × 210 mm - Sổ tay / Giấy nhỏ)</option>
+                                <option value="a3">A3 (297 × 420 mm - Bản vẽ lớn)</option>
+                                <option value="letter">Letter (8.5 × 11 in - Quốc tế)</option>
+                            </optgroup>
+                            <optgroup label="Giấy tờ tùy thân & Thẻ">
+                                <option value="passport">Passport / Ảnh thẻ (35 × 45 mm)</option>
+                                <option value="passport_4x6">Ảnh thẻ 4 × 6 cm</option>
+                                <option value="passport_spread">Hộ chiếu 2 trang mở (125 × 176 mm)</option>
+                                <option value="id_card">Căn cước công dân / Bằng lái (85.6 × 54 mm)</option>
+                            </optgroup>
+                            <optgroup label="Tỉ lệ khung hình (Aspect Ratio)">
+                                <option value="ratio_2_3">Tỉ lệ 2:3 / 3:2 (Chuẩn ảnh DSLR / Ảnh in)</option>
+                                <option value="ratio_16_9">Tỉ lệ 16:9 (Màn hình rộng / Trình chiếu)</option>
+                                <option value="ratio_4_3">Tỉ lệ 4:3 (Tài liệu / Tablet / iPad)</option>
+                                <option value="ratio_1_1">Tỉ lệ 1:1 (Vuông)</option>
+                            </optgroup>
+                        </select>
+                    </div>
+
+                    <div class="setting-group mt-2">
+                        <label class="setting-label-sm">Hướng trang:</label>
+                        <div class="ann-btn-seg" id="segPageOrientation">
+                            <button class="ann-seg-btn active" data-orientation="auto" title="Tự động theo chiều tài liệu">Tự động</button>
+                            <button class="ann-seg-btn" data-orientation="portrait" title="Khổ dọc (Đứng)"><i class="fa-solid fa-arrows-up-down"></i> Dọc</button>
+                            <button class="ann-seg-btn" data-orientation="landscape" title="Khổ ngang (Nằm)"><i class="fa-solid fa-arrows-left-right"></i> Ngang</button>
+                        </div>
+                    </div>
+
+                    <div class="setting-group mt-2">
+                        <label class="setting-label-sm">Kiểu co giãn:</label>
+                        <div class="ann-btn-seg" id="segPageFitMode">
+                            <button class="ann-seg-btn active" data-fit="fill" title="Co giãn phủ kín: Resize ảnh vừa khít 100% tỉ lệ chuẩn, không viền thừa"><i class="fa-solid fa-expand"></i> Phủ kín (Resize)</button>
+                            <button class="ann-seg-btn" data-fit="crop" title="Cắt xén phủ kín: Giữ nguyên tỉ lệ điểm ảnh, cắt bớt mép ngoài để vừa khít"><i class="fa-solid fa-crop-simple"></i> Cắt xén phủ kín</button>
+                        </div>
+                    </div>
+
+                    <div class="setting-group mt-2">
+                        <label class="setting-label-sm">Giãn ngang & dọc (Resize trực tiếp ảnh):</label>
+                        <div class="step2-stretch-row">
+                            <div class="stretch-btn-group">
+                                <span class="stretch-label"><i class="fa-solid fa-arrows-left-right text-muted"></i> Ngang:</span>
+                                <button class="btn btn-secondary btn-xs" id="btnStep2ShrinkX" title="Thu hẹp chiều ngang ảnh 2%"><i class="fa-solid fa-minus"></i></button>
+                                <span class="stretch-val" id="valStep2ScaleX">100%</span>
+                                <button class="btn btn-secondary btn-xs" id="btnStep2ExpandX" title="Giãn rộng chiều ngang ảnh 2%"><i class="fa-solid fa-plus"></i></button>
+                            </div>
+                            <div class="stretch-btn-group">
+                                <span class="stretch-label"><i class="fa-solid fa-arrows-up-down text-muted"></i> Dọc:</span>
+                                <button class="btn btn-secondary btn-xs" id="btnStep2ShrinkY" title="Thu hẹp chiều dọc ảnh 2%"><i class="fa-solid fa-minus"></i></button>
+                                <span class="stretch-val" id="valStep2ScaleY">100%</span>
+                                <button class="btn btn-secondary btn-xs" id="btnStep2ExpandY" title="Giãn rộng chiều dọc ảnh 2%"><i class="fa-solid fa-plus"></i></button>
+                            </div>
+                            <button class="btn btn-subtle btn-xs" id="btnStep2ResetStretch" title="Đặt lại độ co giãn về 100%"><i class="fa-solid fa-rotate-left"></i> 100%</button>
+                        </div>
+                    </div>
+
+                    <div style="display: none;">
+                        <span id="valPageMargin">0%</span>
+                        <input type="range" id="rngPageMargin" min="0" max="15" step="1" value="0">
+                    </div>
+
+                    <div class="page-size-metric-badge mt-2" id="pageSizeMetricBadge">
+                        <i class="fa-solid fa-circle-info text-accent"></i>
+                        <span id="lblPageSizeMetric">Khổ gốc: Tự do theo ảnh</span>
+                    </div>
+                </div>
+
+                <!-- Bước 3: Bộ lọc & Chế độ màu -->
+                <div class="panel-section" id="sectionColorFilter">
+                    <h3 class="section-title"><i class="fa-solid fa-sliders"></i> Bộ lọc & Chế độ màu (Bước 3)</h3>
                     <div class="filter-modes-grid">
                         <button class="mode-card active" data-mode="natural" title="Màu tự nhiên - Giữ 100% màu sắc và nét chữ">
                             <div class="mode-icon"><i class="fa-solid fa-leaf"></i></div>
@@ -531,6 +654,15 @@
                             <div class="mode-icon"><i class="fa-solid fa-image"></i></div>
                             <span class="mode-title">Ảnh gốc</span>
                         </button>
+                    </div>
+
+                    <!-- Thanh trượt mức độ áp dụng bộ lọc (0% - 100%) -->
+                    <div class="slider-group filter-intensity-slider" id="filterIntensityGroup">
+                        <div class="slider-header">
+                            <span><i class="fa-solid fa-sliders text-accent"></i> Mức độ áp dụng bộ lọc</span>
+                            <span class="slider-val" id="valFilterIntensity">100%</span>
+                        </div>
+                        <input type="range" id="rngFilterIntensity" min="0" max="100" value="100" step="5">
                     </div>
                 </div>
 
@@ -603,7 +735,7 @@
                         <label class="custom-checkbox">
                             <input type="checkbox" id="chkNormalizeDpi" checked>
                             <span class="checkmark"></span>
-                            Chuẩn hóa kích thước in (A4 300 DPI)
+                            Chuẩn hóa kích thước in (A4 150 DPI)
                         </label>
                     </div>
                     <div class="slider-group">

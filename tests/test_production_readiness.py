@@ -364,6 +364,148 @@ def test_don_pdf_cu_chi_cham_dung_khuon_ten_ban_cu():
         p.close()
 
 
+def test_six_point_book_spread_transform():
+    """Kiểm tra tính năng nắn phẳng ảnh tài liệu 2 trang dính nhau với 6 điểm mốc."""
+    import numpy as np
+    from core import renderer as rd
+    from core.detector import four_point_transform
+
+    img = np.zeros((600, 800, 3), dtype=np.uint8)
+    cv2_corners = [
+        [20.0, 30.0],
+        [400.0, 70.0],  # Điểm gáy trên
+        [780.0, 35.0],
+        [770.0, 560.0],
+        [400.0, 520.0],  # Điểm gáy dưới
+        [30.0, 570.0],
+    ]
+    warped = four_point_transform(img, np.array(cv2_corners, dtype=np.float32))
+    assert warped is not None
+    assert warped.shape[0] > 100
+    assert warped.shape[1] > 200
+
+    rendered = rd.render_page(img, cv2_corners, 0, {"mode": "natural", "dewarp_enabled": False})
+    assert rendered is not None
+    assert rendered.shape[:2] == warped.shape[:2]
+
+
+def test_aspect_ratio_and_directional_expansion():
+    """Kiểm tra co giãn đa giác theo chiều ngang, chiều dọc và căn tỉ lệ A4, 2:3, 16:9."""
+    import numpy as np
+    from core.detector import expand_quad_directional, fit_quad_aspect_ratio
+
+    # Hình chữ nhật 400 x 600
+    pts = np.array([
+        [100.0, 100.0],
+        [500.0, 100.0],
+        [500.0, 700.0],
+        [100.0, 700.0],
+    ], dtype=np.float32)
+
+    # 1. Giãn ngang factor_x = 1.1, factor_y = 1.0
+    exp_x = expand_quad_directional(pts, (800, 800), factor_x=1.1, factor_y=1.0)
+    w_orig = pts[1, 0] - pts[0, 0]
+    w_new = exp_x[1, 0] - exp_x[0, 0]
+    assert np.isclose(w_new, w_orig * 1.1, atol=1e-2)
+    assert np.isclose(exp_x[2, 1] - exp_x[1, 1], pts[2, 1] - pts[1, 1], atol=1e-2)
+
+    # 2. Giãn dọc factor_x = 1.0, factor_y = 1.2
+    exp_y = expand_quad_directional(pts, (800, 800), factor_x=1.0, factor_y=1.2)
+    h_orig = pts[2, 1] - pts[1, 1]
+    h_new = exp_y[2, 1] - exp_y[1, 1]
+    assert np.isclose(h_new, h_orig * 1.2, atol=1e-2)
+    assert np.isclose(exp_y[1, 0] - exp_y[0, 0], pts[1, 0] - pts[0, 0], atol=1e-2)
+
+    # 3. Căn tỉ lệ A4 đứng (1 / sqrt(2) ≈ 0.7071)
+    a4_quad = fit_quad_aspect_ratio(pts, (800, 800), target_ratio=1.0 / np.sqrt(2), expand=True)
+    a4_w = a4_quad[1, 0] - a4_quad[0, 0]
+    a4_h = a4_quad[2, 1] - a4_quad[1, 1]
+    assert np.isclose(a4_w / a4_h, 1.0 / np.sqrt(2), atol=1e-3)
+
+    # 4. Căn tỉ lệ 16:9
+    w16_quad = fit_quad_aspect_ratio(pts, (2000, 2000), target_ratio=16.0 / 9.0, expand=True)
+    w16_w = w16_quad[1, 0] - w16_quad[0, 0]
+    w16_h = w16_quad[2, 1] - w16_quad[1, 1]
+    assert np.isclose(w16_w / w16_h, 16.0 / 9.0, atol=1e-3)
+
+
+def test_filter_intensity_blending():
+    """Kiểm tra thanh kéo mức độ áp dụng bộ lọc (0% -> 100%)."""
+    import numpy as np
+    from core.enhancer import enhance_document
+
+    img = np.full((100, 100, 3), 120, dtype=np.uint8)
+    # Thêm một vùng màu đỏ để kiểm tra bộ lọc
+    img[20:80, 20:80] = [30, 40, 200]
+
+    # 1. 100% bộ lọc ma thuật
+    res_100 = enhance_document(img, mode="magic_color", filter_intensity=1.0)
+    # 2. 0% bộ lọc ma thuật (phải bằng ảnh gốc cân bằng)
+    res_0 = enhance_document(img, mode="magic_color", filter_intensity=0.0)
+    # 3. 50% bộ lọc ma thuật
+    res_50 = enhance_document(img, mode="magic_color", filter_intensity=0.5)
+
+    assert res_100 is not None
+    assert res_0 is not None
+    assert res_50 is not None
+    assert res_100.shape == img.shape
+    assert res_50.shape == img.shape
+
+    # Ở 50%, giá trị pixel phải nằm giữa 0% và 100%
+    expected_mid = (res_100.astype(np.float32) * 0.5 + res_0.astype(np.float32) * 0.5).astype(np.uint8)
+    diff = np.abs(res_50.astype(np.int16) - expected_mid.astype(np.int16))
+    assert np.mean(diff) <= 2.0  # Chênh lệch do làm tròn số nguyên không vượt quá 2 giá trị
+
+
+def test_apply_page_format_presets():
+    """Kiểm tra Bước 2: Khổ ảnh chuẩn (A4, Passport, 16:9...)."""
+    import numpy as np
+    from core.renderer import apply_page_format, render_page
+
+    img = np.zeros((1000, 800, 3), dtype=np.uint8)
+
+    # 1. Khổ A4 đứng (1 : 1.4142)
+    a4_out = apply_page_format(img, preset="a4", orientation="portrait", fit_mode="fit")
+    assert a4_out is not None
+    r_a4 = a4_out.shape[1] / float(a4_out.shape[0])
+    assert np.isclose(r_a4, 1.0 / 1.41421356, atol=1e-2)
+
+    # 2. Khổ Passport 35x45mm (35 : 45 = 0.7778)
+    pass_out = apply_page_format(img, preset="passport", orientation="portrait", fit_mode="fit")
+    assert pass_out is not None
+    r_pass = pass_out.shape[1] / float(pass_out.shape[0])
+    assert np.isclose(r_pass, 35.0 / 45.0, atol=1e-2)
+
+    # 3. Khổ 16:9 ngang (16 : 9 = 1.7778)
+    w169_out = apply_page_format(img, preset="ratio_16_9", orientation="landscape", fit_mode="fill")
+    assert w169_out is not None
+    r_169 = w169_out.shape[1] / float(w169_out.shape[0])
+    assert np.isclose(r_169, 16.0 / 9.0, atol=1e-2)
+
+    # 4. Tích hợp render_page với page_size_preset
+    corners = [[0, 0], [800, 0], [800, 1000], [0, 1000]]
+    rendered = render_page(img, corners, 0, {
+        "page_size_preset": "a4",
+        "page_orientation": "portrait",
+        "page_fit_mode": "fill",
+        "mode": "natural",
+    })
+    assert rendered is not None
+    r_rend = rendered.shape[1] / float(rendered.shape[0])
+    assert np.isclose(r_rend, 1.0 / 1.41421356, atol=1e-2)
+
+    # 5. Kiểm tra co giãn trực tiếp ảnh (không phủ lề): ảnh có màu nền xanh 100%, không bị chèn viền trắng
+    blue_img = np.full((1000, 800, 3), [255, 0, 0], dtype=np.uint8)
+    a4_blue = apply_page_format(blue_img, preset="a4", orientation="portrait", fit_mode="fill")
+    assert np.all(a4_blue[:, :, 0] == 255)
+    assert np.all(a4_blue[:, :, 1] == 0)
+
+    # 6. Kiểm tra giãn ngang & dọc trực tiếp (stretch_x, stretch_y)
+    stretch_out = apply_page_format(img, preset="original", stretch_x=1.2, stretch_y=1.1)
+    assert stretch_out.shape[1] == int(round(800 * 1.2))
+    assert stretch_out.shape[0] == int(round(1000 * 1.1))
+
+
 if __name__ == "__main__":
     cases = [(n, f) for n, f in sorted(globals().items())
              if n.startswith("test_") and callable(f)]

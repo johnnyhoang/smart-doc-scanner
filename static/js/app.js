@@ -11,12 +11,15 @@
  *   nên mở thư mục hàng trăm trang vẫn nhẹ và tức thì.
  */
 
-const WORKFLOW_TAB = { CROP: 'crop', COLOR: 'color', ANNOTATE: 'annotate' };
+const WORKFLOW_TAB = { CROP: 'crop', PAGESIZE: 'pagesize', COLOR: 'color', ANNOTATE: 'annotate' };
 const VIEW = { EDIT: 'edit', COMPARE: 'compare', ANNOTATE: 'annotate' };
 const AUTOSAVE_MS = 60000;
 const META_SAVE_MS = 1200;
 const PREVIEW_DEBOUNCE_MS = 160;
 const MAX_HISTORY = 30;
+
+const $ = (id) => document.getElementById(id);
+const on = (el, evt, fn, opts) => { if (el) el.addEventListener(evt, fn, opts); };
 
 const DEFAULT_SETTINGS = {
     mode: 'natural',
@@ -24,6 +27,13 @@ const DEFAULT_SETTINGS = {
     sharpness: 0.6,
     contrast: 0.2,
     brightness: 0.0,
+    filter_intensity: 1.0,
+    page_size_preset: 'original',
+    page_orientation: 'auto',
+    page_fit_mode: 'fill',
+    page_margin_pct: 0.0,
+    page_scale_x: 1.0,
+    page_scale_y: 1.0,
     margin_percent: 0.02,
     dewarp_enabled: false,
     dewarp_strength: 0.8,
@@ -69,6 +79,19 @@ function formatBytes(bytes) {
     if (bytes < 1024) return `${bytes} B`;
     if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
     return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
+}
+
+function estimateQualitySize(baseBytes, targetQuality, baseQuality = 85) {
+    if (!baseBytes || baseBytes <= 0) return 0;
+    const curve = (q) => {
+        if (q <= 85) {
+            return 1.0 + (q - 85) * 0.013;
+        } else {
+            return 1.0 + (q - 85) * 0.045 + Math.pow(q - 85, 2) * 0.0035;
+        }
+    };
+    const ratio = curve(targetQuality) / curve(baseQuality);
+    return Math.max(1024, Math.round(baseBytes * ratio));
 }
 
 
@@ -148,8 +171,22 @@ class DocScanApp {
         this.updateHistoryButtons();
         this.updateFolderActionButtons();
 
-        if (this.rootPath) {
-            this.loadProject(this.rootPath, false);
+        this.initSession();
+    }
+
+    async initSession() {
+        let path = localStorage.getItem('docscan_root_path');
+        if (!path) {
+            try {
+                const res = await apiJson('/api/session');
+                if (res && res.root_path) {
+                    path = res.root_path;
+                    localStorage.setItem('docscan_root_path', path);
+                }
+            } catch (e) {}
+        }
+        if (path) {
+            await this.loadProject(path, false);
         } else {
             this.setStatus('Hãy chọn thư mục tài liệu trên máy để bắt đầu.', 'info');
         }
@@ -160,8 +197,6 @@ class DocScanApp {
     // ======================================================
 
     initElements() {
-        const $ = (id) => document.getElementById(id);
-
         this.pageSidebar = $('pageSidebar');
         this.folderSection = $('folderSection');
         this.pagesSection = $('pagesSection');
@@ -233,8 +268,24 @@ class DocScanApp {
         this.btnDeselectAllPages = $('btnDeselectAllPages');
 
         this.btnTabCrop = $('btnTabCrop') || $('btnModeEdit');
+        this.btnTabPageSize = $('btnTabPageSize');
         this.btnTabColor = $('btnTabColor') || $('btnModeCompare');
         this.btnTabAnnotate = $('btnTabAnnotate');
+
+        this.sectionPageSize = $('sectionPageSize');
+        this.selPageSizePreset = $('selPageSizePreset');
+        this.segPageOrientation = $('segPageOrientation');
+        this.segPageFitMode = $('segPageFitMode');
+        this.rngPageMargin = $('rngPageMargin');
+        this.valPageMargin = $('valPageMargin');
+        this.lblPageSizeMetric = $('lblPageSizeMetric');
+        this.btnStep2ShrinkX = $('btnStep2ShrinkX');
+        this.btnStep2ExpandX = $('btnStep2ExpandX');
+        this.valStep2ScaleX = $('valStep2ScaleX');
+        this.btnStep2ShrinkY = $('btnStep2ShrinkY');
+        this.btnStep2ExpandY = $('btnStep2ExpandY');
+        this.valStep2ScaleY = $('valStep2ScaleY');
+        this.btnStep2ResetStretch = $('btnStep2ResetStretch');
         this.btnModeEdit = this.btnTabCrop;
         this.btnModeCompare = this.btnTabColor;
 
@@ -269,6 +320,13 @@ class DocScanApp {
         this.btnResetToRawOriginal = $('btnResetToRawOriginal');
         this.btnResetCorners = $('btnResetCorners');
         this.btnAutoDetect = $('btnAutoDetect');
+        this.btnToggleBookSpread = $('btnToggleBookSpread');
+        this.lblToggleBookSpread = $('lblToggleBookSpread');
+        this.selAspectPreset = $('selAspectPreset');
+        this.btnExpandX = $('btnExpandX');
+        this.btnShrinkX = $('btnShrinkX');
+        this.btnExpandY = $('btnExpandY');
+        this.btnShrinkY = $('btnShrinkY');
         this.btnExpandMargin = $('btnExpandMargin');
         this.btnShrinkMargin = $('btnShrinkMargin');
         this.btnRotateLeft = $('btnRotateLeft');
@@ -277,6 +335,9 @@ class DocScanApp {
         this.modeCards = document.querySelectorAll('.mode-card');
         this.chkDewarp = $('chkDewarp');
         this.dewarpStrengthGroup = $('dewarpStrengthGroup');
+        this.filterIntensityGroup = $('filterIntensityGroup');
+        this.rngFilterIntensity = $('rngFilterIntensity');
+        this.valFilterIntensity = $('valFilterIntensity');
         this.rngDewarp = $('rngDewarp');
         this.valDewarp = $('valDewarp');
         this.rngShadow = $('rngShadow');
@@ -347,8 +408,6 @@ class DocScanApp {
     // ======================================================
 
     bindEvents() {
-        const on = (el, evt, fn, opts) => { if (el) el.addEventListener(evt, fn, opts); };
-
         // --- Nhập ảnh ---
         on(this.fileInput, 'change', (e) => this.importFiles(e.target.files));
         on(this.heroFileInput, 'change', (e) => this.importFiles(e.target.files));
@@ -432,8 +491,133 @@ class DocScanApp {
 
         // --- 3 Tab Quy trình làm việc (Khung & Góc, Lọc & Màu sắc, Chú thích & Biên tập) ---
         on(this.btnTabCrop, 'click', () => this.setWorkflowTab(WORKFLOW_TAB.CROP));
+        on(this.btnTabPageSize, 'click', () => this.setWorkflowTab(WORKFLOW_TAB.PAGESIZE));
         on(this.btnTabColor, 'click', () => this.setWorkflowTab(WORKFLOW_TAB.COLOR));
         on(this.btnTabAnnotate, 'click', () => this.setWorkflowTab(WORKFLOW_TAB.ANNOTATE));
+
+        const bindSlider = (input, label, apply, formatter) => {
+            if (!input) return;
+            let startSnap = null;
+            let hasChanged = false;
+
+            const onStart = () => {
+                const page = this.getActivePage();
+                if (page) {
+                    startSnap = this.snapshot(page);
+                    hasChanged = false;
+                }
+            };
+
+            on(input, 'pointerdown', onStart);
+            on(input, 'keydown', (e) => {
+                if (['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'PageUp', 'PageDown'].includes(e.key)) {
+                    if (!startSnap) onStart();
+                }
+            });
+
+            on(input, 'input', (e) => {
+                const page = this.getActivePage();
+                if (label) label.textContent = formatter(e.target.value);
+                if (!page) return;
+                if (!startSnap) onStart();
+                hasChanged = true;
+                apply(page, e.target.value);
+                if (this.viewMode !== VIEW.COMPARE) this.setViewMode(VIEW.COMPARE);
+                this.requestPreview();
+            });
+
+            on(input, 'change', () => {
+                const page = this.getActivePage();
+                if (page && hasChanged && startSnap) {
+                    page.history.undo.push({ ...startSnap, description: 'Chỉnh thanh trượt' });
+                    if (page.history.undo.length > MAX_HISTORY) page.history.undo.shift();
+                    page.history.redo = [];
+                    this.updateHistoryButtons();
+                    this.scheduleMetaSave();
+                }
+                startSnap = null;
+                hasChanged = false;
+            });
+        };
+
+
+        on(this.selPageSizePreset, 'change', (e) => {
+            const page = this.getActivePage();
+            if (!page) return;
+            const val = e.target.value;
+            this.pushHistory(`Chọn khổ ảnh: ${e.target.options[e.target.selectedIndex]?.text || val}`);
+            page.settings.page_size_preset = val;
+            this.updatePageSizeMetric(page);
+            this.clearBaseline();
+            this.requestPreview();
+        });
+
+        document.querySelectorAll('#segPageOrientation .ann-seg-btn').forEach(btn => {
+            on(btn, 'click', () => {
+                const page = this.getActivePage();
+                if (!page) return;
+                document.querySelectorAll('#segPageOrientation .ann-seg-btn').forEach(b => b.classList.toggle('active', b === btn));
+                page.settings.page_orientation = btn.dataset.orientation;
+                this.pushHistory(`Hướng trang: ${btn.textContent.trim()}`);
+                this.updatePageSizeMetric(page);
+                this.clearBaseline();
+                this.requestPreview();
+            });
+        });
+
+        document.querySelectorAll('#segPageFitMode .ann-seg-btn').forEach(btn => {
+            on(btn, 'click', () => {
+                const page = this.getActivePage();
+                if (!page) return;
+                document.querySelectorAll('#segPageFitMode .ann-seg-btn').forEach(b => b.classList.toggle('active', b === btn));
+                page.settings.page_fit_mode = btn.dataset.fit;
+                this.pushHistory(`Kiểu co giãn: ${btn.textContent.trim()}`);
+                this.updatePageSizeMetric(page);
+                this.clearBaseline();
+                this.requestPreview();
+            });
+        });
+
+        const step2Nudge = (dx, dy) => {
+            const page = this.getActivePage();
+            if (!page) return;
+            const desc = dx ? (dx > 0 ? 'Giãn rộng chiều ngang ảnh 2%' : 'Thu hẹp chiều ngang ảnh 2%') : (dy > 0 ? 'Giãn rộng chiều dọc ảnh 2%' : 'Thu hẹp chiều dọc ảnh 2%');
+            this.pushHistory(desc);
+            if (dx) {
+                const cur = Math.round((page.settings.page_scale_x ?? 1.0) * 100);
+                const next = Math.max(50, Math.min(250, cur + dx));
+                page.settings.page_scale_x = next / 100;
+            }
+            if (dy) {
+                const cur = Math.round((page.settings.page_scale_y ?? 1.0) * 100);
+                const next = Math.max(50, Math.min(250, cur + dy));
+                page.settings.page_scale_y = next / 100;
+            }
+            this.syncInspector(page.settings);
+            this.clearBaseline();
+            this.requestPreview();
+            this.scheduleMetaSave();
+        };
+
+        on(this.btnStep2ShrinkX, 'click', () => step2Nudge(-2, 0));
+        on(this.btnStep2ExpandX, 'click', () => step2Nudge(+2, 0));
+        on(this.btnStep2ShrinkY, 'click', () => step2Nudge(0, -2));
+        on(this.btnStep2ExpandY, 'click', () => step2Nudge(0, +2));
+        on(this.btnStep2ResetStretch, 'click', () => {
+            const page = this.getActivePage();
+            if (!page) return;
+            this.pushHistory('Đặt lại tỉ lệ co giãn ảnh 100%');
+            page.settings.page_scale_x = 1.0;
+            page.settings.page_scale_y = 1.0;
+            this.syncInspector(page.settings);
+            this.clearBaseline();
+            this.requestPreview();
+            this.scheduleMetaSave();
+        });
+
+        bindSlider(this.rngPageMargin, this.valPageMargin,
+            (p, v) => { p.settings.page_margin_pct = parseFloat(v) / 100; this.clearBaseline(); },
+            (v) => `${v}%`);
 
         // --- Snagit Annotation Suite Events ---
         document.querySelectorAll('.ann-tool-btn').forEach(btn => {
@@ -502,6 +686,24 @@ class DocScanApp {
         on(this.btnResetToRawOriginal, 'click', () => this.resetToOriginal());
         on(this.btnResetCorners, 'click', () => this.setCornersToFullFrame());
         on(this.btnAutoDetect, 'click', () => this.autoDetectCorners());
+        on(this.btnToggleBookSpread, 'click', () => this.toggleBookSpread());
+        on(this.selAspectPreset, 'change', (e) => {
+            const val = e.target.value;
+            if (val) {
+                this.applyAspectRatio(val);
+                this.selAspectPreset.value = '';
+            }
+        });
+        on(this.btnExpandX, 'click', (e) => {
+            if (e.altKey || e.shiftKey) this.shrinkHorizontal();
+            else this.expandHorizontal();
+        });
+        on(this.btnShrinkX, 'click', () => this.shrinkHorizontal());
+        on(this.btnExpandY, 'click', (e) => {
+            if (e.altKey || e.shiftKey) this.shrinkVertical();
+            else this.expandVertical();
+        });
+        on(this.btnShrinkY, 'click', () => this.shrinkVertical());
         on(this.btnExpandMargin, 'click', () => this.expandMargin());
         on(this.btnShrinkMargin, 'click', () => this.shrinkMargin());
         on(this.btnRotateLeft, 'click', () => this.rotate(-90));
@@ -516,56 +718,18 @@ class DocScanApp {
                 this.pushHistory(`Đổi bộ lọc: ${card.querySelector('.mode-title')?.textContent || ''}`);
                 page.settings.mode = card.dataset.mode;
                 this.modeCards.forEach(c => c.classList.toggle('active', c === card));
+                if (this.filterIntensityGroup) {
+                    this.filterIntensityGroup.style.opacity = (card.dataset.mode === 'original') ? '0.4' : '1';
+                    if (this.rngFilterIntensity) this.rngFilterIntensity.disabled = (card.dataset.mode === 'original');
+                }
                 if (this.viewMode !== VIEW.COMPARE) this.setViewMode(VIEW.COMPARE);
                 this.requestPreview();
             });
         });
 
-        const bindSlider = (input, label, apply, formatter) => {
-            if (!input) return;
-            let startSnap = null;
-            let hasChanged = false;
 
-            const onStart = () => {
-                const page = this.getActivePage();
-                if (page) {
-                    startSnap = this.snapshot(page);
-                    hasChanged = false;
-                }
-            };
-
-            on(input, 'pointerdown', onStart);
-            on(input, 'keydown', (e) => {
-                if (['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'PageUp', 'PageDown'].includes(e.key)) {
-                    if (!startSnap) onStart();
-                }
-            });
-
-            on(input, 'input', (e) => {
-                const page = this.getActivePage();
-                if (label) label.textContent = formatter(e.target.value);
-                if (!page) return;
-                if (!startSnap) onStart();
-                hasChanged = true;
-                apply(page, e.target.value);
-                if (this.viewMode !== VIEW.COMPARE) this.setViewMode(VIEW.COMPARE);
-                this.requestPreview();
-            });
-
-            on(input, 'change', () => {
-                const page = this.getActivePage();
-                if (page && hasChanged && startSnap) {
-                    page.history.undo.push({ ...startSnap, description: 'Chỉnh thanh trượt' });
-                    if (page.history.undo.length > MAX_HISTORY) page.history.undo.shift();
-                    page.history.redo = [];
-                    this.updateHistoryButtons();
-                    this.scheduleMetaSave();
-                }
-                startSnap = null;
-                hasChanged = false;
-            });
-        };
-
+        bindSlider(this.rngFilterIntensity, this.valFilterIntensity,
+            (p, v) => { p.settings.filter_intensity = v / 100; }, (v) => `${v}%`);
         bindSlider(this.rngDewarp, this.valDewarp,
             (p, v) => { p.settings.dewarp_strength = parseFloat(v); }, (v) => v);
         bindSlider(this.rngShadow, this.valShadow,
@@ -575,7 +739,18 @@ class DocScanApp {
         bindSlider(this.rngContrast, this.valContrast,
             (p, v) => { p.settings.contrast = v / 100; }, (v) => `${v}%`);
         bindSlider(this.rngQuality, this.valQuality,
-            (p, v) => { p.settings.quality = parseInt(v, 10); }, (v) => `${v}%`);
+            (p, v) => {
+                const q = parseInt(v, 10);
+                p.settings.quality = q;
+                // Cập nhật tức thời số liệu dung lượng khi đang kéo chuột/ngón tay (Zero latency)
+                const base = p.baseQualitySize || p.outSize || p.editedSize || p.origSize || 0;
+                const baseQ = p.baseQualityRef || 85;
+                if (base > 0) {
+                    p.outSize = estimateQualitySize(base, q, baseQ);
+                    p.outSizeHuman = formatBytes(p.outSize);
+                    this.updateMetrics(p);
+                }
+            }, (v) => `${v}%`);
         bindSlider(this.rngMargin, this.valMargin,
             (p, v) => { p.settings.margin_percent = parseFloat(v) / 100; },
             (v) => `${parseFloat(v).toFixed(1)}%`);
@@ -596,6 +771,30 @@ class DocScanApp {
             this.pushHistory(e.target.checked ? 'Bật chuẩn hóa độ phân giải' : 'Tắt chuẩn hóa độ phân giải');
             page.settings.normalize_res = e.target.checked;
             this.markDirty(page);
+
+            // Cập nhật dự kiến tức thì dung lượng & kích thước trên UI
+            const origW = page.width || 2000;
+            const origH = page.height || 2800;
+            const maxDim = Math.max(origW, origH);
+            if (e.target.checked && maxDim > 1800) {
+                const scale = 1800.0 / maxDim;
+                const newW = Math.round(origW * scale);
+                const newH = Math.round(origH * scale);
+                page.outDim = `${newW} × ${newH} px`;
+                const pxRatio = (newW * newH) / (origW * origH);
+                page.outSize = Math.max(1024, Math.round((page.outSize || page.origSize || 100000) * Math.pow(pxRatio, 0.72)));
+                page.outSizeHuman = formatBytes(page.outSize);
+                page.baseQualitySize = page.outSize;
+            } else if (!e.target.checked) {
+                page.outDim = `${origW} × ${origH} px`;
+                const curMax = Math.min(1800, maxDim);
+                const scaleBack = maxDim / Math.max(1, curMax);
+                const pxRatio = scaleBack * scaleBack;
+                page.outSize = Math.max(1024, Math.round((page.outSize || page.origSize || 100000) * Math.pow(pxRatio, 0.72)));
+                page.outSizeHuman = formatBytes(page.outSize);
+                page.baseQualitySize = page.outSize;
+            }
+            this.updateMetrics(page);
             this.requestPreview();
             this.scheduleMetaSave();
         });
@@ -712,7 +911,15 @@ class DocScanApp {
 
             const stored = localStorage.getItem('docscan_active_folder');
             const target = this.folders.find(f => f.id === stored) || this.folders.find(f => !f.parentId) || this.folders[0];
-            if (target) this.selectFolder(target.id);
+            if (target) {
+                await this.selectFolder(target.id);
+                const storedPage = localStorage.getItem('docscan_active_page');
+                const pageIds = target.imageIds || [];
+                const pageToOpen = (storedPage && pageIds.includes(storedPage)) ? storedPage : (pageIds[0] || null);
+                if (pageToOpen && this.activeImageId !== pageToOpen) {
+                    await this.selectPage(pageToOpen);
+                }
+            }
 
             this.updateSaveState();
             if (notify) {
@@ -870,11 +1077,17 @@ class DocScanApp {
 
         const ids = this.getFolderImageIds();
         if (!ids.includes(this.activeImageId)) {
-            this.activeImageId = null;
-            this.editorStage.style.display = 'none';
-            this.emptyState.style.display = 'flex';
-            this.docNameWrapper.style.display = 'none';
-            this.updateHistoryButtons();
+            const storedPage = localStorage.getItem('docscan_active_page');
+            const targetPageId = (storedPage && ids.includes(storedPage)) ? storedPage : (ids[0] || null);
+            if (targetPageId) {
+                await this.selectPage(targetPageId);
+            } else {
+                this.activeImageId = null;
+                this.editorStage.style.display = 'none';
+                this.emptyState.style.display = 'flex';
+                this.docNameWrapper.style.display = 'none';
+                this.updateHistoryButtons();
+            }
         }
         this.updateFolderActionButtons();
     }
@@ -1023,6 +1236,7 @@ class DocScanApp {
             await apiJson('/api/delete-folder', { relative_path: folder.relativePath });
             this.toastOk(`Đã xóa thư mục "${folder.name}".`);
             localStorage.removeItem('docscan_active_folder');
+            localStorage.removeItem('docscan_active_page');
             await this.loadProject(this.rootPath, false);
         } catch (err) {
             this.toastErr(err.message);
@@ -1048,15 +1262,48 @@ class DocScanApp {
 
         const folder = this.getActiveFolder();
         const relPath = folder ? folder.relativePath : '';
-        this.showLoading(`Đang xử lý ${files.length} tệp (ảnh / PDF) vào "${folder ? folder.name : ''}"…`);
+        const currentActiveId = this.activeImageId;
 
         let firstId = null;
         let added = 0;
+        let overwrittenActiveId = null;
+
         try {
             for (const file of files) {
+                // Kiểm tra xem tệp đã tồn tại trong thư mục chưa để hỏi người dùng ghi đè hay tạo bản sao
+                const rawName = file.name || '';
+                const fileStem = rawName.replace(/\.[^/.]+$/, "").trim().toLowerCase();
+                const fileNameLower = rawName.toLowerCase();
+
+                const existingPage = Array.from(this.pages.values()).find(p => {
+                    if ((p.relativePath || '') !== (relPath || '')) return false;
+                    const pFile = (p.filename || '').toLowerCase();
+                    const pStem = (p.docName || pFile.replace(/\.[^/.]+$/, "")).trim().toLowerCase();
+                    return pFile === fileNameLower || pStem === fileStem || pFile === `${fileStem}.jpg`;
+                });
+
+                let overwrite = false;
+                if (existingPage) {
+                    const wantOverwrite = await this.askConfirm(
+                        'Tệp đã tồn tại trong thư mục',
+                        `Tệp "${file.name}" đã có trong thư mục "${folder ? folder.name : 'gốc'}".\n\nBạn muốn GHI ĐÈ để cập nhật lại tệp này hay TẠO BẢN SAO mới (thêm hậu tố _2, _3)?`,
+                        false,
+                        'Ghi đè tệp này',
+                        'Tạo bản sao mới'
+                    );
+                    overwrite = wantOverwrite;
+                    if (overwrite && existingPage.id === currentActiveId) {
+                        overwrittenActiveId = currentActiveId;
+                    }
+                }
+
+                this.showLoading(`Đang xử lý "${file.name}" vào "${folder ? folder.name : ''}"…`);
                 const form = new FormData();
                 form.append('file', file);
                 form.append('relative_path', relPath);
+                if (overwrite) {
+                    form.append('overwrite', 'true');
+                }
 
                 const res = await fetch('/api/import', { method: 'POST', body: form });
                 if (!res.ok) {
@@ -1077,9 +1324,19 @@ class DocScanApp {
             this.renderFolderTree();
             this.updateFolderHeader();
             this.renderPageList();
-            if (firstId) await this.selectPage(firstId);
+
+            // QUAN TRỌNG: Nếu người dùng đang mở tệp chính (currentActiveId), KHÔNG tự ý cướp quyền
+            // đổi sang tệp mới làm thay đổi tên tệp và gây lưu đè nhầm file.
+            // Chỉ chuyển trang nếu trước đó CHƯA mở tệp nào, HOẶC tệp đang mở vừa được chọn ghi đè.
+            if (!currentActiveId && firstId) {
+                await this.selectPage(firstId);
+            } else if (overwrittenActiveId && this.pages.has(overwrittenActiveId)) {
+                this.activeImageId = null;
+                await this.selectPage(overwrittenActiveId);
+            }
+
             this.updateFolderActionButtons();
-            this.toastOk(`Đã thêm ${added} trang tài liệu và quy đổi lưu ảnh gốc, ảnh đã sửa & metadata vào máy.`);
+            this.toastOk(`Đã thêm ${added} trang tài liệu vào thư mục.`);
         } catch (err) {
             this.toastErr(err.message);
         } finally {
@@ -1225,6 +1482,19 @@ class DocScanApp {
         if (this.btnResetToRawOriginal) this.btnResetToRawOriginal.disabled = !hasActivePage;
         if (this.btnResetCorners) this.btnResetCorners.disabled = !hasActivePage;
         if (this.btnAutoDetect) this.btnAutoDetect.disabled = !hasActivePage;
+        if (this.btnToggleBookSpread) {
+            this.btnToggleBookSpread.disabled = !hasActivePage;
+            const is6 = page && page.corners && page.corners.length === 6;
+            this.btnToggleBookSpread.classList.toggle('active', !!is6);
+            if (this.lblToggleBookSpread) {
+                this.lblToggleBookSpread.textContent = is6 ? 'Bỏ điểm giữa (4 góc)' : '2 trang (gáy giữa)';
+            }
+        }
+        if (this.selAspectPreset) this.selAspectPreset.disabled = !hasActivePage;
+        if (this.btnExpandX) this.btnExpandX.disabled = !hasActivePage;
+        if (this.btnShrinkX) this.btnShrinkX.disabled = !hasActivePage;
+        if (this.btnExpandY) this.btnExpandY.disabled = !hasActivePage;
+        if (this.btnShrinkY) this.btnShrinkY.disabled = !hasActivePage;
         if (this.btnExpandMargin) this.btnExpandMargin.disabled = !hasActivePage;
         if (this.btnShrinkMargin) this.btnShrinkMargin.disabled = !hasActivePage;
         if (this.btnRotateLeft) this.btnRotateLeft.disabled = !hasActivePage;
@@ -1396,6 +1666,7 @@ class DocScanApp {
         }
 
         this.activeImageId = imageId;
+        localStorage.setItem('docscan_active_page', imageId);
         if (!page._savedSnapshot) {
             page._savedSnapshot = {
                 corners: JSON.parse(JSON.stringify(page.corners || [])),
@@ -1419,6 +1690,7 @@ class DocScanApp {
         this.syncInspector(page.settings);
         this.updateMetrics(page);
         this.updateHistoryButtons();
+        this.updateFolderActionButtons();
         this.renderPageList();
         this.resetZoom();
 
@@ -1592,6 +1864,9 @@ class DocScanApp {
         return JSON.stringify([
             page.id, page.corners, page.rotation,
             page.settings.dewarp_enabled, page.settings.dewarp_strength,
+            page.settings.page_size_preset, page.settings.page_orientation,
+            page.settings.page_fit_mode, page.settings.page_margin_pct,
+            page.settings.page_scale_x, page.settings.page_scale_y,
         ]);
     }
 
@@ -1693,8 +1968,11 @@ class DocScanApp {
             this.editedImg = img;
 
             page.outDim = `${res.headers.get('X-Out-Width')} × ${res.headers.get('X-Out-Height')} px`;
-            page.outSize = blob.size;
-            page.outSizeHuman = formatBytes(blob.size);
+            const estSizeBytes = parseInt(res.headers.get('X-Out-Size'), 10);
+            page.outSize = !isNaN(estSizeBytes) && estSizeBytes > 0 ? estSizeBytes : blob.size;
+            page.outSizeHuman = formatBytes(page.outSize);
+            page.baseQualitySize = page.outSize;
+            page.baseQualityRef = page.settings?.quality || 85;
             this.updateMetrics(page);
             this.layoutCanvas();
             this.ensureBaseline();
@@ -1802,7 +2080,7 @@ class DocScanApp {
                 // Chỉ trang nào máy chủ khẳng định đã ghi được mới coi là đã lưu. Trang ghi
                 // thất bại phải GIỮ cờ "chưa lưu", nếu không người dùng thấy "Đã lưu" trong
                 // khi công sức chỉnh sửa đã mất (ổ đầy, tệp bị khoá, hết quyền ghi...).
-                saved += this.markPagesSaved(pages, data.saved_filenames);
+                saved += this.markPagesSaved(pages, data.saved_filenames, data.saved_details);
                 (data.failed_pages || []).forEach(f => failures.push(f));
             } catch (err) {
                 failures.push({ filename: '', reason: err.message });
@@ -1827,7 +2105,7 @@ class DocScanApp {
      * Đánh dấu đã lưu cho đúng những trang máy chủ báo thành công.
      * savedFilenames vắng mặt thì coi như tất cả thành công (tương thích ngược).
      */
-    markPagesSaved(pages, savedFilenames) {
+    markPagesSaved(pages, savedFilenames, savedDetails = null) {
         const ok = Array.isArray(savedFilenames) ? new Set(savedFilenames) : null;
         let count = 0;
         pages.forEach(p => {
@@ -1841,6 +2119,18 @@ class DocScanApp {
                 docName: p.docName || '',
                 annotations: JSON.parse(JSON.stringify(p.annotations || [])),
             };
+            if (savedDetails && savedDetails[p.filename]) {
+                const info = savedDetails[p.filename];
+                p.outSize = info.file_size;
+                p.outSizeHuman = info.file_size_human;
+                p.editedSize = info.file_size;
+                p.editedSizeHuman = info.file_size_human;
+                p.baseQualitySize = info.file_size;
+                p.baseQualityRef = p.settings?.quality || 85;
+                if (p.id === this.activeImageId) {
+                    this.updateMetrics(p);
+                }
+            }
             this.dirtyPages.delete(p.id);
             count++;
         });
@@ -1889,7 +2179,7 @@ class DocScanApp {
         this.showLoading(`Đang lưu ${dirty.length} trang vào máy tính…`);
         try {
             const data = await apiJson('/api/save-project', { folders });
-            const saved = this.markPagesSaved(dirty, data.saved_filenames);
+            const saved = this.markPagesSaved(dirty, data.saved_filenames, data.saved_details);
             this.updateSaveState();
             this.updateFolderActionButtons();
             this.renderPageList();
@@ -1949,6 +2239,7 @@ class DocScanApp {
                 margin_percent: 0.0,
             });
             page.corners = data.corners;
+            this.updateFolderActionButtons();
             this.drawCanvas();
             this.requestPreview();
             this.toastOk(data.detected
@@ -1959,6 +2250,223 @@ class DocScanApp {
         }
     }
 
+    applyAspectRatio(presetKey) {
+        const page = this.getActivePage();
+        if (!page || !page.corners || page.corners.length < 4) return;
+        this.ensureCornerView();
+
+        const pts = page.corners;
+        const cx = pts.reduce((s, p) => s + p[0], 0) / pts.length;
+        const cy = pts.reduce((s, p) => s + p[1], 0) / pts.length;
+        const rot = (page.rotation || 0) % 360;
+        const isSwapped = (rot === 90 || rot === 270);
+
+        // Đo kích thước khung hiện tại trên màn hình
+        let curW, curH;
+        if (isSwapped) {
+            const minX = Math.min(...pts.map(p => p[1]));
+            const maxX = Math.max(...pts.map(p => p[1]));
+            const minY = Math.min(...pts.map(p => p[0]));
+            const maxY = Math.max(...pts.map(p => p[0]));
+            curW = Math.max(1, maxX - minX);
+            curH = Math.max(1, maxY - minY);
+        } else {
+            const minX = Math.min(...pts.map(p => p[0]));
+            const maxX = Math.max(...pts.map(p => p[0]));
+            const minY = Math.min(...pts.map(p => p[1]));
+            const maxY = Math.max(...pts.map(p => p[1]));
+            curW = Math.max(1, maxX - minX);
+            curH = Math.max(1, maxY - minY);
+        }
+
+        const isLandscape = curW >= curH;
+        let targetRatio = 1.0;
+        let ratioName = '1:1';
+
+        switch (presetKey) {
+            case 'a4':
+                targetRatio = isLandscape ? Math.SQRT2 : (1 / Math.SQRT2);
+                ratioName = isLandscape ? 'A4 ngang (1.41:1)' : 'A4 đứng (1:1.41)';
+                break;
+            case 'a4_portrait':
+                targetRatio = 1 / Math.SQRT2;
+                ratioName = 'A4 đứng (1:1.41)';
+                break;
+            case 'a4_landscape':
+                targetRatio = Math.SQRT2;
+                ratioName = 'A4 ngang (1.41:1)';
+                break;
+            case '2:3':
+                targetRatio = isLandscape ? (3 / 2) : (2 / 3);
+                ratioName = isLandscape ? '3:2 ngang' : '2:3 đứng';
+                break;
+            case '2:3_portrait':
+                targetRatio = 2 / 3;
+                ratioName = '2:3 đứng';
+                break;
+            case '3:2_landscape':
+                targetRatio = 3 / 2;
+                ratioName = '3:2 ngang';
+                break;
+            case '16:9':
+                targetRatio = isLandscape ? (16 / 9) : (9 / 16);
+                ratioName = isLandscape ? '16:9 ngang' : '9:16 đứng';
+                break;
+            case '16:9_landscape':
+                targetRatio = 16 / 9;
+                ratioName = '16:9 ngang';
+                break;
+            case '9:16_portrait':
+                targetRatio = 9 / 16;
+                ratioName = '9:16 đứng';
+                break;
+            case '4:3':
+                targetRatio = isLandscape ? (4 / 3) : (3 / 4);
+                ratioName = isLandscape ? '4:3 ngang' : '3:4 đứng';
+                break;
+            case '4:3_landscape':
+                targetRatio = 4 / 3;
+                ratioName = '4:3 ngang';
+                break;
+            case '3:4_portrait':
+                targetRatio = 3 / 4;
+                ratioName = '3:4 đứng';
+                break;
+            case '1:1':
+                targetRatio = 1.0;
+                ratioName = '1:1 vuông';
+                break;
+            default:
+                return;
+        }
+
+        this.pushHistory(`Căn tỉ lệ ${ratioName}`);
+
+        const curRatio = curW / curH;
+        let scaleW = 1.0;
+        let scaleH = 1.0;
+
+        // Giãn rộng chiều thiếu để đạt tỉ lệ chuẩn mà không làm mất nội dung đã chọn
+        if (curRatio < targetRatio) {
+            scaleW = targetRatio / curRatio;
+        } else {
+            scaleH = curRatio / targetRatio;
+        }
+
+        if (isSwapped) {
+            // Khi xoay 90°/270°, chiều ngang màn hình ứng với tọa độ Y của ảnh gốc
+            page.corners = pts.map(([x, y]) => [
+                cx + (x - cx) * scaleH,
+                cy + (y - cy) * scaleW,
+            ]);
+        } else {
+            page.corners = pts.map(([x, y]) => [
+                cx + (x - cx) * scaleW,
+                cy + (y - cy) * scaleH,
+            ]);
+        }
+
+        this.drawCanvas();
+        this.requestPreview();
+        this.toastOk(`Đã giãn khung theo tỉ lệ ${ratioName}.`);
+    }
+
+    expandHorizontal(margin = 0.02) {
+        const page = this.getActivePage();
+        if (!page || !page.corners) return;
+        this.ensureCornerView();
+        this.pushHistory('Giãn rộng chiều ngang 2%');
+
+        const pts = page.corners;
+        const cx = pts.reduce((s, p) => s + p[0], 0) / pts.length;
+        const cy = pts.reduce((s, p) => s + p[1], 0) / pts.length;
+        const factor = 1 + margin * 2;
+        const rot = (page.rotation || 0) % 360;
+        const isSwapped = (rot === 90 || rot === 270);
+
+        if (isSwapped) {
+            page.corners = pts.map(([x, y]) => [x, cy + (y - cy) * factor]);
+        } else {
+            page.corners = pts.map(([x, y]) => [cx + (x - cx) * factor, y]);
+        }
+
+        this.drawCanvas();
+        this.requestPreview();
+        this.toastOk('Đã giãn rộng chiều ngang 2%.');
+    }
+
+    shrinkHorizontal(margin = 0.02) {
+        const page = this.getActivePage();
+        if (!page || !page.corners) return;
+        this.ensureCornerView();
+        this.pushHistory('Thu hẹp chiều ngang 2%');
+
+        const pts = page.corners;
+        const cx = pts.reduce((s, p) => s + p[0], 0) / pts.length;
+        const cy = pts.reduce((s, p) => s + p[1], 0) / pts.length;
+        const factor = 1 - margin * 2;
+        const rot = (page.rotation || 0) % 360;
+        const isSwapped = (rot === 90 || rot === 270);
+
+        if (isSwapped) {
+            page.corners = pts.map(([x, y]) => [x, cy + (y - cy) * factor]);
+        } else {
+            page.corners = pts.map(([x, y]) => [cx + (x - cx) * factor, y]);
+        }
+
+        this.drawCanvas();
+        this.requestPreview();
+        this.toastOk('Đã thu hẹp chiều ngang 2%.');
+    }
+
+    expandVertical(margin = 0.02) {
+        const page = this.getActivePage();
+        if (!page || !page.corners) return;
+        this.ensureCornerView();
+        this.pushHistory('Giãn rộng chiều dọc 2%');
+
+        const pts = page.corners;
+        const cx = pts.reduce((s, p) => s + p[0], 0) / pts.length;
+        const cy = pts.reduce((s, p) => s + p[1], 0) / pts.length;
+        const factor = 1 + margin * 2;
+        const rot = (page.rotation || 0) % 360;
+        const isSwapped = (rot === 90 || rot === 270);
+
+        if (isSwapped) {
+            page.corners = pts.map(([x, y]) => [cx + (x - cx) * factor, y]);
+        } else {
+            page.corners = pts.map(([x, y]) => [x, cy + (y - cy) * factor]);
+        }
+
+        this.drawCanvas();
+        this.requestPreview();
+        this.toastOk('Đã giãn rộng chiều dọc 2%.');
+    }
+
+    shrinkVertical(margin = 0.02) {
+        const page = this.getActivePage();
+        if (!page || !page.corners) return;
+        this.ensureCornerView();
+        this.pushHistory('Thu hẹp chiều dọc 2%');
+
+        const pts = page.corners;
+        const cx = pts.reduce((s, p) => s + p[0], 0) / pts.length;
+        const cy = pts.reduce((s, p) => s + p[1], 0) / pts.length;
+        const factor = 1 - margin * 2;
+        const rot = (page.rotation || 0) % 360;
+        const isSwapped = (rot === 90 || rot === 270);
+
+        if (isSwapped) {
+            page.corners = pts.map(([x, y]) => [cx + (x - cx) * factor, y]);
+        } else {
+            page.corners = pts.map(([x, y]) => [x, cy + (y - cy) * factor]);
+        }
+
+        this.drawCanvas();
+        this.requestPreview();
+        this.toastOk('Đã thu hẹp chiều dọc 2%.');
+    }
+
     expandMargin(margin = 0.02) {
         const page = this.getActivePage();
         if (!page || !page.corners) return;
@@ -1966,8 +2474,8 @@ class DocScanApp {
         this.pushHistory('Mở rộng lề 2%');
 
         const pts = page.corners;
-        const cx = pts.reduce((s, p) => s + p[0], 0) / 4;
-        const cy = pts.reduce((s, p) => s + p[1], 0) / 4;
+        const cx = pts.reduce((s, p) => s + p[0], 0) / pts.length;
+        const cy = pts.reduce((s, p) => s + p[1], 0) / pts.length;
         const factor = 1 + margin * 2;
         page.corners = pts.map(([x, y]) => [cx + (x - cx) * factor, cy + (y - cy) * factor]);
 
@@ -1983,8 +2491,8 @@ class DocScanApp {
         this.pushHistory('Thu hẹp lề 2%');
 
         const pts = page.corners;
-        const cx = pts.reduce((s, p) => s + p[0], 0) / 4;
-        const cy = pts.reduce((s, p) => s + p[1], 0) / 4;
+        const cx = pts.reduce((s, p) => s + p[0], 0) / pts.length;
+        const cy = pts.reduce((s, p) => s + p[1], 0) / pts.length;
         const factor = 1 - margin * 2;
         page.corners = pts.map(([x, y]) => [cx + (x - cx) * factor, cy + (y - cy) * factor]);
 
@@ -1993,15 +2501,56 @@ class DocScanApp {
         this.toastOk('Đã thu hẹp lề 2%.');
     }
 
+    toggleBookSpread() {
+        const page = this.getActivePage();
+        if (!page) return;
+        this.ensureCornerView();
+        const corners = page.corners || this.fullFrameCorners(page.width, page.height);
+
+        if (corners.length === 6) {
+            this.pushHistory('Chuyển về 4 góc (1 trang)');
+            // Giữ lại 4 góc ngoài: TL (0), TR (2), BR (3), BL (5)
+            page.corners = [corners[0], corners[2], corners[3], corners[5]];
+            this.toastOk('Đã chuyển về chế độ 4 góc đơn trang.');
+        } else {
+            this.pushHistory('Thêm 2 điểm giữa (2 trang / Sách / Hộ chiếu)');
+            const [tl, tr, br, bl] = corners.length === 4 ? corners : this.fullFrameCorners(page.width, page.height);
+            const tm = [Math.round((tl[0] + tr[0]) / 2), Math.round((tl[1] + tr[1]) / 2)];
+            const bm = [Math.round((bl[0] + br[0]) / 2), Math.round((bl[1] + br[1]) / 2)];
+            page.corners = [tl, tm, tr, br, bm, bl];
+            this.toastOk('Đã thêm 2 điểm gáy giữa. Hãy kéo 2 điểm màu cam vào nếp gấp giữa 2 trang.');
+        }
+
+        this.updateFolderActionButtons();
+        this.drawCanvas();
+        this.requestPreview();
+        this.scheduleMetaSave();
+    }
+
     setCornersToFullFrame() {
         const page = this.getActivePage();
         if (!page) return;
         this.ensureCornerView();
         this.pushHistory('Bao trọn toàn ảnh');
-        page.corners = this.fullFrameCorners(page.width, page.height);
+        if (page.corners && page.corners.length === 6) {
+            const w = Math.max(1, page.width || 1);
+            const h = Math.max(1, page.height || 1);
+            page.corners = [
+                [0, 0],
+                [Math.round((w - 1) / 2), 0],
+                [w - 1, 0],
+                [w - 1, h - 1],
+                [Math.round((w - 1) / 2), h - 1],
+                [0, h - 1],
+            ];
+            this.toastOk('Đã đặt 6 điểm bao trọn toàn bộ ảnh.');
+        } else {
+            page.corners = this.fullFrameCorners(page.width, page.height);
+            this.toastOk('Đã đặt 4 góc bao trọn toàn bộ ảnh.');
+        }
+        this.updateFolderActionButtons();
         this.drawCanvas();
         this.requestPreview();
-        this.toastOk('Đã đặt 4 góc bao trọn toàn bộ ảnh.');
     }
 
     async resetToOriginal() {
@@ -2020,6 +2569,7 @@ class DocScanApp {
         page.rotation = 0;
         page.settings = { ...DEFAULT_SETTINGS };
         page.corners = this.fullFrameCorners(page.width, page.height);
+        this.updateFolderActionButtons();
         this.syncInspector(page.settings);
         this.clearBaseline();
         this.drawCanvas();
@@ -2042,7 +2592,7 @@ class DocScanApp {
         if (!page) return;
         const ok = await this.askConfirm(
             'Lưu ảnh sửa thành ảnh gốc',
-            'Ảnh gốc cũ trong thư mục _goc/ sẽ được thay thế bằng bản ảnh nét hiện tại và lịch sử hoàn tác được làm mới. Bạn vẫn tiếp tục chỉnh sửa được trên nền ảnh mới.',
+            `Bạn đang lưu bản ảnh đang sửa thành ảnh gốc cho tệp:\n"${page.filename}"\n\nẢnh gốc cũ trong thư mục _goc/ sẽ được thay thế bằng bản ảnh nét hiện tại và lịch sử hoàn tác được làm mới. Bạn vẫn tiếp tục chỉnh sửa được trên nền ảnh mới.`,
             false,
             'Lưu thành ảnh gốc',
             'Hủy'
@@ -2066,7 +2616,7 @@ class DocScanApp {
             this.activeImageId = null;
             await this.selectPage(updated.id);
             this.updateSaveState();
-            this.toastOk('Đã lưu ảnh sửa thành ảnh gốc.');
+            this.toastOk(`Đã lưu ảnh sửa thành ảnh gốc cho tệp "${updated.filename}".`);
         } catch (err) {
             this.toastErr(err.message);
         } finally {
@@ -2116,6 +2666,7 @@ class DocScanApp {
         this.drawCanvas();
         this.requestPreview();
         this.updateHistoryButtons();
+        this.updateFolderActionButtons();
         this.updateAnnotationActionButtons();
     }
 
@@ -2156,6 +2707,7 @@ class DocScanApp {
     setWorkflowTab(tab) {
         this.activeTab = tab;
         this.btnTabCrop?.classList.toggle('active', tab === WORKFLOW_TAB.CROP);
+        this.btnTabPageSize?.classList.toggle('active', tab === WORKFLOW_TAB.PAGESIZE);
         this.btnTabColor?.classList.toggle('active', tab === WORKFLOW_TAB.COLOR);
         this.btnTabAnnotate?.classList.toggle('active', tab === WORKFLOW_TAB.ANNOTATE);
 
@@ -2168,9 +2720,21 @@ class DocScanApp {
             floatingToolbar.style.display = (tab === WORKFLOW_TAB.CROP) ? 'flex' : 'none';
         }
 
+        // Tự động cuộn đến phần điều khiển tương ứng trên bảng bên phải
+        if (tab === WORKFLOW_TAB.PAGESIZE && this.sectionPageSize) {
+            this.sectionPageSize.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+        } else if (tab === WORKFLOW_TAB.COLOR) {
+            const colorSec = $('sectionColorFilter');
+            if (colorSec) colorSec.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+        }
+
         if (tab === WORKFLOW_TAB.CROP) {
             this.viewMode = VIEW.EDIT;
             this.showHandles = true;
+        } else if (tab === WORKFLOW_TAB.PAGESIZE) {
+            this.viewMode = VIEW.COMPARE;
+            this.showHandles = false;
+            this.ensureBaseline();
         } else if (tab === WORKFLOW_TAB.COLOR) {
             this.viewMode = VIEW.COMPARE;
             this.showHandles = false;
@@ -2183,6 +2747,36 @@ class DocScanApp {
         this.btnModeEdit?.classList.toggle('active', this.viewMode === VIEW.EDIT);
         this.btnModeCompare?.classList.toggle('active', this.viewMode === VIEW.COMPARE);
         this.layoutCanvas();
+    }
+
+    updatePageSizeMetric(page) {
+        if (!this.lblPageSizeMetric || !page) return;
+        const preset = page.settings.page_size_preset || 'original';
+        const labels = {
+            'original': 'Khổ gốc: Tự do theo góc cắt',
+            'a4': 'A4: 210 × 297 mm (Chuẩn văn bản & In ấn)',
+            'a5': 'A5: 148 × 210 mm (Sổ tay)',
+            'a3': 'A3: 297 × 420 mm (Bản vẽ lớn)',
+            'letter': 'Letter: 8.5 × 11 in (216 × 279 mm)',
+            'passport': 'Passport: 35 × 45 mm (Ảnh thẻ hộ chiếu)',
+            'passport_4x6': 'Ảnh thẻ: 4 × 6 cm',
+            'passport_spread': 'Hộ chiếu 2 trang mở: 125 × 176 mm',
+            'id_card': 'Căn cước công dân / Bằng lái: 85.6 × 54 mm',
+            'ratio_2_3': 'Tỉ lệ 2:3 / 3:2 (Chuẩn ảnh chụp)',
+            'ratio_16_9': 'Tỉ lệ 16:9 (Màn hình rộng / Slide)',
+            'ratio_4_3': 'Tỉ lệ 4:3 (Tài liệu / iPad)',
+            'ratio_1_1': 'Tỉ lệ 1:1 (Vuông)',
+        };
+        const orient = page.settings.page_orientation || 'auto';
+        const orientText = orient === 'portrait' ? ' [Dọc]' : (orient === 'landscape' ? ' [Ngang]' : '');
+        const sx = Math.round((page.settings.page_scale_x ?? 1.0) * 100);
+        const sy = Math.round((page.settings.page_scale_y ?? 1.0) * 100);
+        let stretchInfo = '';
+        if (sx !== 100 || sy !== 100) {
+            stretchInfo = ` [Co giãn: X ${sx}% · Y ${sy}%]`;
+        }
+        const fitInfo = (page.settings.page_fit_mode === 'crop') ? ' · Cắt xén' : (preset !== 'original' ? ' · Co giãn phủ kín' : '');
+        this.lblPageSizeMetric.textContent = (labels[preset] || 'Khổ chuẩn') + orientText + fitInfo + stretchInfo;
     }
 
     setViewMode(mode) {
@@ -2372,7 +2966,7 @@ class DocScanApp {
         ctx.save();
         ctx.beginPath();
         ctx.moveTo(pts[0][0], pts[0][1]);
-        for (let i = 1; i < 4; i++) ctx.lineTo(pts[i][0], pts[i][1]);
+        for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]);
         ctx.closePath();
 
         ctx.fillStyle = 'rgba(56, 189, 248, 0.10)';
@@ -2381,28 +2975,90 @@ class DocScanApp {
         ctx.lineWidth = 2;
         ctx.stroke();
 
-        // Lưới 1/3 giúp căn tài liệu cân đối
-        ctx.strokeStyle = 'rgba(56, 189, 248, 0.28)';
-        ctx.lineWidth = 1;
-        for (let i = 1; i <= 2; i++) {
-            const t = i / 3;
-            const top = this.lerp(pts[0], pts[1], t);
-            const bottom = this.lerp(pts[3], pts[2], t);
-            const left = this.lerp(pts[0], pts[3], t);
-            const right = this.lerp(pts[1], pts[2], t);
-            ctx.beginPath(); ctx.moveTo(top[0], top[1]); ctx.lineTo(bottom[0], bottom[1]); ctx.stroke();
-            ctx.beginPath(); ctx.moveTo(left[0], left[1]); ctx.lineTo(right[0], right[1]); ctx.stroke();
+        if (pts.length === 6) {
+            // Điểm giữa: pts[1] là Gáy trên, pts[4] là Gáy dưới
+            // Vẽ đường trục gáy sách / nếp gấp giữa hai trang
+            ctx.save();
+            ctx.beginPath();
+            ctx.setLineDash([6, 4]);
+            ctx.moveTo(pts[1][0], pts[1][1]);
+            ctx.lineTo(pts[4][0], pts[4][1]);
+            ctx.strokeStyle = '#f59e0b';
+            ctx.lineWidth = 2.5;
+            ctx.stroke();
+            ctx.restore();
+
+            // Vẽ lưới 1/2 cho trang trái và trang phải
+            ctx.strokeStyle = 'rgba(56, 189, 248, 0.22)';
+            ctx.lineWidth = 1;
+            // Trang trái: [0 (TL), 1 (TM), 4 (BM), 5 (BL)]
+            const topL = this.lerp(pts[0], pts[1], 0.5);
+            const botL = this.lerp(pts[5], pts[4], 0.5);
+            const midLL = this.lerp(pts[0], pts[5], 0.5);
+            const midLR = this.lerp(pts[1], pts[4], 0.5);
+            ctx.beginPath(); ctx.moveTo(topL[0], topL[1]); ctx.lineTo(botL[0], botL[1]); ctx.stroke();
+            ctx.beginPath(); ctx.moveTo(midLL[0], midLL[1]); ctx.lineTo(midLR[0], midLR[1]); ctx.stroke();
+
+            // Trang phải: [1 (TM), 2 (TR), 3 (BR), 4 (BM)]
+            const topR = this.lerp(pts[1], pts[2], 0.5);
+            const botR = this.lerp(pts[4], pts[3], 0.5);
+            const midRL = this.lerp(pts[1], pts[4], 0.5);
+            const midRR = this.lerp(pts[2], pts[3], 0.5);
+            ctx.beginPath(); ctx.moveTo(topR[0], topR[1]); ctx.lineTo(botR[0], botR[1]); ctx.stroke();
+            ctx.beginPath(); ctx.moveTo(midRL[0], midRL[1]); ctx.lineTo(midRR[0], midRR[1]); ctx.stroke();
+        } else {
+            // Lưới 1/3 giúp căn tài liệu cân đối (4 góc thông thường)
+            ctx.strokeStyle = 'rgba(56, 189, 248, 0.28)';
+            ctx.lineWidth = 1;
+            for (let i = 1; i <= 2; i++) {
+                const t = i / 3;
+                const top = this.lerp(pts[0], pts[1], t);
+                const bottom = this.lerp(pts[3], pts[2], t);
+                const left = this.lerp(pts[0], pts[3], t);
+                const right = this.lerp(pts[1], pts[2], t);
+                ctx.beginPath(); ctx.moveTo(top[0], top[1]); ctx.lineTo(bottom[0], bottom[1]); ctx.stroke();
+                ctx.beginPath(); ctx.moveTo(left[0], left[1]); ctx.lineTo(right[0], right[1]); ctx.stroke();
+            }
         }
 
         pts.forEach(([x, y], i) => {
             const active = i === this.draggingCornerIndex;
+            const isMidPoint = (pts.length === 6 && (i === 1 || i === 4));
+            const r = active ? this.handleRadius + 4 : this.handleRadius;
+
+            // 1. Chấm tròn bán trong suốt (Transparent) giúp nhìn xuyên thấu mép giấy bên dưới
             ctx.beginPath();
-            ctx.arc(x, y, active ? this.handleRadius + 3 : this.handleRadius, 0, Math.PI * 2);
-            ctx.fillStyle = active ? '#0ea5e9' : '#38bdf8';
+            ctx.arc(x, y, r, 0, Math.PI * 2);
+            if (isMidPoint) {
+                ctx.fillStyle = active ? 'rgba(245, 158, 11, 0.55)' : 'rgba(245, 158, 11, 0.35)';
+                ctx.strokeStyle = active ? '#fbbf24' : '#f59e0b';
+            } else {
+                ctx.fillStyle = active ? 'rgba(56, 189, 248, 0.55)' : 'rgba(56, 189, 248, 0.35)';
+                ctx.strokeStyle = active ? '#38bdf8' : '#ffffff';
+            }
             ctx.fill();
-            ctx.strokeStyle = '#ffffff';
-            ctx.lineWidth = 3;
+            ctx.lineWidth = active ? 2.5 : 2;
             ctx.stroke();
+
+            // 2. Chữ thập & Tâm định vị (Crosshair & Center Bullseye) để dễ căn mép chuẩn xác
+            ctx.save();
+            ctx.beginPath();
+            ctx.moveTo(x - r + 3, y);
+            ctx.lineTo(x + r - 3, y);
+            ctx.moveTo(x, y - r + 3);
+            ctx.lineTo(x, y + r - 3);
+            ctx.strokeStyle = 'rgba(255, 255, 255, 0.85)';
+            ctx.lineWidth = 1.2;
+            ctx.stroke();
+
+            ctx.beginPath();
+            ctx.arc(x, y, 2.5, 0, Math.PI * 2);
+            ctx.fillStyle = '#ffffff';
+            ctx.fill();
+            ctx.strokeStyle = 'rgba(0, 0, 0, 0.5)';
+            ctx.lineWidth = 1;
+            ctx.stroke();
+            ctx.restore();
         });
         ctx.restore();
     }
@@ -3589,8 +4245,22 @@ class DocScanApp {
         if (!this.magLens || !this.originalImg) return;
         this.magLens.style.display = 'block';
 
-        const labels = ['Góc trên - trái', 'Góc trên - phải', 'Góc dưới - phải', 'Góc dưới - trái'];
-        this.lensLabel.textContent = labels[cornerIdx] || 'Góc';
+        const page = this.getActivePage();
+        const is6 = page && page.corners && page.corners.length === 6;
+        const labels = is6 ? [
+            'Góc trên - trái',
+            'Gáy trên (điểm giữa)',
+            'Góc trên - phải',
+            'Góc dưới - phải',
+            'Gáy dưới (điểm giữa)',
+            'Góc dưới - trái',
+        ] : [
+            'Góc trên - trái',
+            'Góc trên - phải',
+            'Góc dưới - phải',
+            'Góc dưới - trái',
+        ];
+        this.lensLabel.textContent = labels[cornerIdx] || 'Điểm mốc';
 
         const dpr = this.dpr || 1;
         const mw = this.magCanvas.width;
@@ -3769,6 +4439,7 @@ class DocScanApp {
                     await this.selectPage(remaining[0]);
                 } else {
                     this.activeImageId = null;
+                    localStorage.removeItem('docscan_active_page');
                     this.editorStage.style.display = 'none';
                     this.emptyState.style.display = 'flex';
                     this.docNameWrapper.style.display = 'none';
@@ -4071,6 +4742,7 @@ class DocScanApp {
                 relative_path: page.relativePath,
                 filename: page.filename,
                 format,
+                quality: page.settings?.quality,
                 doc_name: title,
             }, savePath);
             this.toastOk(this.savedMessage(`ảnh ${ext.toUpperCase()}`, data));
@@ -4089,12 +4761,45 @@ class DocScanApp {
         if (!settings) return;
         this.modeCards.forEach(c => c.classList.toggle('active', c.dataset.mode === (settings.mode || 'natural')));
 
+        const pct = (v, d) => Math.round((v ?? d) * 100);
+        if (this.rngFilterIntensity) {
+            this.rngFilterIntensity.value = pct(settings.filter_intensity, 1.0);
+            this.valFilterIntensity.textContent = `${this.rngFilterIntensity.value}%`;
+            if (this.filterIntensityGroup) {
+                this.filterIntensityGroup.style.opacity = (settings.mode === 'original') ? '0.4' : '1';
+                this.rngFilterIntensity.disabled = (settings.mode === 'original');
+            }
+        }
+
+        // Bước 2: Khổ ảnh chuẩn
+        if (this.selPageSizePreset) {
+            this.selPageSizePreset.value = settings.page_size_preset || 'original';
+        }
+        const orient = settings.page_orientation || 'auto';
+        document.querySelectorAll('#segPageOrientation .ann-seg-btn').forEach(b => {
+            b.classList.toggle('active', b.dataset.orientation === orient);
+        });
+        const fit = settings.page_fit_mode || 'fill';
+        document.querySelectorAll('#segPageFitMode .ann-seg-btn').forEach(b => {
+            b.classList.toggle('active', b.dataset.fit === fit);
+        });
+        const sx = Math.round((settings.page_scale_x ?? 1.0) * 100);
+        const sy = Math.round((settings.page_scale_y ?? 1.0) * 100);
+        if (this.valStep2ScaleX) this.valStep2ScaleX.textContent = `${sx}%`;
+        if (this.valStep2ScaleY) this.valStep2ScaleY.textContent = `${sy}%`;
+        if (this.rngPageMargin) {
+            const m = Math.round((settings.page_margin_pct ?? 0.0) * 100);
+            this.rngPageMargin.value = m;
+            if (this.valPageMargin) this.valPageMargin.textContent = `${m}%`;
+        }
+        const activeP = this.getActivePage();
+        if (activeP) this.updatePageSizeMetric(activeP);
+
         this.chkDewarp.checked = !!settings.dewarp_enabled;
         this.dewarpStrengthGroup.style.display = settings.dewarp_enabled ? 'flex' : 'none';
         this.rngDewarp.value = settings.dewarp_strength ?? 0.8;
         this.valDewarp.textContent = this.rngDewarp.value;
 
-        const pct = (v, d) => Math.round((v ?? d) * 100);
         this.rngShadow.value = pct(settings.shadow_reduction, 0.6);
         this.valShadow.textContent = `${this.rngShadow.value}%`;
         this.rngSharpness.value = pct(settings.sharpness, 0.6);

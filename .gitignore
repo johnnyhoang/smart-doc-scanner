@@ -1,41 +1,23 @@
-# Byte-compiled / optimized / DLL files
+# Python
 __pycache__/
 *.py[cod]
-*.class
-
-# C extensions
+*$py.class
 *.so
-
-# Distribution / packaging
-build/
-dist/
-*.egg-info/
-
-# Virtual environments
+.Python
+env/
 venv/
 .venv/
-env/
+ENV/
+.env
 
-# Test & generated sample outputs
-test_*.jpg
-test_*.png
-test_*.jpeg
-test_*.pdf
-test_*.webp
-output_*.jpg
-output_*.png
-output_*.jpeg
-output_*.pdf
-output_*.webp
-
-# IDEs and editors
-.idea/
-.vscode/
-*.swp
-*.swo
-*~
-
-# Operating System Files
+# OS
 .DS_Store
 Thumbs.db
-desktop.ini
+
+# App outputs & runtime files
+_goc/
+.docscan_meta.json
+output_*.jpg
+output_*.png
+output_*.pdf
+*.log

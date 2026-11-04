@@ -108,6 +108,25 @@ def test_nhap_trung_ten_khong_ghi_de():
         p.close()
 
 
+def test_nhap_trung_ten_co_ghi_de_khi_yeu_cau():
+    p = Project()
+    try:
+        a = p.import_page("Trang.jpg")
+        with open(SAMPLE_IMAGE, "rb") as f:
+            blob = f.read()
+        res = p.client.post(
+            "/api/import",
+            files={"file": ("Trang.jpg", blob, "image/jpeg")},
+            data={"relative_path": "", "overwrite": "true"},
+        )
+        assert res.status_code == 200, res.text
+        b = res.json()
+        assert a["filename"] == b["filename"], f"Lẽ ra phải ghi đè nhưng lại tạo tên mới {b['filename']}"
+        assert len(p.scan("")) == 1, "Sau khi ghi đè số trang phải giữ nguyên là 1"
+    finally:
+        p.close()
+
+
 # ==========================================================
 # ĐỔI TÊN — PHẢI ĐỔI CẢ BỘ BA
 # ==========================================================

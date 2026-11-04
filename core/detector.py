@@ -61,21 +61,23 @@ def order_points(pts: np.ndarray) -> np.ndarray:
 
 def expand_quad(pts: np.ndarray, img_shape: Tuple[int, int], margin_percent: float = 0.02) -> np.ndarray:
     """
-    Expands the quadrilateral outward by margin_percent (e.g. 2%, 5%)
+    Expands the quadrilateral or 6-point polygon outward by margin_percent (e.g. 2%, 5%)
     from its centroid without clamping to image boundaries, allowing margin extension
     even when document touches photo edges.
     """
-    pts = order_points(pts)
+    pts = np.asarray(pts, dtype=np.float32)
     h, w = img_shape[:2]
+    if len(pts) == 4:
+        pts = order_points(pts)
 
-    # Calculate center of the quad
+    # Calculate center of the polygon
     centroid = np.mean(pts, axis=0)
 
     # Scale each point away from the centroid
     expanded = np.zeros_like(pts)
     scale = 1.0 + (margin_percent * 2.0)
 
-    for i in range(4):
+    for i in range(len(pts)):
         vec = pts[i] - centroid
         expanded[i] = centroid + vec * scale
 
@@ -83,7 +85,66 @@ def expand_quad(pts: np.ndarray, img_shape: Tuple[int, int], margin_percent: flo
     expanded[:, 0] = np.clip(expanded[:, 0], -w * 0.25, w * 1.25)
     expanded[:, 1] = np.clip(expanded[:, 1], -h * 0.25, h * 1.25)
 
-    return expanded.astype(np.float32)
+    return expanded
+
+
+def expand_quad_directional(
+    pts: np.ndarray,
+    img_shape: Tuple[int, int],
+    factor_x: float = 1.0,
+    factor_y: float = 1.0,
+) -> np.ndarray:
+    """
+    Giãn rộng/thu hẹp đa giác 4 điểm hoặc 6 điểm theo từng chiều riêng biệt (X và Y).
+    """
+    pts = np.asarray(pts, dtype=np.float32)
+    h, w = img_shape[:2]
+    centroid = np.mean(pts, axis=0)
+    cx, cy = centroid[0], centroid[1]
+
+    expanded = np.zeros_like(pts)
+    for i in range(len(pts)):
+        expanded[i, 0] = cx + (pts[i, 0] - cx) * factor_x
+        expanded[i, 1] = cy + (pts[i, 1] - cy) * factor_y
+
+    expanded[:, 0] = np.clip(expanded[:, 0], -w * 0.25, w * 1.25)
+    expanded[:, 1] = np.clip(expanded[:, 1], -h * 0.25, h * 1.25)
+    return expanded
+
+
+def fit_quad_aspect_ratio(
+    pts: np.ndarray,
+    img_shape: Tuple[int, int],
+    target_ratio: float,
+    expand: bool = True,
+) -> np.ndarray:
+    """
+    Căn chỉnh đa giác 4 góc hoặc 6 điểm theo tỉ lệ khung hình chuẩn (A4, 2:3, 16:9, 4:3, 1:1).
+    Nếu expand=True, giãn rộng chiều thiếu để bao trọn nội dung cũ (không cắt xén).
+    """
+    pts = np.asarray(pts, dtype=np.float32)
+    min_x, max_x = np.min(pts[:, 0]), np.max(pts[:, 0])
+    min_y, max_y = np.min(pts[:, 1]), np.max(pts[:, 1])
+    cur_w = max(1.0, float(max_x - min_x))
+    cur_h = max(1.0, float(max_y - min_y))
+    cur_ratio = cur_w / cur_h
+
+    if expand:
+        if cur_ratio < target_ratio:
+            factor_x = target_ratio / cur_ratio
+            factor_y = 1.0
+        else:
+            factor_x = 1.0
+            factor_y = cur_ratio / target_ratio
+    else:
+        if cur_ratio < target_ratio:
+            factor_x = 1.0
+            factor_y = cur_ratio / target_ratio
+        else:
+            factor_x = target_ratio / cur_ratio
+            factor_y = 1.0
+
+    return expand_quad_directional(pts, img_shape, factor_x, factor_y).astype(np.float32)
 
 
 def find_quad_contour(binary_img: np.ndarray, min_area: float) -> Optional[np.ndarray]:
@@ -180,12 +241,105 @@ def detect_document_corners(image: np.ndarray, margin_percent: float = 0.0) -> T
     return corners, detected
 
 
+def six_point_book_transform(image: np.ndarray, pts: np.ndarray) -> np.ndarray:
+    """
+    Nắn thẳng tài liệu dạng 2 trang dính nhau (Sách / Hộ chiếu) dựa trên 6 điểm:
+        0: Top-Left (Góc trên-trái)
+        1: Top-Middle (Gáy trên / điểm giữa trên)
+        2: Top-Right (Góc trên-phải)
+        3: Bottom-Right (Góc dưới-phải)
+        4: Bottom-Middle (Gáy dưới / điểm giữa dưới)
+        5: Bottom-Left (Góc dưới-trái)
+    Chia đôi thành 2 hình thang/tứ giác (trang trái & trang phải), nắn thẳng từng trang
+    và ghép phẳng hoàn hảo tại trục gáy sách.
+    """
+    pts = np.asarray(pts, dtype=np.float32)
+    h, w = image.shape[:2]
+    min_x = np.min(pts[:, 0])
+    max_x = np.max(pts[:, 0])
+    min_y = np.min(pts[:, 1])
+    max_y = np.max(pts[:, 1])
+
+    pad_left = int(max(0, -min_x + 10))
+    pad_top = int(max(0, -min_y + 10))
+    pad_right = int(max(0, max_x - (w - 1) + 10))
+    pad_bottom = int(max(0, max_y - (h - 1) + 10))
+
+    if pad_left > 0 or pad_top > 0 or pad_right > 0 or pad_bottom > 0:
+        padded_img = cv2.copyMakeBorder(
+            image,
+            pad_top, pad_bottom, pad_left, pad_right,
+            borderType=cv2.BORDER_REPLICATE
+        )
+        adj_pts = pts.copy()
+        adj_pts[:, 0] += pad_left
+        adj_pts[:, 1] += pad_top
+    else:
+        padded_img = image
+        adj_pts = pts.copy()
+
+    tl, tm, tr, br, bm, bl = adj_pts
+
+    # Kích thước ước tính trang trái & trang phải
+    top_l = np.hypot(tm[0] - tl[0], tm[1] - tl[1])
+    bot_l = np.hypot(bm[0] - bl[0], bm[1] - bl[1])
+    w_l = max(int(round(max(top_l, bot_l))), 50)
+
+    top_r = np.hypot(tr[0] - tm[0], tr[1] - tm[1])
+    bot_r = np.hypot(br[0] - bm[0], br[1] - bm[1])
+    w_r = max(int(round(max(top_r, bot_r))), 50)
+
+    h_l = np.hypot(bl[0] - tl[0], bl[1] - tl[1])
+    h_m = np.hypot(bm[0] - tm[0], bm[1] - tm[1])
+    h_r = np.hypot(br[0] - tr[0], br[1] - tr[1])
+    target_h = max(int(round(max(h_l, h_m, h_r))), 50)
+
+    # Sách / Hộ chiếu mở đôi có 2 trang bằng nhau 100% -> cân bằng kích thước 2 bên
+    page_w = max(w_l, w_r)
+
+    # Nắn trang trái: [TL, TM, BM, BL] -> [0..page_w, 0..target_h]
+    src_l = np.array([tl, tm, bm, bl], dtype=np.float32)
+    dst_l = np.array([
+        [0, 0],
+        [page_w, 0],
+        [page_w, target_h],
+        [0, target_h]
+    ], dtype=np.float32)
+    m_l = cv2.getPerspectiveTransform(src_l, dst_l)
+    warp_l = cv2.warpPerspective(
+        padded_img, m_l, (page_w, target_h),
+        flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE
+    )
+
+    # Nắn trang phải: [TM, TR, BR, BM] -> [0..page_w, 0..target_h]
+    src_r = np.array([tm, tr, br, bm], dtype=np.float32)
+    dst_r = np.array([
+        [0, 0],
+        [page_w, 0],
+        [page_w, target_h],
+        [0, target_h]
+    ], dtype=np.float32)
+    m_r = cv2.getPerspectiveTransform(src_r, dst_r)
+    warp_r = cv2.warpPerspective(
+        padded_img, m_r, (page_w, target_h),
+        flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE
+    )
+
+    # Ghép phẳng 2 trang liền nhau tại trục gáy (2 bên đều nhau 100%)
+    combined = np.hstack([warp_l, warp_r])
+    return combined
+
+
 def four_point_transform(image: np.ndarray, pts: np.ndarray) -> np.ndarray:
     """
-    Warps a quadrilateral document into a straight rectangle.
+    Warps a quadrilateral or 6-point book spread document into a straight flat image.
     If points extend beyond image boundaries (e.g. from 2% margin expansion on edge-touching photos),
     automatically extrapolates the paper borders using high-quality texture synthesis / replication.
     """
+    pts = np.asarray(pts, dtype=np.float32)
+    if len(pts) == 6:
+        return six_point_book_transform(image, pts)
+
     rect = order_points(pts)
     (tl, tr, br, bl) = rect
 

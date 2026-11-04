@@ -49,8 +49,8 @@ def extract_horizontal_flows(gray: np.ndarray, num_bands: int = 10, num_cols: in
         expected_y = (y_start + y_end) / 2.0
         diff = col_centers - expected_y
 
-        # Clamp max deviation to at most 3% of image height to prevent distortion
-        max_dev = h * 0.035
+        # Clamp max deviation to allow noticeable curve correction (up to 8% of image height)
+        max_dev = h * 0.08
         diff = np.clip(diff, -max_dev, max_dev)
 
         # Smooth curve fit
@@ -88,11 +88,12 @@ def generate_unwrinkle_mesh(
     if offsets is not None:
         resized_offsets = cv2.resize(offsets, (cols, rows), interpolation=cv2.INTER_CUBIC)
         
-        # Lock borders
-        resized_offsets[0, :] = 0
-        resized_offsets[-1, :] = 0
+        # Lock left and right edges to preserve document width
         resized_offsets[:, 0] = 0
         resized_offsets[:, -1] = 0
+        # Smoothly taper top and bottom edges rather than hard zeroing
+        resized_offsets[0, :] *= 0.5
+        resized_offsets[-1, :] *= 0.5
 
         src_x = dst_x.copy()
         src_y = dst_y + resized_offsets
