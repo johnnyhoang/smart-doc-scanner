@@ -185,59 +185,16 @@ UNAPPROVED_ALIASES = {
 
 
 def is_unapproved_name(name: Optional[str]) -> bool:
-    if not name:
-        return False
-    cleaned = str(name).strip().lower().replace("-", "_")
-    if cleaned in UNAPPROVED_ALIASES:
-        return True
-    cleaned_spaces = str(name).strip().lower().replace("_", " ")
-    return cleaned_spaces in UNAPPROVED_ALIASES
+    return False
 
 
 def display_folder_name(raw_name: str, rel: Optional[str]) -> str:
-    rel_clean = normalize_rel(rel)
-    if is_unapproved_name(rel_clean) or is_unapproved_name(raw_name):
-        return UNAPPROVED_LABEL
     return raw_name
 
 
 def merge_unapproved_folders_if_needed(root_abs: str) -> List[str]:
-    """
-    Gộp các thư mục "Kho chưa duyệt" trùng lặp (ví dụ tồn tại đồng thời
-    'Kho_Chua_Duyet' và 'Kho ảnh chưa duyệt' do các bản cũ tạo ra) về một thư mục
-    chuẩn duy nhất là UNAPPROVED_DIR.
-
-    Trả về danh sách cảnh báo (rỗng nếu không có gì phải làm hoặc đã gộp xong).
-    KHÔNG được nuốt lỗi im lặng: nếu gộp thất bại, thư mục trùng vẫn phải hiển thị
-    đầy đủ trên giao diện, tuyệt đối không để ảnh của người dùng biến mất khỏi app.
-    """
-    warnings: List[str] = []
-    canonical_dir = os.path.join(root_abs, UNAPPROVED_DIR)
-
-    try:
-        entries = sorted(os.listdir(root_abs))
-    except OSError as e:
-        print(f"[merge-unapproved] không đọc được thư mục dự án: {e}")
-        return warnings
-
-    for item in entries:
-        item_path = os.path.join(root_abs, item)
-        if item == UNAPPROVED_DIR or not os.path.isdir(item_path):
-            continue
-        if not is_unapproved_name(item):
-            continue
-
-        try:
-            _merge_one_unapproved_dir(root_abs, item, item_path, canonical_dir)
-        except OSError as e:
-            # Ghi log rõ ràng và báo lên trên; giao diện vẫn thấy cả hai thư mục.
-            print(f"[merge-unapproved] không gộp được '{item}': {e}")
-            warnings.append(
-                f"Không gộp được thư mục '{item}' vào '{UNAPPROVED_DIR}'. "
-                "Có thể tệp đang mở ở ứng dụng khác."
-            )
-
-    return warnings
+    """Không tự động gộp hay tạo thư mục Kho_Chua_Duyet — tôn trọng cấu trúc của người dùng."""
+    return []
 
 
 def _merge_one_unapproved_dir(root_abs: str, item: str, item_path: str, canonical_dir: str) -> None:
@@ -401,7 +358,9 @@ def patch_page_meta(root: str, rel: Optional[str], filename: str, patch: Dict[st
 
 
 def set_folder_order(root: str, rel: Optional[str], order: List[str]) -> None:
-    """Lưu thứ tự trang do người dùng sắp xếp, để mở lại app vẫn đúng thứ tự in PDF."""
+    """Lưu thứ tự trang do người dùng sắp xếp. Chỉ lưu nếu thư mục đã có metadata."""
+    if not os.path.exists(meta_path(root, rel)):
+        return
     with _meta_lock:
         pages = read_meta(root, rel).get("pages", {})
         _write_meta(root, rel, pages, [str(x) for x in (order or [])])

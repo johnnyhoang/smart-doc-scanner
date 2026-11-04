@@ -429,6 +429,17 @@ def page_payload(root: str, rel: str, filename: str) -> Dict[str, Any]:
 @app.post("/api/pick-directory")
 async def pick_directory():
     """Mở hộp thoại chọn thư mục gốc của hệ điều hành."""
+    if sys.platform == "darwin":
+        try:
+            cmd = ['osascript', '-e', 'POSIX path of (choose folder with prompt "Chọn thư mục dự án cho DocScan Studio")']
+            res = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            path = res.stdout.strip()
+            if path:
+                return {"success": True, "path": os.path.normpath(path)}
+            return {"success": False, "path": ""}
+        except Exception:
+            pass  # Fallback to tkinter
+
     try:
         import tkinter as tk
         from tkinter import filedialog
@@ -470,6 +481,23 @@ async def pick_save_path(req: PickSavePathRequest):
     }
     label, pattern = labels.get(ext, (f"Tệp {ext.upper()}", f"*.{ext}"))
     suggested = f"{ps.sanitize_component(req.suggested_name) or 'Tai-Lieu'}.{ext}"
+
+    if sys.platform == "darwin":
+        try:
+            script = f'''
+            set initialFolder to POSIX file "{initial_dir}"
+            set savePath to choose file name with prompt "Chọn nơi lưu {label}" default name "{suggested}" default location initialFolder
+            return POSIX path of savePath
+            '''
+            res = subprocess.run(['osascript', '-e', script], capture_output=True, text=True, check=True)
+            chosen = res.stdout.strip()
+            if chosen:
+                if not chosen.lower().endswith(f".{ext}"):
+                    chosen += f".{ext}"
+                return {"success": True, "path": chosen, "filename": os.path.basename(chosen)}
+            return {"success": False, "path": "", "filename": ""}
+        except Exception:
+            pass  # Fallback to tkinter
 
     try:
         import tkinter as tk
@@ -709,23 +737,9 @@ def _save_imported_image(
         stem = ps.unique_stem(root, rel, source_stem)
     filename = ps.edited_filename(stem)
 
-    ps.write_original(root, rel, filename, img)
-
-    corners, detected = detect_document_corners(img, margin_percent=0.0)
-    settings = ps.default_settings()
-    rendered = rd.render_page(img, corners.tolist(), 0, settings)
-    data, _size, _dim = rd.encode_final(rendered, settings)
+    # Chỉ lưu file ảnh trực tiếp vào thư mục. KHÔNG tự tạo _goc và KHÔNG tự tạo metadata khi nhập.
+    data, _size, _dim = rd.encode_final(img, ps.default_settings())
     ps.write_edited_bytes(root, rel, filename, data)
-
-    ps.patch_page_meta(root, rel, filename, {
-        "doc_name": stem,
-        "corners": corners.tolist(),
-        "rotation": 0,
-        "settings": settings,
-        "history": {"undo": [], "redo": []},
-        "detected": bool(detected),
-        "committed_fingerprint": ps.state_fingerprint(corners.tolist(), 0, settings),
-    })
 
     invalidate(root, rel, filename)
     payload = page_payload(root, rel, filename)
@@ -880,6 +894,11 @@ def commit_page(root: str, rel: str, state: PageState) -> Dict[str, Any]:
     annotations = state.annotations if state.annotations is not None else stored.get("annotations")
 
     original = load_original(root, rel, filename)
+
+    # NẾU CHƯA CÓ ẢNH GỐC TRONG _goc/: SAO LƯU ẢNH GỐC NGAY TRƯỚC KHI GHI ĐÈ
+    if ps.find_original_path(root, rel, filename) is None:
+        ps.write_original(root, rel, filename, original)
+
     rendered = rd.render_page(original, corners, rotation, settings, annotations=annotations)
     data, size, (out_w, out_h) = rd.encode_final(rendered, settings)
     ps.write_edited_bytes(root, rel, filename, data)

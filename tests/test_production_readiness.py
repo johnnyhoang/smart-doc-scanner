@@ -121,24 +121,18 @@ def test_luu_mot_phan_phai_liet_ke_dung_trang_thanh_cong():
 # ==========================================================
 
 def test_gop_kho_chua_duyet_co_du_lieu_that():
-    """Thư mục trùng lặp CÓ ảnh + metadata phải được gộp trọn vẹn, không sót tệp."""
+    """Thư mục của người dùng được tôn trọng, không tự ý di chuyển hay xoá."""
     p = Project()
     try:
-        os.makedirs(os.path.join(p.root, ps.UNAPPROVED_DIR), exist_ok=True)
         alias = os.path.join(p.root, "Kho ảnh chưa duyệt")
         os.makedirs(alias, exist_ok=True)
         p.import_page("Hoa Don.jpg", rel="Kho ảnh chưa duyệt")
 
         res = p.client.post("/api/scan-directory", json={"path": p.root}).json()
 
-        assert not os.path.isdir(alias), "thư mục trùng lặp chưa được dọn sau khi gộp"
-        canon = os.path.join(p.root, ps.UNAPPROVED_DIR)
-        jpgs = [f for f in os.listdir(canon) if f.lower().endswith(".jpg")]
-        assert jpgs, "ảnh không được chuyển sang thư mục chuẩn"
-        assert os.path.isdir(os.path.join(canon, ps.GOC_DIR)), "ảnh gốc không đi cùng"
-
-        unapproved = [f for f in res["folders"] if f["isUnapproved"]]
-        assert len(unapproved) == 1, f"còn {len(unapproved)} thư mục Kho chưa duyệt"
+        assert os.path.isdir(alias), "thư mục của người dùng không được tự ý xoá hay gộp ngầm"
+        jpgs = [f for f in os.listdir(alias) if f.lower().endswith(".jpg")]
+        assert jpgs, "ảnh trong thư mục của người dùng phải được giữ nguyên"
     finally:
         p.close()
 

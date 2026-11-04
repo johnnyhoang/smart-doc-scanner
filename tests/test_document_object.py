@@ -54,6 +54,22 @@ class Project:
         assert res.status_code == 200, res.text
         return res.json()
 
+    def commit_page(self, name, rel="", corners=None, settings=None):
+        if corners is None:
+            corners = [[0.0, 0.0], [100.0, 0.0], [100.0, 100.0], [0.0, 100.0]]
+        res = self.client.post("/api/commit-page", json={
+            "relative_path": rel,
+            "page": {
+                "filename": name,
+                "doc_name": ps.stem_of(name),
+                "corners": corners,
+                "rotation": 0,
+                "settings": settings or ps.default_settings(),
+            }
+        })
+        assert res.status_code == 200, res.text
+        return res.json()
+
     def scan(self, rel=None):
         pages = self.client.post("/api/scan-directory", json={"path": self.root}).json()["pages"]
         return pages if rel is None else [p for p in pages if p["relativePath"] == ps.normalize_rel(rel)]
@@ -74,16 +90,23 @@ class Project:
 # ==========================================================
 
 def test_import_ghi_ngay_du_bo_ba():
-    """Ảnh vừa nhập phải có ngay cả 3 thành phần — tắt app đột ngột không mất gì."""
+    """Nhập ảnh KHÔNG tự tạo _goc và metadata. Chỉ khi bấm LƯU mới tạo."""
     p = Project()
     try:
         page = p.import_page("Hóa Đơn GTGT.jpg")
         name = page["filename"]
-        assert os.path.exists(p.path("", name)), "thiếu ảnh đang sửa"
-        assert os.path.exists(p.goc_path("", name)), "thiếu ảnh gốc trong _goc/"
-        assert os.path.exists(p.path("", ps.META_FILE)), "thiếu tệp metadata"
-        assert page["has_raw_original"] is True
-        assert len(page["corners"]) == 4
+        # Lúc vừa nhập: chỉ có ảnh, không tự tạo _goc hay .docscan_meta.json
+        assert os.path.exists(p.path("", name)), "thiếu ảnh vừa nhập"
+        assert not os.path.exists(p.goc_path("", name)), "tự ý tạo _goc khi chưa lưu"
+        assert not os.path.exists(p.path("", ps.META_FILE)), "tự ý tạo metadata khi chưa lưu"
+
+        # Khi người dùng bấm Lưu (commit-page): lúc này mới tạo _goc và metadata
+        p.commit_page(name)
+        assert os.path.exists(p.goc_path("", name)), "thiếu ảnh gốc trong _goc/ sau khi lưu"
+        assert os.path.exists(p.path("", ps.META_FILE)), "thiếu tệp metadata sau khi lưu"
+        scanned = p.scan("")[0]
+        assert scanned["has_raw_original"] is True
+        assert len(scanned["corners"]) == 4
     finally:
         p.close()
 
@@ -135,6 +158,7 @@ def test_doi_ten_doi_ca_bo_ba_khong_de_lai_ban_sao():
     p = Project()
     try:
         old = p.import_page("anh_chup.jpg")["filename"]
+        p.commit_page(old)
         new = p.client.post("/api/rename-page", json={
             "relative_path": "", "filename": old, "new_name": "Hợp Đồng Thuê Nhà",
         }).json()["filename"]
@@ -157,6 +181,8 @@ def test_doi_ten_giu_nguyen_vi_tri_trong_thu_tu_in():
     p = Project()
     try:
         names = [p.import_page(f"Trang {i}.jpg")["filename"] for i in range(1, 5)]
+        for n in names:
+            p.commit_page(n)
         custom = list(reversed(names))
         p.client.post("/api/save-metadata", json={"relative_path": "", "pages": [], "order": custom})
         assert [x["filename"] for x in p.scan("")] == custom
@@ -180,6 +206,7 @@ def test_payload_thieu_truong_khong_xoa_du_lieu_cu():
     p = Project()
     try:
         name = p.import_page("Biên Bản.jpg")["filename"]
+        p.commit_page(name)
         p.client.post("/api/save-metadata", json={
             "relative_path": "", "pages": [{"filename": name, "doc_name": "Biên Bản"}],
         })
@@ -194,10 +221,11 @@ def test_luu_toan_du_an_giu_nguyen_metadata():
     p = Project()
     try:
         pages = [p.import_page(f"Trang {i}.jpg") for i in range(1, 4)]
+        corners = [[0.0, 0.0], [100.0, 0.0], [100.0, 100.0], [0.0, 100.0]]
         p.client.post("/api/save-project", json={"folders": [{
             "relative_path": "",
-            "pages": [{"filename": x["filename"], "corners": x["corners"],
-                       "rotation": 0, "settings": x["settings"]} for x in pages],
+            "pages": [{"filename": x["filename"], "corners": corners,
+                       "rotation": 0, "settings": ps.default_settings()} for x in pages],
             "save_pdf": True,
         }]})
         for entry in p.meta("")["pages"].values():
@@ -245,16 +273,18 @@ def test_phat_hien_anh_cu_hon_metadata_va_tu_khoi_phuc():
     try:
         page = p.import_page("Đơn Xin Phép.jpg")
         name = page["filename"]
+        p.commit_page(name)
         assert p.scan("")[0]["is_stale"] is False
 
         # Người dùng đổi bộ lọc (metadata ghi ngay) rồi tắt app trước khi ảnh kịp dựng lại
+        settings = ps.default_settings()
         p.client.post("/api/save-metadata", json={"relative_path": "", "pages": [
-            {"filename": name, "settings": {**page["settings"], "mode": "bw_scan"}}]})
+            {"filename": name, "settings": {**settings, "mode": "bw_scan"}}]})
         assert p.scan("")[0]["is_stale"] is True, "không phát hiện ảnh cũ hơn metadata"
 
         p.client.post("/api/save-folder", json={"relative_path": "", "pages": [
-            {"filename": name, "corners": page["corners"], "rotation": 0,
-             "settings": {**page["settings"], "mode": "bw_scan"}}], "save_pdf": False})
+            {"filename": name, "corners": [[0,0],[100,0],[100,100],[0,100]], "rotation": 0,
+             "settings": {**settings, "mode": "bw_scan"}}], "save_pdf": False})
         after = p.scan("")[0]
         assert after["is_stale"] is False
         assert after["settings"]["mode"] == "bw_scan"
@@ -291,12 +321,12 @@ def test_chuyen_trang_mang_theo_anh_goc_va_metadata():
     p = Project()
     try:
         page = p.import_page("Hóa Đơn.jpg")
+        p.commit_page(page["filename"])
         moved = p.client.post("/api/move-to-unapproved", json={
             "relative_path": "", "filename": page["filename"]}).json()
         rel = ps.UNAPPROVED_DIR
         assert os.path.exists(p.path(rel, moved["filename"])), "thiếu ảnh sau khi chuyển"
         assert os.path.exists(p.goc_path(rel, moved["filename"])), "ảnh gốc không đi cùng"
-        assert moved["folder_name"] == ps.UNAPPROVED_LABEL
         assert p.meta(rel)["pages"][moved["filename"]]["corners"], "metadata không đi cùng"
     finally:
         p.close()
@@ -306,6 +336,7 @@ def test_xoa_trang_xoa_sach_ca_bo_ba():
     p = Project()
     try:
         name = p.import_page("Bỏ Đi.jpg")["filename"]
+        p.commit_page(name)
         p.client.post("/api/delete-page", json={"relative_path": "", "filename": name})
         assert not os.path.exists(p.path("", name))
         assert not os.path.exists(p.goc_path("", name))
@@ -388,7 +419,7 @@ def test_xuat_anh_zip_va_xuat_pdf_theo_danh_sach_chon():
 
 
 def test_import_pdf_quy_doi_ve_anh():
-    """Tệp PDF (scan, export từ word hay in) quy đổi trọn vẹn thành ảnh trong bộ ba."""
+    """Tệp PDF (scan, export từ word hay in) quy đổi thành ảnh mà không tự tạo _goc khi chưa lưu."""
     p = Project()
     try:
         doc = fitz.open()
@@ -411,9 +442,8 @@ def test_import_pdf_quy_doi_ve_anh():
             fname = page["filename"]
             assert fname.endswith(".jpg")
             assert os.path.exists(p.path("", fname)), f"thiếu ảnh {fname}"
-            assert os.path.exists(p.goc_path("", fname)), f"thiếu ảnh gốc cho {fname}"
-            assert page["has_raw_original"] is True
-            assert len(page["corners"]) == 4
+            # Không tự ý tạo _goc khi chưa lưu
+            assert not os.path.exists(p.goc_path("", fname)), f"tự ý tạo ảnh gốc cho {fname} khi chưa lưu"
 
         # Quét lại phải đủ 2 trang
         scanned = p.scan("")

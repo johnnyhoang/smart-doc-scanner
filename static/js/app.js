@@ -856,10 +856,13 @@ class DocScanApp {
         on(this.btnCloseOrphanModal, 'click', () => this.closeOrphanPrompt(true));
 
         window.addEventListener('resize', () => { if (this.getActivePage()) this.layoutCanvas(); });
-        // Đóng tab: gửi nốt tình trạng đang chỉnh bằng sendBeacon (không chặn người dùng).
-        // Không cần hộp thoại "rời trang?" vì tình trạng đã nằm trên đĩa, còn tệp ảnh nào
-        // chưa kịp kết xuất lại sẽ được đánh dấu và tự lưu ở lần mở sau.
-        window.addEventListener('pagehide', () => this.beaconMetadata());
+        window.addEventListener('beforeunload', (e) => {
+            if (this.dirtyPages && this.dirtyPages.size > 0) {
+                e.preventDefault();
+                e.returnValue = 'Bạn có thay đổi chưa lưu vào máy.';
+                return e.returnValue;
+            }
+        });
     }
 
     // ======================================================
@@ -1540,7 +1543,6 @@ class DocScanApp {
                     </label>
                     <span class="drag-handle" title="Kéo để đổi thứ tự trang"><i class="fa-solid fa-grip-vertical"></i></span>
                     <span class="page-index-badge">Trang ${idx + 1}</span>
-                    ${page.hasOriginal ? '' : '<span class="badge-orphan" title="Chưa có ảnh gốc trong _goc/"><i class="fa-solid fa-triangle-exclamation"></i></span>'}
                 </div>
                 <div class="thumb-img-box">
                     <img src="${this.thumbUrl(page)}" alt="Trang ${idx + 1}" loading="lazy">
@@ -1724,9 +1726,7 @@ class DocScanApp {
             this.toastErr('Không mở được ảnh của trang này trên ổ đĩa.');
         }
 
-        if (!page.hasOriginal && !page.orphanHandled && !this.isUnapprovedFolder(page.folderId)) {
-            this.openOrphanPrompt(imageId);
-        }
+        // Khong tu dong hien modal ep hop thuc hoa anh le
     }
 
     isUnapprovedFolder(folderId) {
@@ -1910,10 +1910,8 @@ class DocScanApp {
         this.dirtyPages.add(page.id);
         this.updateSaveState();
         this.updateFolderActionButtons();
-        // Mọi chỉnh sửa đều phải kéo theo: ghi tình trạng (nhẹ) + hẹn giờ tự động lưu 60s.
-        // Thiếu hai lời gọi này thì cam kết "tự động lưu sau 60 giây" chỉ nằm trên giấy.
-        this.scheduleMetaSave();
-        this.ensureAutoSaveArmed();
+        // Giữ trạng thái chỉnh sửa trong bộ nhớ, KHÔNG tự ý ghi đĩa ngầm.
+        // Chỉ ghi đĩa khi người dùng chủ động bấm Lưu.
         const card = this.pageListContainer?.querySelector(`.page-thumb-card[data-image-id="${page.id}"]`);
         card?.classList.add('unsaved');
     }
@@ -2008,21 +2006,15 @@ class DocScanApp {
     }
 
     scheduleMetaSave() {
-        clearTimeout(this.metaTimer);
-        this.metaTimer = setTimeout(() => this.saveMetadata(this.activeFolderId), META_SAVE_MS);
+        // Tắt tự động ghi metadata — chỉ ghi khi người dùng bấm Lưu
     }
 
     scheduleAutoSave() {
-        clearTimeout(this.autoSaveTimer);
-        this.autoSaveTimer = setTimeout(() => {
-            this.autoSaveTimer = null;
-            this.saveDirtyPages(true);
-        }, AUTOSAVE_MS);
+        // Tắt tự động lưu ảnh ngầm — chỉ ghi khi người dùng bấm Lưu
     }
 
-    /** Còn trang chờ ghi ảnh thì luôn phải có một hẹn giờ tự động lưu đang chạy. */
+    /** Còn trang chờ ghi ảnh thì giữ cờ giao diện, không tự động ghi đĩa. */
     ensureAutoSaveArmed() {
-        if (this.dirtyPages.size > 0 && !this.autoSaveTimer) this.scheduleAutoSave();
     }
 
     /** Lưu nhanh tình trạng chỉnh sửa (không kết xuất lại ảnh). */
@@ -2201,20 +2193,9 @@ class DocScanApp {
         }
     }
 
-    /** Gửi tình trạng chỉnh sửa lúc đóng tab — chạy được cả khi trang đang bị hủy. */
+    /** Gửi tình trạng chỉnh sửa lúc đóng tab (đã tắt để tránh tự ý ghi đĩa). */
     beaconMetadata() {
-        const folder = this.getActiveFolder();
-        if (!folder || !this.rootPath || !navigator.sendBeacon) return;
-        const pages = (folder.imageIds || [])
-            .map(id => this.pages.get(id)).filter(Boolean)
-            .map(p => this.pageStatePayload(p));
-        if (!pages.length) return;
-        const body = JSON.stringify({
-            relative_path: folder.relativePath,
-            pages,
-            order: (folder.imageIds || []).map(id => this.pages.get(id)?.filename).filter(Boolean),
-        });
-        navigator.sendBeacon('/api/save-metadata', new Blob([body], { type: 'application/json' }));
+        // Tắt sendBeacon — ổ đĩa chỉ thay đổi khi người dùng bấm Lưu.
     }
 
     // ======================================================
