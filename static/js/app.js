@@ -23,10 +23,10 @@ const on = (el, evt, fn, opts) => { if (el) el.addEventListener(evt, fn, opts); 
 
 const DEFAULT_SETTINGS = {
     mode: 'original',
-    shadow_reduction: 0.6,
-    sharpness: 0.6,
-    contrast: 0.2,
     brightness: 0.0,
+    shadow_reduction: 0.0,
+    sharpness: 0.0,
+    contrast: 0.0,
     filter_intensity: 1.0,
     page_size_preset: 'original',
     page_orientation: 'auto',
@@ -340,6 +340,8 @@ class DocScanApp {
         this.valFilterIntensity = $('valFilterIntensity');
         this.rngDewarp = $('rngDewarp');
         this.valDewarp = $('valDewarp');
+        this.rngBrightness = $('rngBrightness');
+        this.valBrightness = $('valBrightness');
         this.rngShadow = $('rngShadow');
         this.valShadow = $('valShadow');
         this.rngSharpness = $('rngSharpness');
@@ -732,6 +734,9 @@ class DocScanApp {
             (p, v) => { p.settings.filter_intensity = v / 100; }, (v) => `${v}%`);
         bindSlider(this.rngDewarp, this.valDewarp,
             (p, v) => { p.settings.dewarp_strength = parseFloat(v); }, (v) => v);
+        bindSlider(this.rngBrightness, this.valBrightness,
+            (p, v) => { p.settings.brightness = parseInt(v, 10) / 100; },
+            (v) => `${parseInt(v, 10) > 0 ? '+' : ''}${v}%`);
         bindSlider(this.rngShadow, this.valShadow,
             (p, v) => { p.settings.shadow_reduction = v / 100; }, (v) => `${v}%`);
         bindSlider(this.rngSharpness, this.valSharpness,
@@ -1891,7 +1896,7 @@ class DocScanApp {
                     filename: page.filename,
                     corners: page.corners,
                     rotation: page.rotation,
-                    settings: { ...page.settings, mode: 'original', shadow_reduction: 0, sharpness: 0, contrast: 0 },
+                    settings: { ...page.settings, mode: 'original', brightness: 0, shadow_reduction: 0, sharpness: 0, contrast: 0 },
                 }),
             });
             if (!res.ok) return;
@@ -4781,11 +4786,17 @@ class DocScanApp {
         this.rngDewarp.value = settings.dewarp_strength ?? 0.8;
         this.valDewarp.textContent = this.rngDewarp.value;
 
-        this.rngShadow.value = pct(settings.shadow_reduction, 0.6);
+        if (this.rngBrightness && this.valBrightness) {
+            const bPct = Math.round((settings.brightness ?? 0.0) * 100);
+            this.rngBrightness.value = bPct;
+            this.valBrightness.textContent = `${bPct > 0 ? '+' : ''}${bPct}%`;
+        }
+
+        this.rngShadow.value = pct(settings.shadow_reduction, 0.0);
         this.valShadow.textContent = `${this.rngShadow.value}%`;
-        this.rngSharpness.value = pct(settings.sharpness, 0.6);
+        this.rngSharpness.value = pct(settings.sharpness, 0.0);
         this.valSharpness.textContent = `${this.rngSharpness.value}%`;
-        this.rngContrast.value = pct(settings.contrast, 0.2);
+        this.rngContrast.value = pct(settings.contrast, 0.0);
         this.valContrast.textContent = `${this.rngContrast.value}%`;
 
         this.rngMargin.value = ((settings.margin_percent ?? 0.02) * 100).toFixed(1);

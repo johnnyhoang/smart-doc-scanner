@@ -46,10 +46,10 @@ IGNORE_DIRS = {
 
 DEFAULT_SETTINGS: Dict[str, Any] = {
     "mode": "original",
-    "shadow_reduction": 0.6,
-    "sharpness": 0.6,
-    "contrast": 0.2,
     "brightness": 0.0,
+    "shadow_reduction": 0.0,
+    "sharpness": 0.0,
+    "contrast": 0.0,
     "filter_intensity": 1.0,
     "page_size_preset": "original",
     "page_orientation": "auto",
