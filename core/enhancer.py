@@ -266,17 +266,17 @@ def enhance_document(
       - 'bw_scan': Crisp binarized scan for office printing.
       - 'original': Straight warped image without color modifications.
     """
-    if mode == "original":
-        return image.copy()
-
     # Step 1: Crease Shadow & Fold Normalization
-    if shadow_reduction > 0:
+    if shadow_reduction > 0.01:
         img_balanced = remove_crease_shadows_and_folds(image, strength=shadow_reduction)
     else:
         img_balanced = image.copy()
 
     # Step 2: Mode-specific processing
-    if mode == "magic_color":
+    if mode == "original":
+        img_result = img_balanced.copy()
+
+    elif mode == "magic_color":
         img_result = enhance_magic_color(img_balanced)
 
     elif mode == "restore_yellowed":
