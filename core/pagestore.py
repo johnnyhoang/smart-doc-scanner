@@ -45,7 +45,7 @@ IGNORE_DIRS = {
 }
 
 DEFAULT_SETTINGS: Dict[str, Any] = {
-    "mode": "natural",
+    "mode": "original",
     "shadow_reduction": 0.6,
     "sharpness": 0.6,
     "contrast": 0.2,

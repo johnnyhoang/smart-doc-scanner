@@ -22,7 +22,7 @@ const $ = (id) => document.getElementById(id);
 const on = (el, evt, fn, opts) => { if (el) el.addEventListener(evt, fn, opts); };
 
 const DEFAULT_SETTINGS = {
-    mode: 'natural',
+    mode: 'original',
     shadow_reduction: 0.6,
     sharpness: 0.6,
     contrast: 0.2,
@@ -4740,7 +4740,7 @@ class DocScanApp {
 
     syncInspector(settings) {
         if (!settings) return;
-        this.modeCards.forEach(c => c.classList.toggle('active', c.dataset.mode === (settings.mode || 'natural')));
+        this.modeCards.forEach(c => c.classList.toggle('active', c.dataset.mode === (settings.mode || 'original')));
 
         const pct = (v, d) => Math.round((v ?? d) * 100);
         if (this.rngFilterIntensity) {

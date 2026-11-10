@@ -447,7 +447,7 @@ def render_page(
 
     enhanced = enhance_document(
         warped,
-        mode=settings.get("mode", "natural"),
+        mode=settings.get("mode", "original"),
         shadow_reduction=float(settings.get("shadow_reduction", 0.6)),
         sharpness=float(settings.get("sharpness", 0.6)),
         contrast=float(settings.get("contrast", 0.2)),

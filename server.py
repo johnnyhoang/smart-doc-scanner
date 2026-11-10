@@ -1122,7 +1122,7 @@ def apply_as_original(req: PageRef):
     h, w = rendered.shape[:2]
     full_frame = [[0.0, 0.0], [float(w), 0.0], [float(w), float(h)], [0.0, float(h)]]
     reset_settings = ps.default_settings()
-    reset_settings["mode"] = settings.get("mode", "natural")
+    reset_settings["mode"] = settings.get("mode", "original")
 
     data, _size, _dim = rd.encode_final(
         rd.render_page(rendered, full_frame, 0, reset_settings), reset_settings
